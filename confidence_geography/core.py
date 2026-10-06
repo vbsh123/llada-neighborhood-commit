@@ -59,7 +59,7 @@ def select(rows, policy, quota, threshold):
         # predictions, with no neighbor-confidence gate or replacement slots.
         anchor = candidates[0]['position']
         by_position = {r['position']: r for r in candidates}
-        return [by_position[anchor+offset] for offset in (0, -1, 1, 2)
+        return [by_position[anchor+offset] for offset in (0, -1, 1)
                 if anchor+offset in by_position]
     return candidates[:quota]
 

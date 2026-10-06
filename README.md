@@ -1,13 +1,13 @@
 # LLaDA neighborhood commitment experiment
 
 Paired GSM8K experiment: ordinary highest-confidence top1 versus a top1-anchored
-four-position window. Independent repository; no model inference runs locally.
+three-position window. Independent repository; no model inference runs locally.
 Collector derived from [dllm-confidence-geography](https://github.com/vbsh123/dllm-confidence-geography).
 
 ## Decoder
 
 `top1_window` finds the highest-confidence eligible masked position p, then
-commits p and masked eligible positions p−1, p+1, p+2. All predictions come
+commits p and masked eligible positions p−1, p+1. All predictions come
 from the same forward. The anchor is always included, so the decoder progresses.
 No neighbor confidence gate. Filled slots and positions outside the active
 response block are skipped, without replacing them with other positions.
@@ -15,6 +15,9 @@ response block are skipped, without replacing them with other positions.
 Selection is in `confidence_geography/core.py:select()`. The decoding loop and
 trace collection are in `confidence_geography/run.py:collect_sample()`.
 Read [QUIRKS.md](QUIRKS.md) for the explicit protocol choices.
+
+Version 2 removes +2: at most three tokens per forward. Earlier four-position
+results belong to version 1. Use a fresh output directory after updating source.
 
 ## Vast commands
 

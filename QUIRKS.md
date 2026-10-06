@@ -1,7 +1,8 @@
 # Explicit choices for experiment 1
 
-1. **Exactly offsets −1, 0, +1, +2**, including the top1 anchor: at most four
-   tokens total, not four additional tokens. Neighbor means token index, not
+1. **Exactly offsets −1, 0, +1**, including the top1 anchor: at most three
+   tokens total, not three additional tokens. Version 2 removes +2 from the
+   original four-token version. Neighbor means token index, not
    word or nearest remaining MASK. Positive offsets point right.
 2. **Only still-masked eligible slots.** Already-unmasked slots are skipped.
    We interpret the user's “if applicable” this way; overwriting revealed

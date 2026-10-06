@@ -197,8 +197,8 @@ def collect_sample(model, tokenizer, config, sample, output):
                 if config['policy'] == 'top1_window':
                     anchor = committed[0]
                     selection_metadata = {'selection': {
-                        'rule': 'top1_anchor_with_masked_offsets_minus1_plus1_plus2_v1',
-                        'anchor_position': anchor, 'requested_offsets': [-1, 0, 1, 2],
+                        'rule': 'top1_anchor_with_masked_offsets_minus1_plus1_v2',
+                        'anchor_position': anchor, 'requested_offsets': [-1, 0, 1],
                         'actual_offsets': [p-anchor for p in committed],
                         'same_forward': True, 'neighbor_confidence_gate': None}}
                 emit(handle, {'type': 'step', 'step': step, 'block_start': block_start, 'block_end': block_end,
