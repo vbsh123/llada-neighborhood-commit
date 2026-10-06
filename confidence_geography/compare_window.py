@@ -10,8 +10,9 @@ def compare_window(baseline, window, out):
     def read_run(run, expected):
         source=Source(Path(run));samples={};config=None;batch_sizes=Counter();neighbors=[];answer_neighbors=[]
         forward_seconds=0
+        print(f'Reading {expected}: {len(source.names)} saved question traces (no inference)', flush=True)
         try:
-            for name in source.names:
+            for number,name in enumerate(source.names,1):
                 result=source.result(name);sid=str(result['sample_id'])
                 if sid in samples:raise ValueError('Duplicate question')
                 samples[sid]=result
@@ -31,6 +32,8 @@ def compare_window(baseline, window, out):
                                 confidence=by_position[p]['confidence'];neighbors.append(confidence)
                                 if p<result['answer_token_length'] and not by_position[p]['special']:
                                     answer_neighbors.append(confidence)
+                if number % 10 == 0 or number == len(source.names):
+                    print(f'Read {expected}: {number}/{len(source.names)} questions', flush=True)
         finally:source.close()
         n=len(samples)
         if not n:raise ValueError('No completed samples')
@@ -63,6 +66,7 @@ def compare_window(baseline, window, out):
             'numeric_accuracy_change_percentage_points':100*(sb['numeric_accuracy']-sa['numeric_accuracy']),
             'limits':'Full response window filled, including special/post-stop slots. Wall time includes trace collection overhead. Neighbor confidence does not establish correctness.'}
     out=Path(out);out.parent.mkdir(parents=True,exist_ok=True);out.write_text(json.dumps(report,indent=2)+'\n')
+    print(f'Comparison saved: {out}', flush=True)
     print(json.dumps(report,indent=2));return report
 
 
