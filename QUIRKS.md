@@ -44,3 +44,26 @@ and accuracy are unverified until the Vast runs complete. Source is derived
 from the existing experiment collector; this repository is intentionally
 independent and retains the `confidence_geography` Python module name so the
 collector and offline tooling need minimal changes.
+
+## Final repair choices
+
+- **Posthoc repair of saved outputs.** No generation rerun and no additional
+  baseline. Candidate selection uses the logged original confidence and anchor,
+  so it also works for the earlier four-token window. No correctness or gold
+  answer is used to choose candidates.
+- **Strictly below 0.75 by default.** Only forced neighbors; never anchors,
+  originally special tokens, or positions at/after the original final stop.
+  There is no candidate cap. All candidates are masked simultaneously, and
+  their replacements are committed simultaneously from one forward.
+- **Fixed original answer boundary.** Original EOS/end-of-turn tokens stay
+  untouched. New predictions can be special tokens, including EOS; they are
+  skipped by decoding but do not shorten the original scoring boundary. This
+  is an explicit fixed-boundary repair experiment. MASK remains excluded from
+  predictions, using the existing probability calculation.
+- **No acceptance gate or second pass.** A replacement is used even when its
+  new confidence is low. No-candidate questions receive no extra forward.
+- **Same scoring as generation.** Marked answer if present, otherwise last
+  number. Runtime and forwards are recorded separately for repair; cumulative
+  elapsed time adds repair to the saved original generation time, excluding
+  checkpoint loading and trace-reading time. Stale word maps are removed from
+  changed results. Original generation stop metadata remains fixed.

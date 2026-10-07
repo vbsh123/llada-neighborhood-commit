@@ -83,3 +83,41 @@ python -m unittest discover -s tests -v
 
 This experiment tests the locality hypothesis; it does not assume simultaneous
 neighbor commitment preserves accuracy. It does not reproduce another method.
+
+## One-forward repair of a completed window run
+
+This reuses saved outputs and traces. It does **not** rerun generation or top1.
+It selects forced neighbors whose original commitment confidence was strictly
+below 0.75, excluding anchors, originally special tokens, and positions at or
+after the original final stop. All selected positions are masked together and
+filled from one model forward, without a confidence acceptance gate or retries.
+Questions with no candidates require no forward. Both the earlier four-token
+window and the current three-token window are supported.
+
+On the Vast machine with your completed run and existing environment:
+
+```bash
+git pull
+source .venv/bin/activate
+python -m confidence_geography.repair_window \
+  --run runs/window_3tokens_v1/top1_window \
+  --out runs/window_3tokens_repair75_v1 \
+  --threshold 0.75
+bash scripts/export.sh runs/window_3tokens_repair75_v1
+```
+
+Use the same command to resume; completed repairs are skipped. Use a fresh
+output folder when changing settings or code. The model/tokenizer revision and
+prompt IDs come from the saved run. It requires the same GPU dependencies as
+generation; there is no extra installation step when the environment is ready.
+
+`summary.json` reports original versus repaired accuracy, paired correctness
+changes, candidate counts, changed tokens, and extra forwards. Each sample has
+its unchanged `original_result.json` and separate repaired `result.json`, with
+candidate metadata and new predictions. These outputs are results, not new
+generation traces. The source run is untouched.
+
+Read `confidence_geography/repair_window.py`: `repair_candidates()` selects the
+positions, `repair_window()` performs the single forward, and `repaired_result()`
+decodes and scores the repaired answer. CPU tests use a fake model; actual repair
+quality must be measured on Vast.
