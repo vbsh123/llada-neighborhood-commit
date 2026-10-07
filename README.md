@@ -1,7 +1,7 @@
 # LLaDA neighborhood commitment experiment
 
-Paired GSM8K experiment: ordinary highest-confidence top1 versus a top1-anchored
-three-position window. Independent repository; no model inference runs locally.
+GSM8K experiment: ordinary highest-confidence top1 and a top1-anchored
+three- or four-position window. Independent repository; no model inference runs locally.
 Collector derived from [dllm-confidence-geography](https://github.com/vbsh123/dllm-confidence-geography).
 
 ## Decoder
@@ -11,6 +11,8 @@ commits p and masked eligible positions p−1, p+1. All predictions come
 from the same forward. The anchor is always included, so the decoder progresses.
 No neighbor confidence gate. Filled slots and positions outside the active
 response block are skipped, without replacing them with other positions.
+Pass `--window-size 4` to also commit p+2, restoring the original four-token rule.
+The default remains three tokens; the choice is saved in the run configuration.
 
 Selection is in `confidence_geography/core.py:select()`. The decoding loop and
 trace collection are in `confidence_geography/run.py:collect_sample()`.
@@ -121,3 +123,25 @@ Read `confidence_geography/repair_window.py`: `repair_candidates()` selects the
 positions, `repair_window()` performs the single forward, and `repaired_result()`
 decodes and scores the repaired answer. CPU tests use a fake model; actual repair
 quality must be measured on Vast.
+
+## Four-token generation followed by repair on a new machine
+
+After installing the GPU environment, run only the four-token window and its
+repair (no separate top1 baseline):
+
+```bash
+source .venv/bin/activate
+python -m confidence_geography.run \
+  --out runs/window4_repair75_v1/top1_window \
+  --policy top1_window --window-size 4 \
+  --samples 100 --length 256 --seed 1729
+python -m confidence_geography.repair_window \
+  --run runs/window4_repair75_v1/top1_window \
+  --out runs/window4_repair75_v1/repaired --threshold 0.75
+bash scripts/export.sh runs/window4_repair75_v1
+```
+
+The repair runs after the generation command completes and uses its exact saved
+outputs. The original and repaired answers are both retained. The original
+answer's generation is ungated; the repair threshold only selects positions
+for the final simultaneous repair forward.

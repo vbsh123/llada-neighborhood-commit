@@ -29,5 +29,16 @@ class WindowPolicyTests(unittest.TestCase):
     def test_cli_accepts_new_policy(self):
         self.assertEqual(parser().parse_args(['--out','unused','--policy','top1_window']).policy,'top1_window')
 
+    def test_four_token_window_uses_original_offsets_without_gate(self):
+        rows=[row(5,.99),row(4,.1),row(6,.2),row(7,.3),row(12,.98)]
+        self.assertEqual([r['position'] for r in select(rows,'top1_window',1,.9,4)],[5,4,6,7])
+        self.assertEqual(parser().parse_args(['--out','unused','--window-size','4']).window_size,4)
+
+    def test_four_token_window_skips_missing_and_ineligible_without_replacement(self):
+        rows=[row(5,.99),row(4,.9,False),row(7,.8),row(12,.98)]
+        self.assertEqual([r['position'] for r in select(rows,'top1_window',1,.9,4)],[5,7])
+        with self.assertRaises(ValueError):
+            select(rows,'top1_window',1,.9,5)
+
 
 if __name__=='__main__':unittest.main()

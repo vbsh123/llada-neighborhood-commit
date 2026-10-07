@@ -186,8 +186,9 @@ def collect_sample(model, tokenizer, config, sample, output):
                                 'text': info['text'], **nearest(p, last_commits),
                                 'nearest_filled_distance': min((abs(p-q) for q in filled), default=None),
                                 'beyond_observed_stop': p > observed_stop if observed_stop is not None else None})
-                quota = 1  # Window size is fixed by its offsets, not a quota.
-                chosen = select(rows, config['policy'], quota, config['commit_threshold'])
+                quota = 1  # Window size is determined by offsets, not a quota.
+                window_size = config.get('window_size', 3)
+                chosen = select(rows, config['policy'], quota, config['commit_threshold'], window_size)
                 committed = [r['position'] for r in chosen]
                 selected = set(committed)
                 for row in rows:
@@ -197,8 +198,10 @@ def collect_sample(model, tokenizer, config, sample, output):
                 if config['policy'] == 'top1_window':
                     anchor = committed[0]
                     selection_metadata = {'selection': {
-                        'rule': 'top1_anchor_with_masked_offsets_minus1_plus1_v2',
-                        'anchor_position': anchor, 'requested_offsets': [-1, 0, 1],
+                        'rule': ('top1_anchor_with_masked_offsets_minus1_plus1_plus2_v1' if window_size == 4
+                                 else 'top1_anchor_with_masked_offsets_minus1_plus1_v2'),
+                        'anchor_position': anchor,
+                        'requested_offsets': [-1, 0, 1, 2] if window_size == 4 else [-1, 0, 1],
                         'actual_offsets': [p-anchor for p in committed],
                         'same_forward': True, 'neighbor_confidence_gate': None}}
                 emit(handle, {'type': 'step', 'step': step, 'block_start': block_start, 'block_end': block_end,
@@ -257,6 +260,8 @@ def parser():
     p.add_argument('--length', type=int, default=256)
     p.add_argument('--block-length', type=int, default=0, help='0 means full response')
     p.add_argument('--policy', choices=['top1', 'top1_window'], default='top1')
+    p.add_argument('--window-size', type=int, choices=[3, 4], default=3,
+                   help='Top1 window: 3 = offsets -1,0,+1; 4 = -1,0,+1,+2')
     p.set_defaults(commit_threshold=0.9)  # Pure measurement; neither policy gates on it.
     p.add_argument('--thresholds', type=float, nargs='+', default=[0.5, 0.7, 0.8, 0.9, 0.95, 0.99])
     p.add_argument('--top-k', type=int, default=5)

@@ -1,8 +1,10 @@
 # Explicit choices for experiment 1
 
-1. **Exactly offsets −1, 0, +1**, including the top1 anchor: at most three
-   tokens total, not three additional tokens. Version 2 removes +2 from the
-   original four-token version. Neighbor means token index, not
+1. **Configurable offsets:** `--window-size 3` (default) uses −1, 0, +1;
+   `--window-size 4` restores −1, 0, +1, +2. These include the anchor, so
+   they mean at most three or four tokens total, not additional tokens.
+   Version 2 removed +2; the four-token option restores the original rule.
+   Neighbor means token index, not
    word or nearest remaining MASK. Positive offsets point right.
 2. **Only still-masked eligible slots.** Already-unmasked slots are skipped.
    We interpret the user's “if applicable” this way; overwriting revealed

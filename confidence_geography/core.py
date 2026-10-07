@@ -42,7 +42,9 @@ def nearest(position, anchors):
             'distance': distance, 'nonlocal': distance > 1}
 
 
-def select(rows, policy, quota, threshold):
+def select(rows, policy, quota, threshold, window_size=3):
+    if policy == 'top1_window' and window_size not in (3, 4):
+        raise ValueError('Window size must be 3 or 4')
     candidates = sorted((r for r in rows if r['eligible']),
                         key=lambda r: (-r['confidence'], r['position']))
     if not candidates:
@@ -59,7 +61,8 @@ def select(rows, policy, quota, threshold):
         # predictions, with no neighbor-confidence gate or replacement slots.
         anchor = candidates[0]['position']
         by_position = {r['position']: r for r in candidates}
-        return [by_position[anchor+offset] for offset in (0, -1, 1)
+        offsets = (0, -1, 1, 2) if window_size == 4 else (0, -1, 1)
+        return [by_position[anchor+offset] for offset in offsets
                 if anchor+offset in by_position]
     return candidates[:quota]
 
