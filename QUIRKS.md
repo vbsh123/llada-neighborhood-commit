@@ -69,3 +69,12 @@ collector and offline tooling need minimal changes.
   elapsed time adds repair to the saved original generation time, excluding
   checkpoint loading and trace-reading time. Stale word maps are removed from
   changed results. Original generation stop metadata remains fixed.
+
+## Matched baseline after an existing experiment
+
+`matched_baseline` reads a completed window run, preserves the exact sample IDs
+and order, and copies every source setting except `policy=top1`. It skips dataset
+selection/download and calls the existing collector for top1 only. An unused
+window-size setting stays in the config to support strict paired comparison.
+Older completed window and repair runs are read despite their older source
+fingerprints; they are never resumed or overwritten by this command.

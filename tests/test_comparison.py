@@ -42,5 +42,26 @@ class ComparisonTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'Question/reference mismatch'):
                 compare_window(a,b,root/'comparison.json')
 
+    def test_repair_comparison_includes_extra_compute_and_checks_original(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            a=self.fixture(root,'top1');b=self.fixture(root,'top1_window')
+            repaired=root/'repaired';folder=repaired/'samples/00001';folder.mkdir(parents=True)
+            original=json.loads((b/'samples/00001/result.json').read_text())
+            (folder/'original_result.json').write_text(json.dumps(original))
+            (repaired/'manifest.json').write_text(json.dumps({'source_config':{'policy':'top1_window','seed':1729},'repair_threshold':.75}))
+            result={**original,'correct_numeric':True,'repair_forwards':1,'repair_forward_seconds':.25,'elapsed_seconds':2.5}
+            (folder/'result.json').write_text(json.dumps(result))
+            report=compare_window(a,b,root/'comparison.json',repaired)
+            r=report['repaired_window']
+            self.assertEqual(r['total_forwards_including_generation'],2)
+            self.assertEqual(r['total_forward_seconds_including_generation'],1.25)
+            self.assertEqual(r['numeric_accuracy'],1.)
+            self.assertEqual(r['paired_vs_top1'],{'both_correct':1})
+            original['correct_numeric']=True
+            (folder/'original_result.json').write_text(json.dumps(original))
+            with self.assertRaisesRegex(ValueError,'different original'):
+                compare_window(a,b,root/'comparison.json',repaired)
+
 
 if __name__=='__main__':unittest.main()

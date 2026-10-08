@@ -6,7 +6,7 @@ from pathlib import Path
 from .trace_source import Source
 
 
-def compare_window(baseline, window, out):
+def compare_window(baseline, window, out, repaired=None):
     def read_run(run, expected):
         source=Source(Path(run));samples={};config=None;batch_sizes=Counter();neighbors=[];answer_neighbors=[]
         forward_seconds=0
@@ -65,6 +65,39 @@ def compare_window(baseline, window, out):
             'forward_reduction_percent':100*(1-sb['total_forwards']/sa['total_forwards']),
             'numeric_accuracy_change_percentage_points':100*(sb['numeric_accuracy']-sa['numeric_accuracy']),
             'limits':'Full response window filled, including special/post-stop slots. Wall time includes trace collection overhead. Neighbor confidence does not establish correctness.'}
+    if repaired is not None:
+        repaired=Path(repaired)
+        manifest=json.loads((repaired/'manifest.json').read_text())
+        if {k:v for k,v in manifest['source_config'].items() if k!='policy'}!=bc:
+            raise ValueError('Repair source config differs from window run')
+        repaired_samples={}
+        for path in sorted((repaired/'samples').glob('*/result.json')):
+            result=json.loads(path.read_text());sid=str(result['sample_id'])
+            if sid in repaired_samples:raise ValueError('Duplicate repaired sample')
+            repaired_samples[sid]=result
+        if set(repaired_samples)!=set(b):raise ValueError('Repaired sample set differs')
+        for sid,result in repaired_samples.items():
+            original=json.loads((repaired/'samples'/sid/'original_result.json').read_text())
+            if original!=b[sid]:raise ValueError('Repair used different original result')
+        repaired_values=list(repaired_samples.values())
+        accuracy=sum(r['correct_numeric'] for r in repaired_values)/len(repaired_values)
+        extra=sum(r['repair_forwards'] for r in repaired_values)
+        total_forwards=sb['total_forwards']+extra
+        report['repaired_window']={
+            'samples':len(repaired_values),'repair_threshold':manifest['repair_threshold'],
+            'numeric_accuracy':accuracy,'extra_repair_forwards':extra,
+            'total_forwards_including_generation':total_forwards,
+            'total_forward_seconds_including_generation':sb['total_forward_seconds']+sum(r['repair_forward_seconds'] for r in repaired_values),
+            'total_elapsed_seconds_including_generation':sum(r['elapsed_seconds'] for r in repaired_values),
+            'forward_reduction_vs_top1_percent':100*(1-total_forwards/sa['total_forwards']),
+            'accuracy_change_vs_top1_percentage_points':100*(accuracy-sa['numeric_accuracy']),
+            'accuracy_change_vs_window_percentage_points':100*(accuracy-sb['numeric_accuracy']),
+            'paired_vs_top1':dict(Counter(
+                'both_correct' if a[sid]['correct_numeric'] and r['correct_numeric'] else
+                'repaired_only_correct' if r['correct_numeric'] else
+                'top1_only_correct' if a[sid]['correct_numeric'] else 'both_wrong'
+                for sid,r in repaired_samples.items())),
+            'timing_note':'Includes generation plus repair; excludes checkpoint loading, trace reading and final result writes. Actual end-to-end command wall time is not measured.'}
     out=Path(out);out.parent.mkdir(parents=True,exist_ok=True);out.write_text(json.dumps(report,indent=2)+'\n')
     print(f'Comparison saved: {out}', flush=True)
     print(json.dumps(report,indent=2));return report
@@ -72,4 +105,5 @@ def compare_window(baseline, window, out):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--baseline',required=True);p.add_argument('--window',required=True);p.add_argument('--out',required=True)
-    a=p.parse_args();compare_window(a.baseline,a.window,a.out)
+    p.add_argument('--repaired',help='Optional completed repair folder for three-way comparison')
+    a=p.parse_args();compare_window(a.baseline,a.window,a.out,a.repaired)

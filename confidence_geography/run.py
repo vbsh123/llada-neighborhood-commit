@@ -295,7 +295,7 @@ def source_fingerprint():
     return digest.hexdigest()
 
 
-def execute(config, out):
+def execute(config, out, *, matched_samples=None, matched_dataset_info=None):
     import torch
     import numpy as np
     config = {**config, 'prompt_protocol': PROMPT_PROTOCOL, 'scoring_protocol': SCORING_PROTOCOL}
@@ -309,7 +309,10 @@ def execute(config, out):
         samples = [json.loads(s) for s in (out / 'samples.jsonl').read_text().splitlines()]
         dataset_info = manifest['dataset_info']
     else:
-        if config['data_jsonl']:
+        if matched_samples is not None:
+            samples = matched_samples
+            dataset_info = matched_dataset_info
+        elif config['data_jsonl']:
             source = Path(config['data_jsonl']).read_bytes()
             rows = [json.loads(s) for s in source.decode().splitlines() if s.strip()]
             dataset_info = {'sha256': hashlib.sha256(source).hexdigest(), 'source': config['data_jsonl']}
@@ -320,12 +323,13 @@ def execute(config, out):
             ds = load_dataset(config['dataset'], 'main', split=config['split'], revision=revision)
             rows = list(ds)
             dataset_info = {'repository': config['dataset'], 'revision': revision, 'fingerprint': ds._fingerprint}
-        indices = list(range(len(rows)))
-        random.Random(config['seed']).shuffle(indices)
-        indices = indices[config['offset']:config['offset']+config['samples']]
-        if len(indices) != config['samples']:
-            raise ValueError('Requested sample range exceeds dataset')
-        samples = [{'id': f'{i:05d}', 'dataset_index': i, 'question': rows[i]['question'], 'answer': rows[i]['answer']} for i in indices]
+        if matched_samples is None:
+            indices = list(range(len(rows)))
+            random.Random(config['seed']).shuffle(indices)
+            indices = indices[config['offset']:config['offset']+config['samples']]
+            if len(indices) != config['samples']:
+                raise ValueError('Requested sample range exceeds dataset')
+            samples = [{'id': f'{i:05d}', 'dataset_index': i, 'question': rows[i]['question'], 'answer': rows[i]['answer']} for i in indices]
         if any(numeric_answer(s['answer'], reference=True)[0] is None for s in samples):
             raise ValueError('Dataset answers must contain a numeric #### reference')
         (out / 'samples.jsonl').write_text(''.join(json.dumps(s, ensure_ascii=False)+'\n' for s in samples))

@@ -145,3 +145,39 @@ The repair runs after the generation command completes and uses its exact saved
 outputs. The original and repaired answers are both retained. The original
 answer's generation is ungated; the repair threshold only selects positions
 for the final simultaneous repair forward.
+
+## Add a matched top1 baseline after window and repair finish
+
+No window or repair rerun is needed. This command loads the saved sample list
+directly, preserving its order, dataset indices and IDs without shuffling or
+downloading GSM8K again. It copies the source configuration and changes only
+`policy` to `top1`, including the original model revision and response length.
+The unused `window_size` setting is retained for exact configuration matching.
+The source window must be complete. It is only read, never resumed or modified.
+
+```bash
+git pull
+source .venv/bin/activate
+python -u -m confidence_geography.matched_baseline \
+  --window runs/window4_repair75_500_v1/top1_window \
+  --out runs/window4_repair75_500_v1/top1
+python -u -m confidence_geography.compare_window \
+  --baseline runs/window4_repair75_500_v1/top1 \
+  --window runs/window4_repair75_500_v1/top1_window \
+  --repaired runs/window4_repair75_500_v1/repaired \
+  --out runs/window4_repair75_500_v1/three_way_comparison.json
+bash scripts/export.sh runs/window4_repair75_500_v1
+```
+
+The optional `--repaired` comparison checks that each repair used the exact
+original window result. It reports accuracy and paired correctness, plus
+generation and repair forwards/time added together. Timing is instrumented
+work, not total command wall time; checkpoint loading and trace reading are
+excluded. No equal-hardware assumption is enforced: compare GPU environments
+in run manifests before interpreting timing differences.
+
+Source updates prevent resuming older generation/repair runs under changed code;
+they do not prevent reading their completed results for this new baseline and
+comparison. Use a fresh baseline output folder if that folder already contains
+an incompatible run. Code: `matched_baseline.py:matched_inputs()` validates and
+copies the inputs; `run_matched_baseline()` calls only the existing top1 decoder.
