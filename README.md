@@ -181,3 +181,14 @@ they do not prevent reading their completed results for this new baseline and
 comparison. Use a fresh baseline output folder if that folder already contains
 an incompatible run. Code: `matched_baseline.py:matched_inputs()` validates and
 copies the inputs; `run_matched_baseline()` calls only the existing top1 decoder.
+
+## SOAR discarded-branch measurement
+
+A separate observation-only probe is in
+[experiments/soar_reuse](experiments/soar_reuse/README.md). It runs pinned official
+SOAR on saved prompts and logs discarded token opportunities, branch conflicts,
+survivor support, entropy and cross-branch disagreement. It makes no merges and
+does not establish a merge speedup. Start with its two-question Vast smoke;
+only CPU logic checks have run locally. Existing window/repair outputs are read,
+not regenerated. Probe code lives outside the collector package, so adding it
+does not change existing generation/repair source fingerprints.
