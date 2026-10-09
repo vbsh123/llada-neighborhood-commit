@@ -11,6 +11,7 @@ import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from hooks import COMMIT, SOURCE_SHA256, URL, instrument, reuse_opportunities
+from convergence import measure_convergence
 from confidence_geography.core import numeric_answer
 from confidence_geography.run import dump, emit, load_model, run_lock, token_info, PROMPT_PROTOCOL, SCORING_PROTOCOL
 
@@ -22,9 +23,12 @@ class Probe:
         self.events = []
         self.batch_sizes = []
         self.token_ids = set()
+        self.lineage_steps = []
+        self.watch_tokens = {}
 
     def before(self, step, beam, logits, predictions, confidence, prompt_length, block_length, mask_id, threshold):
         import torch
+        self.logits = logits
         self.pl = prompt_length
         self.mask_id = mask_id
         self.parents = []
@@ -40,10 +44,14 @@ class Probe:
                 pp = positions[start:start+8]
                 z = logits[i, [prompt_length+p for p in pp]].float()
                 lp = torch.log_softmax(z, dim=-1)
-                ent = -(lp.exp()*lp).sum(-1).tolist()
-                for p, entropy in zip(pp, ent):
+                ent = (-(lp.exp()*lp).sum(-1)).tolist()
+                for j, (p, entropy) in enumerate(zip(pp, ent)):
+                    wanted = self.watch_tokens.setdefault(p, set())
+                    wanted.update(int(predictions[k, prompt_length+p]) for k in range(len(beam)))
                     rows[p] = {'position': p, 'token_id': int(predictions[i, prompt_length+p]),
-                               'confidence': float(confidence[i, prompt_length+p]), 'entropy': entropy}
+                               'confidence': float(confidence[i, prompt_length+p]), 'entropy': entropy,
+                               'cross_support': dict(zip(map(str, sorted(wanted)),
+                                                        lp[j, sorted(wanted)].exp().tolist()))}
             self.parents.append({'id': i, 'state': state, 'score': score, 'block': block,
                                  'rows': rows, 'search_trigger': bool(positions) and not any(r['confidence'] > threshold for r in rows.values())})
             self.token_ids.update(state)
@@ -69,6 +77,11 @@ class Probe:
                                     'branch_information': max(0., float(mixture_entropy[j]-average_entropy[j]))})
         self.mixture = mixture
 
+    def token_probability(self, parent, position, token):
+        import torch
+        lp = torch.log_softmax(self.logits[parent, self.pl+position].float(), dim=-1)
+        return float(lp[token].exp())
+
     def candidate(self, parent, entry):
         seq, score, block, records = entry
         cid = len(self.candidates)
@@ -92,7 +105,16 @@ class Probe:
         for opportunity in opportunities:
             row = surviving_rows.get(opportunity['position'])
             opportunity['best_parent_prediction'] = row
+            # Score each donor's exact token, even when it is not top1.
+            if row:
+                for donor in opportunity['donors']:
+                    donor['best_parent_support'] = self.token_probability(
+                        best['parent'], opportunity['position'], donor['token_id'])
             opportunity['best_parent_agrees'] = bool(row and opportunity['donors_agree'] and row['token_id'] == opportunity['token_id'])
+        self.lineage_steps.append({'step': step, 'parents': self.parents,
+                                   'retained': [{k: self.candidates[cid][k] for k in ('parent', 'state')}
+                                                for cid in retained_ids]})
+        del self.logits
         event = {'type': 'step', 'step': step, 'parents': self.parents,
                  'candidates': self.candidates, 'retained_ids': retained_ids,
                  'common_masked_mixture': self.mixture, 'opportunities': opportunities}
@@ -116,7 +138,21 @@ class Probe:
             matched = sum(tokens[o['position']] == o['token_id'] for o in rows)
             return {'proposal_events': len(rows), 'unique_positions': len({o['position'] for o in rows}),
                     'matches_final_output': matched, 'final_match_percent': 100*matched/len(rows) if rows else None}
-        return {'model_calls': len(self.batch_sizes), 'evaluated_branch_sequences': sum(self.batch_sizes),
+        donor_support_sweep = []
+        for donor_threshold in (.75, .85, .9, .95):
+            for support_threshold in (.05, .1, .2, .3, .5, .75, .9):
+                eligible = [(o, d) for o in opportunities for d in o['donors']
+                            if d.get('last_commit') is not None
+                            and d['last_commit']['confidence'] >= donor_threshold
+                            and d.get('best_parent_support') is not None]
+                qualifying = [(o, d) for o, d in eligible
+                              if d['best_parent_support'] >= support_threshold]
+                donor_support_sweep.append({
+                    'donor_threshold': donor_threshold, 'recipient_support_threshold': support_threshold,
+                    'eligible_donor_observations': len(eligible), 'qualifying_donor_observations': len(qualifying),
+                    'support_percent': 100*len(qualifying)/len(eligible) if eligible else None,
+                    'qualifying_final_matches': sum(tokens[o['position']] == d['token_id'] for o, d in qualifying)})
+        return {'donor_support_sweep': donor_support_sweep, 'model_calls': len(self.batch_sizes), 'evaluated_branch_sequences': sum(self.batch_sizes),
                 'beam_width_histogram': dict(Counter(self.batch_sizes)),
                 'search_parent_events': sum(e['search_parents'] for e in self.events),
                 'steps_with_multiple_parents': sum(e['beam_width'] > 1 for e in self.events),
@@ -146,7 +182,8 @@ def run(args):
     manifest = {'upstream_commit': COMMIT, 'upstream_sha256': SOURCE_SHA256,
                 'source_window': str(source.resolve()), 'source_config': config,
                 'samples_sha256': hashlib.sha256(json.dumps(samples,sort_keys=True).encode()).hexdigest(),
-                'probe_sha256': hashlib.sha256(Path(__file__).read_bytes()+Path(__file__).with_name('hooks.py').read_bytes()).hexdigest(),
+                'probe_sha256': hashlib.sha256(b''.join(Path(__file__).with_name(n).read_bytes() for n in ('run_probe.py', 'hooks.py', 'convergence.py'))).hexdigest(),
+                'convergence_protocol': 'same-position ordered parent-pair disagreements; actual retained ancestry; no extra forwards',
                 'samples': len(samples), 'beam_size': args.beam_size, 'steps': steps,
                 'soar_threshold': .95, 'max_parallel_tokens': 5, 'temperature': 0.,
                 'mixture_weights': 'uniform across evaluated parents; common masked eligible positions only',
@@ -203,13 +240,20 @@ def run(args):
                     end = min((i for i,t in enumerate(tokens) if t in header['stop_ids']), default=length)
                     answer = tokenizer.decode(tokens[:end],skip_special_tokens=True,clean_up_tokenization_spaces=False)
                     predicted, method = numeric_answer(answer);gold,_ = numeric_answer(sample['answer'],reference=True)
+                    print(f"Analyzing branch convergence sample={sid} (CPU, no extra forwards)", flush=True)
+                    convergence_events, convergence_summary = measure_convergence(
+                        probe.lineage_steps, tokens, end, probe.special_ids)
+                    with gzip.open(folder/'convergence.jsonl.gz.partial', 'wt', compresslevel=3) as convergence_handle:
+                        for convergence_event in convergence_events:
+                            emit(convergence_handle, convergence_event)
+                    (folder/'convergence.jsonl.gz.partial').replace(folder/'convergence.jsonl.gz')
                     result = {'sample_id': sid, 'question': sample['question'], 'reference': sample['answer'],
                               'answer': answer, 'final_ids': tokens, 'answer_token_length': end,
                               'predicted_answer': predicted, 'gold_answer': gold, 'answer_extraction': method,
                               'correct_numeric': predicted == gold and gold is not None,
                               'unresolved_masks': tokens.count(config['mask_id']),
                               'forward_seconds': timed.seconds, 'elapsed_seconds': time.perf_counter()-started,
-                              'reuse': probe.summary(tokens,end),
+                              'reuse': probe.summary(tokens,end), 'convergence': convergence_summary,
                               'token_dictionary': {str(t): token_info(tokenizer,t,set(tokenizer.all_special_ids))
                                                    for t in sorted(probe.token_ids)}}
                     emit(handle, {'type': 'result', **result})
@@ -236,6 +280,36 @@ def run(args):
         calls = totals['total_model_calls'];pruning = totals['steps_with_pruning']
         totals['percent_all_steps_with_reuse_proposals'] = 100*totals['steps_with_reuse_proposals']/calls if calls else None
         totals['percent_pruning_steps_with_reuse_proposals'] = 100*totals['steps_with_reuse_proposals']/pruning if pruning else None
+        # Pool counts, never average per-question percentages.
+        pooled = []
+        for j, settings in enumerate(results[0]['convergence']['threshold_sweep']):
+            row = {k: settings[k] for k in ('donor_threshold', 'recipient_support_threshold')}
+            keys = ('observations', 'later_top1_count', 'retained_descendant_commit_count',
+                    'lineage_extinct_count', 'final_lineage_observations', 'final_lineage_matches')
+            row.update({k: sum(r['convergence']['threshold_sweep'][j][k] for r in results) for k in keys})
+            n = row['observations']; final_n = row['final_lineage_observations']
+            row['later_top1_percent'] = 100*row['later_top1_count']/n if n else None
+            row['retained_descendant_commit_percent'] = 100*row['retained_descendant_commit_count']/n if n else None
+            row['final_lineage_match_percent'] = 100*row['final_lineage_matches']/final_n if final_n else None
+            pooled.append(row)
+        totals['convergence_threshold_sweep'] = pooled
+        all_counts = {k: sum(r['convergence']['all_disagreements'][k] for r in results)
+                      for k in ('observations', 'later_top1_count', 'retained_descendant_commit_count',
+                                'lineage_extinct_count', 'final_lineage_observations', 'final_lineage_matches')}
+        n = all_counts['observations']; final_n = all_counts['final_lineage_observations']
+        all_counts['later_top1_percent'] = 100*all_counts['later_top1_count']/n if n else None
+        all_counts['retained_descendant_commit_percent'] = 100*all_counts['retained_descendant_commit_count']/n if n else None
+        all_counts['final_lineage_match_percent'] = 100*all_counts['final_lineage_matches']/final_n if final_n else None
+        totals['all_cross_branch_disagreements'] = all_counts
+        pooled_support = []
+        for j, settings in enumerate(results[0]['reuse']['donor_support_sweep']):
+            row = {k: settings[k] for k in ('donor_threshold', 'recipient_support_threshold')}
+            for key in ('eligible_donor_observations', 'qualifying_donor_observations', 'qualifying_final_matches'):
+                row[key] = sum(r['reuse']['donor_support_sweep'][j][key] for r in results)
+            n = row['eligible_donor_observations']
+            row['support_percent'] = 100*row['qualifying_donor_observations']/n if n else None
+            pooled_support.append(row)
+        totals['discarded_donor_support_sweep'] = pooled_support
         dump(out/'summary.json',totals);print(json.dumps(totals,indent=2),flush=True)
 
 

@@ -112,3 +112,72 @@ CPU tests:
 ```bash
 python -m unittest discover -s experiments/soar_reuse -p 'test_*.py' -v
 ```
+
+## Cross-branch support and future convergence (new)
+
+There are two separate measurements. Neither changes SOAR's decisions.
+
+**Discarded revealed-token support:** for every eligible donor token in a reuse
+opportunity, record the best retained candidate's evaluated parent's probability
+for that exact token at that exact position. This does not require it to be that
+parent's top1. Donor confidence is historical confidence at commitment; recipient
+support is from this forward. The output `discarded_donor_support_sweep` pools
+ordered donor observations (multiple donors at one position count separately).
+For each donor-confidence cutoff, the denominator is all observations with
+known donor confidence above that cutoff and a recipient probability; the
+numerator additionally passes the recipient-support cutoff. No reference answer
+is used to decide which observations qualify.
+
+**Different top1 predictions:** at every forward, compare ordered pairs A -> B
+at positions that are still masked and eligible in both. If A's per-position
+vocabulary top1 token differs from B's, record A's confidence and B's probability
+for A's token. A need not select that position for commitment. Special donor
+predictions are excluded. This is always the SAME response position, not matching
+common words anywhere in the output.
+
+Follow B's actual retained descendants through candidate ancestry, including
+branch splitting and beam reordering. For each observation record:
+
+- First later forward where any retained descendant predicts A's token as top1
+  while that position is still masked and eligible.
+- First forward whose retained descendant commits that token. Delay zero means
+  commitment during the original comparison forward.
+- Highest subsequent masked-position support among those descendants.
+- Whether B's lineage disappears; an extinct lineage has no observable future.
+- Whether B lies on the final winning lineage, and if so whether its final token
+  at that position matches A's prediction. An unrelated survivor's matching
+  token does NOT count as convergence of B.
+
+`convergence.jsonl.gz` stores one event per ordered pair/position/forward;
+repeated disagreements at the same position count again. `branches.jsonl.gz`
+adds `cross_support` to masked-position rows: probabilities for tokens previously
+predicted there, allowing probability trajectories to be reconstructed without
+saving the full vocabulary. The scalar summaries do not duplicate every
+trajectory point, to keep output size manageable.
+
+`summary.json` contains `convergence_threshold_sweep`: donor confidence cutoffs
+0.75, 0.85, 0.9, 0.95 crossed with recipient-support cutoffs 0.05, 0.1, 0.2, 0.3,
+0.5, 0.75, 0.9. Both cutoffs are inclusive. Raw probabilities are saved so other
+thresholds can be analyzed later. Top1/commit rates divide by all qualifying
+observations; extinct recipients remain in that denominator and are separately
+counted. Final-match rates divide ONLY by observations whose recipient is on the
+actual final winning lineage. Statistics exclude positions beyond the actual
+final first stop retrospectively; this does not alter decoding. Agreement and
+convergence do not establish correctness or safe merging.
+
+Read `convergence.py:measure_convergence()` for the ancestry/counting logic;
+`run_probe.py:Probe.before()` collects probabilities and
+`Probe.after()` collects exact-token donor support. The pooled counts are built
+at the end of `run_probe.py:run()`.
+
+Use a fresh output folder for this version, for example:
+
+```bash
+python -u experiments/soar_reuse/run_probe.py \
+  --window runs/window4_repair75_500_v1/top1_window \
+  --out runs/soar_support_convergence_smoke_v1 --samples 2 --beam-size 2
+```
+
+It adds probability-scoring/logging and CPU ancestry-analysis overhead, but no
+extra model forwards. GPU execution still needs the Vast smoke test. The probe
+code fingerprint includes `convergence.py`, preventing mixed-version resumes.
