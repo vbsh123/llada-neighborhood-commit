@@ -17,6 +17,16 @@ from confidence_geography.core import numeric_answer
 from confidence_geography.run import dump, emit, load_model, run_lock, token_info, MODEL, REVISION, PROMPT_PROTOCOL, SCORING_PROTOCOL
 
 
+def candidate_key(entry):
+    """SOAR rebuilds tuples during deduplication but preserves their contents.
+
+    Tensor and history identity distinguish candidates with different ancestry,
+    even when their states happen to be equal. Do not key by tuple identity.
+    """
+    seq, score, block, records = entry
+    return id(seq), score, block, id(records)
+
+
 class Probe:
     def __init__(self, handle, special_ids):
         self.handle = handle
@@ -86,7 +96,7 @@ class Probe:
     def candidate(self, parent, entry):
         seq, score, block, records = entry
         cid = len(self.candidates)
-        self.candidate_lookup[id(entry)] = cid
+        self.candidate_lookup[candidate_key(entry)] = cid
         commits = [{'position': r['position']-self.pl, 'token_id': r['token_id'],
                     'confidence': r['confidence']} for r in records if r['step'] == len(self.batch_sizes)]
         self.candidates.append({'id': cid, 'parent': parent, 'state': seq[0, self.pl:].tolist(),
@@ -95,8 +105,8 @@ class Probe:
                                                  for r in records}})
 
     def after(self, step, raw, unique, retained):
-        retained_ids = [self.candidate_lookup[id(c)] for c in retained]
-        unique_ids = {self.candidate_lookup[id(c)] for c in unique}
+        retained_ids = [self.candidate_lookup[candidate_key(c)] for c in retained]
+        unique_ids = {self.candidate_lookup[candidate_key(c)] for c in unique}
         for candidate in self.candidates:
             cid = candidate['id']
             candidate['status'] = ('retained' if cid in retained_ids else

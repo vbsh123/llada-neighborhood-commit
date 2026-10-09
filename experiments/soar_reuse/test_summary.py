@@ -1,7 +1,7 @@
 import io
 import unittest
 
-from run_probe import Probe
+from run_probe import Probe, candidate_key
 
 
 class ProbeSummaryTests(unittest.TestCase):
@@ -53,10 +53,15 @@ class ProbeSummaryTests(unittest.TestCase):
         probe.token_probability = lambda parent, position, token: .2
         probe.parents=[{'rows':{0:{'position':0,'token_id':3,'confidence':.8}},'search_trigger':True}]
         probe.candidates=[{'id':0,'parent':0,'state':[99,1]}, {'id':1,'parent':0,'state':[3,99]}]
-        retained_entry=object();pruned_entry=object()
-        probe.candidate_lookup={id(retained_entry):0,id(pruned_entry):1}
+        retained_entry=(object(), 1., 0, [])
+        pruned_entry=(object(), .9, 0, [])
+        probe.candidate_lookup={candidate_key(retained_entry):0,candidate_key(pruned_entry):1}
+        # Upstream rebuilds tuples while preserving tensor/history references.
+        rebuilt_retained=tuple(list(retained_entry))
+        self.assertIsNot(rebuilt_retained, retained_entry)
         probe.mixture=[]
-        probe.after(0,[retained_entry,pruned_entry],[retained_entry,pruned_entry],[retained_entry])
+        probe.after(0,[retained_entry,pruned_entry],
+                    [rebuilt_retained,tuple(list(pruned_entry))],[rebuilt_retained])
         rows=probe.events[0]['opportunities']
         self.assertEqual(len(rows),1)
         self.assertTrue(rows[0]['best_parent_agrees'])
