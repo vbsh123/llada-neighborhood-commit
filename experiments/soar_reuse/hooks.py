@@ -4,7 +4,6 @@ import hashlib
 
 COMMIT = 'ec3eb400e41a43dc05db20a49c0219b9a968d28e'
 SOURCE_SHA256 = 'a0144a51471e1a265f962c41dc1d8169e466081abfda435a9b2043bc85efce78'
-URL = f'https://raw.githubusercontent.com/duterscmy/SOAR/{COMMIT}/eval_llada8b/generate.py'
 
 
 def instrument(source, check_hash=True):

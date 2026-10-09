@@ -7,10 +7,10 @@ import json
 from pathlib import Path
 import sys
 import time
-import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from hooks import COMMIT, SOURCE_SHA256, URL, instrument, reuse_opportunities
+from hooks import COMMIT, SOURCE_SHA256, instrument, reuse_opportunities
+from checkout import DEFAULT_ROOT, verify_checkout
 from convergence import measure_convergence
 from confidence_geography.core import numeric_answer
 from confidence_geography.run import dump, emit, load_model, run_lock, token_info, PROMPT_PROTOCOL, SCORING_PROTOCOL
@@ -167,6 +167,7 @@ class Probe:
 
 
 def run(args):
+    upstream_source = verify_checkout(args.soar_root)
     import torch
     source = Path(args.window)
     original_manifest = json.loads((source/'manifest.json').read_text())
@@ -180,9 +181,10 @@ def run(args):
     steps = length  # Official default 128 changed explicitly to window length.
     out = Path(args.out);out.mkdir(parents=True, exist_ok=True)
     manifest = {'upstream_commit': COMMIT, 'upstream_sha256': SOURCE_SHA256,
+                'upstream_checkout': str(upstream_source.parent.parent),
                 'source_window': str(source.resolve()), 'source_config': config,
                 'samples_sha256': hashlib.sha256(json.dumps(samples,sort_keys=True).encode()).hexdigest(),
-                'probe_sha256': hashlib.sha256(b''.join(Path(__file__).with_name(n).read_bytes() for n in ('run_probe.py', 'hooks.py', 'convergence.py'))).hexdigest(),
+                'probe_sha256': hashlib.sha256(b''.join(Path(__file__).with_name(n).read_bytes() for n in ('run_probe.py', 'hooks.py', 'convergence.py', 'checkout.py'))).hexdigest(),
                 'convergence_protocol': 'same-position ordered parent-pair disagreements; actual retained ancestry; no extra forwards',
                 'samples': len(samples), 'beam_size': args.beam_size, 'steps': steps,
                 'soar_threshold': .95, 'max_parallel_tokens': 5, 'temperature': 0.,
@@ -195,20 +197,12 @@ def run(args):
         elif any(p.name != '.lock' for p in out.iterdir()):
             raise ValueError('Use a new empty output folder')
         else: dump(out/'manifest.json', manifest)
-        cache = Path(__file__).parent/'upstream_cache'/f'generate_{COMMIT}.py'
-        cache.parent.mkdir(exist_ok=True)
-        if not cache.exists():
-            print('Downloading pinned upstream SOAR source (not weights)',flush=True)
-            with urllib.request.urlopen(URL, timeout=60) as response:
-                raw = response.read()
-            if hashlib.sha256(raw).hexdigest() != SOURCE_SHA256:raise ValueError('Upstream source hash differs')
-            cache.write_bytes(raw)
-        tree = instrument(cache.read_text())
+        tree = instrument(upstream_source.read_text())
         pending = [s for s in samples if not (out/'samples'/s['id']/'result.json').exists()]
         if pending:
             model, tokenizer = load_model(config)
             namespace = {}
-            exec(compile(tree, str(cache), 'exec'), namespace)
+            exec(compile(tree, str(upstream_source), 'exec'), namespace)
             for sample in pending:
                 sid = sample['id'];folder = out/'samples'/sid;folder.mkdir(parents=True,exist_ok=True)
                 # Exact original prompt IDs: no new instructions/template choices.
@@ -319,4 +313,6 @@ if __name__ == '__main__':
     parser.add_argument('--out',required=True)
     parser.add_argument('--samples',type=int,default=10)
     parser.add_argument('--beam-size',type=int,default=2)
+    parser.add_argument('--soar-root',type=Path,default=DEFAULT_ROOT,
+                        help='Clean official SOAR checkout at the pinned commit')
     run(parser.parse_args())

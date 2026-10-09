@@ -6,8 +6,11 @@ cannot be measured until a merge policy is implemented and compared.
 
 Official source: https://github.com/duterscmy/SOAR . Commit
 `ec3eb400e41a43dc05db20a49c0219b9a968d28e`, LLaDA `generate_soar()`.
-Source is downloaded at runtime, verified by SHA256, and instrumented using AST
-hooks. It is not bundled. `hooks.py:instrument()` inserts observers before
+The full official repository is cloned into `external/SOAR` and checked out
+at that commit (detached HEAD). The checkout is ignored by our Git repo; it is
+not vendored or modified. The probe verifies HEAD, a clean working tree, and
+the decoder SHA256 before loading model weights. It then instruments the
+source in memory using AST hooks. `hooks.py:instrument()` inserts observers before
 expansion, after each candidate append, and after pruning. The upstream
 selection, scoring, deduplication and collapse rules remain unchanged.
 
@@ -15,6 +18,7 @@ Run on Vast with the existing environment/checkpoint cache and saved run:
 
 ```bash
 git pull
+bash scripts/vast_soar.sh setup
 source .venv/bin/activate
 python -u experiments/soar_reuse/run_probe.py \
   --window runs/window4_repair75_500_v1/top1_window \
@@ -180,4 +184,54 @@ python -u experiments/soar_reuse/run_probe.py \
 
 It adds probability-scoring/logging and CPU ancestry-analysis overhead, but no
 extra model forwards. GPU execution still needs the Vast smoke test. The probe
-code fingerprint includes `convergence.py`, preventing mixed-version resumes.
+code fingerprint includes `convergence.py` and `checkout.py`, preventing mixed-version resumes.
+
+
+## Vast wrapper with the cloned upstream repo
+
+On an existing configured machine, from this experiment repo:
+
+```bash
+git pull
+bash scripts/vast_soar.sh setup
+WINDOW_RUN=runs/window4_repair75_500_v1/top1_window \
+RUN_NAME=soar_checkout_smoke_v1 SKIP_INSTALL=1 \
+  bash scripts/vast_soar.sh smoke
+```
+
+Then, after inspecting the two-question smoke:
+
+```bash
+WINDOW_RUN=runs/window4_repair75_500_v1/top1_window \
+RUN_NAME=soar_checkout_pilot_v1 SKIP_INSTALL=1 \
+  bash scripts/vast_soar.sh pilot
+```
+
+On a fresh machine, clone our repo and restore the completed source window run
+at the path passed to `WINDOW_RUN`. Omit `SKIP_INSTALL=1` to create the venv and
+install our existing pinned GPU dependencies. It does not regenerate window or
+top1 outputs and does not download GSM8K. Checkpoint weights may need downloading
+if absent. The upstream repo's complete evaluation environment is not installed:
+we call its pinned LLaDA decoder using our existing model environment, as before.
+
+`setup` only clones/verifies SOAR: no packages, dataset, model, or inference.
+`smoke` runs 2 questions; `pilot` runs 100. Both retain the source response length
+(256 here), use beam size 2, and retain upstream strict >0.95 threshold and
+maximum parallel commits 5. Set `SAMPLES`, `BEAM_SIZE`, `RUN_NAME`, or `SOAR_ROOT`
+explicitly to change them. No Hugging Face cache variables are forced.
+
+The same script can resume an unchanged `RUN_NAME`; completed questions are
+skipped. Use a new output folder after changing probe code or source settings.
+The earlier single-file-download manifests cannot be resumed by this version.
+`summary.json`, per-question `result.json`, `branches.jsonl.gz`, and
+`convergence.jsonl.gz` are under `runs/RUN_NAME`. Export manually if desired:
+
+```bash
+bash scripts/export.sh runs/soar_checkout_pilot_v1
+```
+
+An existing upstream checkout is never reset, pulled, or overwritten. A wrong
+commit or dirty checkout produces a clear error. Set `SOAR_ROOT` to another
+new directory if you want to keep a checkout containing your own edits. The
+probe itself never writes inside the SOAR checkout. Read their code at
+`external/SOAR/eval_llada8b/generate.py`, and our checkout checks in `checkout.py`.

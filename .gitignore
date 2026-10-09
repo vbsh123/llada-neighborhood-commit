@@ -5,3 +5,5 @@ __pycache__/
 runs/
 exports/
 *.tar.gz
+external/
+experiments/soar_reuse/upstream_cache/
