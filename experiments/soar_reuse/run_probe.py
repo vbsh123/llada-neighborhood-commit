@@ -12,8 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from hooks import COMMIT, SOURCE_SHA256, instrument, reuse_opportunities
 from checkout import DEFAULT_ROOT, verify_checkout
 from convergence import measure_convergence
+from inputs import load_inputs, question_prompt
 from confidence_geography.core import numeric_answer
-from confidence_geography.run import dump, emit, load_model, run_lock, token_info, PROMPT_PROTOCOL, SCORING_PROTOCOL
+from confidence_geography.run import dump, emit, load_model, run_lock, token_info, MODEL, REVISION, PROMPT_PROTOCOL, SCORING_PROTOCOL
 
 
 class Probe:
@@ -169,34 +170,47 @@ class Probe:
 def run(args):
     upstream_source = verify_checkout(args.soar_root)
     import torch
-    source = Path(args.window)
-    original_manifest = json.loads((source/'manifest.json').read_text())
-    config = original_manifest['config']
-    if config['prompt_protocol'] != PROMPT_PROTOCOL or config['scoring_protocol'] != SCORING_PROTOCOL:
-        raise ValueError('Unexpected source prompt/scoring protocol')
-    samples = [json.loads(s) for s in (source/'samples.jsonl').read_text().splitlines() if s.strip()][:args.samples]
-    if len(samples) != args.samples or args.samples < 1 or args.beam_size < 2:
-        raise ValueError('Require available sample count >=1 and beam size >=2')
-    length = config['length'];block = config['block_length']
-    steps = length  # Official default 128 changed explicitly to window length.
+    config = {'model': args.model, 'revision': args.revision, 'mask_id': args.mask_id,
+              'dataset': args.dataset, 'dataset_revision': args.dataset_revision,
+              'split': args.split, 'data_jsonl': str(args.data_jsonl.resolve()) if args.data_jsonl else None,
+              'samples': args.samples, 'offset': args.offset, 'seed': args.seed,
+              'length': args.length, 'block_length': args.block_length or args.length,
+              'prompt_protocol': PROMPT_PROTOCOL, 'scoring_protocol': SCORING_PROTOCOL}
+    length = config['length']; block = config['block_length']
+    steps = args.steps or length
+    if (args.samples < 1 or args.offset < 0 or args.beam_size < 2 or length < 1
+            or block < 1 or length % block or steps < 1 or steps % (length // block)):
+        raise ValueError('Require samples>=1, offset>=0, beam>=2; block divides length and blocks divide steps')
     out = Path(args.out);out.mkdir(parents=True, exist_ok=True)
     manifest = {'upstream_commit': COMMIT, 'upstream_sha256': SOURCE_SHA256,
                 'upstream_checkout': str(upstream_source.parent.parent),
-                'source_window': str(source.resolve()), 'source_config': config,
-                'samples_sha256': hashlib.sha256(json.dumps(samples,sort_keys=True).encode()).hexdigest(),
-                'probe_sha256': hashlib.sha256(b''.join(Path(__file__).with_name(n).read_bytes() for n in ('run_probe.py', 'hooks.py', 'convergence.py', 'checkout.py'))).hexdigest(),
+                'config': config,
+                'probe_sha256': hashlib.sha256(b''.join(Path(__file__).with_name(n).read_bytes() for n in ('run_probe.py', 'hooks.py', 'convergence.py', 'checkout.py', 'inputs.py'))).hexdigest(),
                 'convergence_protocol': 'same-position ordered parent-pair disagreements; actual retained ancestry; no extra forwards',
-                'samples': len(samples), 'beam_size': args.beam_size, 'steps': steps,
+                'samples': args.samples, 'beam_size': args.beam_size, 'steps': steps,
                 'soar_threshold': .95, 'max_parallel_tokens': 5, 'temperature': 0.,
                 'mixture_weights': 'uniform across evaluated parents; common masked eligible positions only',
                 'decoding_changes': 'none; upstream policy observed, no merging or extra forwards'}
     with run_lock(out):
+        existing = None
         if (out/'manifest.json').exists():
-            if json.loads((out/'manifest.json').read_text()) != manifest:
+            existing = json.loads((out/'manifest.json').read_text())
+            if any(existing.get(k) != v for k, v in manifest.items()):
                 raise ValueError('Settings/input/code changed; use fresh output')
         elif any(p.name != '.lock' for p in out.iterdir()):
             raise ValueError('Use a new empty output folder')
-        else: dump(out/'manifest.json', manifest)
+        samples, dataset_info = load_inputs(config, out/'samples.jsonl' if existing else None)
+        if len(samples) != args.samples or any(numeric_answer(s['answer'], reference=True)[0] is None for s in samples):
+            raise ValueError('Require requested sample count and numeric #### reference answers')
+        samples_hash = hashlib.sha256(json.dumps(samples, sort_keys=True).encode()).hexdigest()
+        if existing:
+            if samples_hash != existing['samples_sha256']:
+                raise ValueError('Saved samples changed')
+            manifest = existing
+        else:
+            manifest.update({'dataset_info': dataset_info, 'samples_sha256': samples_hash})
+            (out/'samples.jsonl').write_text(''.join(json.dumps(s, ensure_ascii=False)+'\n' for s in samples))
+            dump(out/'manifest.json', manifest)
         tree = instrument(upstream_source.read_text())
         pending = [s for s in samples if not (out/'samples'/s['id']/'result.json').exists()]
         if pending:
@@ -205,10 +219,11 @@ def run(args):
             exec(compile(tree, str(upstream_source), 'exec'), namespace)
             for sample in pending:
                 sid = sample['id'];folder = out/'samples'/sid;folder.mkdir(parents=True,exist_ok=True)
-                # Exact original prompt IDs: no new instructions/template choices.
-                with gzip.open(source/'samples'/sid/'trace.jsonl.gz', 'rt') as handle:
-                    header = json.loads(next(handle))
-                if header['type'] != 'header':raise ValueError('Missing original header')
+                header = question_prompt(tokenizer, sample['question'], config['mask_id'])
+                context_limit = (getattr(model.config, 'max_position_embeddings', None)
+                                 or getattr(model.config, 'max_sequence_length', None))
+                if context_limit and len(header['prompt_ids'])+length > context_limit:
+                    raise ValueError('Prompt plus response exceeds model context limit')
                 prompt = torch.tensor([header['prompt_ids']],device=model.device)
                 torch.manual_seed(config['seed'])
                 torch.backends.cuda.matmul.allow_tf32 = False
@@ -218,7 +233,7 @@ def run(args):
                 with gzip.open(partial,'wt',compresslevel=3) as handle, torch.inference_mode():
                     probe = Probe(handle,tokenizer.all_special_ids)
                     namespace['probe'] = probe
-                    emit(handle, {'type': 'header', 'sample': sample, 'prompt_ids': header['prompt_ids'], 'manifest': manifest})
+                    emit(handle, {'type': 'header', 'sample': sample, **header, 'manifest': manifest})
                     class TimedModel:
                         device = model.device
                         seconds = 0.
@@ -309,9 +324,20 @@ def run(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--window',required=True,help='Completed window run with saved samples/prompts')
     parser.add_argument('--out',required=True)
-    parser.add_argument('--samples',type=int,default=10)
+    parser.add_argument('--samples',type=int,default=100)
+    parser.add_argument('--model',default=MODEL)
+    parser.add_argument('--revision',default=REVISION)
+    parser.add_argument('--mask-id',type=int,default=126336)
+    parser.add_argument('--dataset',default='openai/gsm8k')
+    parser.add_argument('--dataset-revision',default='main')
+    parser.add_argument('--split',choices=['train','test'],default='test')
+    parser.add_argument('--data-jsonl',type=Path,help='Optional offline question/answer rows')
+    parser.add_argument('--seed',type=int,default=1729)
+    parser.add_argument('--offset',type=int,default=0)
+    parser.add_argument('--length',type=int,default=256)
+    parser.add_argument('--block-length',type=int,default=0,help='0 means full response')
+    parser.add_argument('--steps',type=int,default=0,help='0 means response length')
     parser.add_argument('--beam-size',type=int,default=2)
     parser.add_argument('--soar-root',type=Path,default=DEFAULT_ROOT,
                         help='Clean official SOAR checkout at the pinned commit')

@@ -14,31 +14,46 @@ source in memory using AST hooks. `hooks.py:instrument()` inserts observers befo
 expansion, after each candidate append, and after pruning. The upstream
 selection, scoring, deduplication and collapse rules remain unchanged.
 
-Run on Vast with the existing environment/checkpoint cache and saved run:
+## Standalone Vast run
+
+This is an independent GSM8K experiment. No previous run, generated answers,
+window traces, or restored results are required.
+
+On an existing configured machine:
 
 ```bash
 git pull
-bash scripts/vast_soar.sh setup
-source .venv/bin/activate
-python -u experiments/soar_reuse/run_probe.py \
-  --window runs/window4_repair75_500_v1/top1_window \
-  --out runs/soar_reuse_smoke_v1 --samples 2 --beam-size 2
+RUN_NAME=soar_smoke_v1 SKIP_INSTALL=1 bash scripts/vast_soar.sh smoke
 ```
 
-After the smoke finishes, a 100-question measurement pilot:
+After inspecting the two-question smoke:
 
 ```bash
-python -u experiments/soar_reuse/run_probe.py \
-  --window runs/window4_repair75_500_v1/top1_window \
-  --out runs/soar_reuse_pilot_v1 --samples 100 --beam-size 2
-bash scripts/export.sh runs/soar_reuse_pilot_v1
+RUN_NAME=soar_pilot_v1 SKIP_INSTALL=1 bash scripts/vast_soar.sh pilot
+bash scripts/export.sh runs/soar_pilot_v1
 ```
 
-This runs SOAR only, not top1/window/repair again. It reuses the source sample
-order, exact prompt IDs, model revision, response length and block length. It
-does not need another dataset download. Model inference has not been run locally.
-The source run is never written. Resume unchanged commands to skip completed
-questions. Progress prints every 32 decoding steps and after each question.
+On a fresh machine, clone our repo and omit `SKIP_INSTALL=1`; the wrapper creates
+the venv and installs dependencies. The official SOAR checkout is prepared
+automatically. GSM8K and checkpoint files download if not already cached.
+`RUN_NAME` only controls the output folder and can be omitted for a timestamped
+name. No Hugging Face cache variables are forced.
+
+Default inputs: `openai/gsm8k`, configuration `main`, test split, deterministic
+shuffle seed 1729, offset 0. Save the selected questions in our own
+`samples.jsonl` and the resolved dataset revision in `manifest.json`. Resume uses
+these saved questions and checks their hash; it does not fetch the dataset again.
+
+Default model: LLaDA-8B-Instruct, revision
+`08b83a6feb34df1a6011b80c3c00c7563e963b07`, CUDA BF16. Prompts contain only the
+original question as a user message, rendered with the checkpoint's chat
+template and assistant generation marker. No system message, few-shot examples,
+or extra answer-format instruction. This is an explicit question-only experiment,
+not a reproduction of the paper's complete evaluation protocol.
+
+This runs SOAR only. Resume an unchanged command and RUN_NAME to skip completed
+questions. Model inference has not been run locally. Progress prints every 32
+steps and after each question, including a CPU-analysis progress message.
 
 ## Measurements
 
@@ -83,8 +98,8 @@ separately from mixture metrics. Single-parent steps have no mixture estimates.
   min parallel tokens **1**, cumulative score is **sum of probabilities**, and
   beam collapse/deduplication rules remain upstream. This differs from our
   previous threshold-0.9 collector.
-- Temperature 0, CFG 0, no cache; prompt/model come from the source run.
-- Maximum iterations set to response length (256 for this experiment), rather
+- Temperature 0, CFG 0, no cache; standalone model/prompt settings are above.
+- Maximum iterations set to response length (256 for the default experiment), rather
   than upstream default 128. No early stop on EOS. Final scoring trims first
   EOS/eot using the saved stop IDs and the existing numeric-answer extractor.
 - Upstream MASK and special-token selection behavior is retained. Unlike our
@@ -178,7 +193,6 @@ Use a fresh output folder for this version, for example:
 
 ```bash
 python -u experiments/soar_reuse/run_probe.py \
-  --window runs/window4_repair75_500_v1/top1_window \
   --out runs/soar_support_convergence_smoke_v1 --samples 2 --beam-size 2
 ```
 
@@ -187,51 +201,32 @@ extra model forwards. GPU execution still needs the Vast smoke test. The probe
 code fingerprint includes `convergence.py` and `checkout.py`, preventing mixed-version resumes.
 
 
-## Vast wrapper with the cloned upstream repo
-
-On an existing configured machine, from this experiment repo:
-
-```bash
-git pull
-bash scripts/vast_soar.sh setup
-WINDOW_RUN=runs/window4_repair75_500_v1/top1_window \
-RUN_NAME=soar_checkout_smoke_v1 SKIP_INSTALL=1 \
-  bash scripts/vast_soar.sh smoke
-```
-
-Then, after inspecting the two-question smoke:
-
-```bash
-WINDOW_RUN=runs/window4_repair75_500_v1/top1_window \
-RUN_NAME=soar_checkout_pilot_v1 SKIP_INSTALL=1 \
-  bash scripts/vast_soar.sh pilot
-```
-
-On a fresh machine, clone our repo and restore the completed source window run
-at the path passed to `WINDOW_RUN`. Omit `SKIP_INSTALL=1` to create the venv and
-install our existing pinned GPU dependencies. It does not regenerate window or
-top1 outputs and does not download GSM8K. Checkpoint weights may need downloading
-if absent. The upstream repo's complete evaluation environment is not installed:
-we call its pinned LLaDA decoder using our existing model environment, as before.
+## Wrapper and direct options
 
 `setup` only clones/verifies SOAR: no packages, dataset, model, or inference.
-`smoke` runs 2 questions; `pilot` runs 100. Both retain the source response length
-(256 here), use beam size 2, and retain upstream strict >0.95 threshold and
-maximum parallel commits 5. Set `SAMPLES`, `BEAM_SIZE`, `RUN_NAME`, or `SOAR_ROOT`
-explicitly to change them. No Hugging Face cache variables are forced.
+`smoke` runs 2 questions; `pilot` runs 100. Both use response length 256, one
+full response block, maximum decoding iterations 256, beam size 2, upstream
+strict >0.95 threshold and maximum parallel commits 5. Set `SAMPLES`, `BEAM_SIZE`,
+`LENGTH`, `BLOCK_LENGTH`, `STEPS`, `SEED`, `OFFSET`, `RUN_NAME`, or `SOAR_ROOT`
+explicitly to change wrapper settings. `STEPS=0` means response length.
 
-The same script can resume an unchanged `RUN_NAME`; completed questions are
-skipped. Use a new output folder after changing probe code or source settings.
-The earlier single-file-download manifests cannot be resumed by this version.
-`summary.json`, per-question `result.json`, `branches.jsonl.gz`, and
-`convergence.jsonl.gz` are under `runs/RUN_NAME`. Export manually if desired:
+For further input options, activate the venv and use the direct command:
 
 ```bash
-bash scripts/export.sh runs/soar_checkout_pilot_v1
+python -u experiments/soar_reuse/run_probe.py \
+  --out runs/soar_direct_smoke_v1 --samples 2 --length 256 --beam-size 2
 ```
 
-An existing upstream checkout is never reset, pulled, or overwritten. A wrong
-commit or dirty checkout produces a clear error. Set `SOAR_ROOT` to another
-new directory if you want to keep a checkout containing your own edits. The
-probe itself never writes inside the SOAR checkout. Read their code at
-`external/SOAR/eval_llada8b/generate.py`, and our checkout checks in `checkout.py`.
+Direct flags also include `--model`, `--revision`, `--mask-id`, `--dataset`,
+`--dataset-revision`, `--split`, `--seed`, `--offset`, and optional `--data-jsonl`
+for offline question/answer rows. References must include GSM8K's numeric ####
+marker. `--window` no longer exists. Earlier source-run-based output manifests
+cannot be resumed with this version; use a fresh RUN_NAME.
+
+The wrapper uses our pinned GPU environment, not upstream's complete evaluation
+harness environment. Existing upstream checkouts are never reset, pulled, or
+overwritten. A wrong commit or dirty checkout gives an error. Set `SOAR_ROOT` to
+another new directory to retain a checkout containing your own edits. The probe
+never writes inside that checkout. Read their decoder at
+`external/SOAR/eval_llada8b/generate.py`; our checkout checks in `checkout.py`;
+standalone sample selection and prompt construction in `inputs.py`.
