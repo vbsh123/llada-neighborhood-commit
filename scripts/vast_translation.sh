@@ -36,6 +36,7 @@ python -m unittest discover -s tests -p 'test_translation_probe.py' -v
 python -m pip freeze > "$experiment_out/packages.txt"
 nvidia-smi > "$experiment_out/nvidia-smi.txt"
 python -u -m experiments.translation_probe.run \
+  --inputs "${INPUTS:-experiments/translation_probe/inputs/flores_zh_en_dev_10.jsonl}" \
   --out "$experiment_out" --samples "$count" --policies top1 threshold \
   --length "${LENGTH:-256}" --commit-threshold "${COMMIT_THRESHOLD:-0.9}"
 bash scripts/export.sh "$experiment_out"

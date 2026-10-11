@@ -68,7 +68,7 @@ def run(args):
             manifest = {'config': config, 'source_sha256': fingerprint(), 'created_unix': time.time(),
                         'git_commit': command('git','rev-parse','HEAD'),
                         'packages': {d.metadata['Name']: d.version for d in importlib.metadata.distributions()},
-                        'dataset_info': json.loads((HERE/'inputs/provenance.json').read_text()) if args.inputs.resolve() == (HERE/'inputs/flores_zh_en_dev_10.jsonl').resolve() else {'source':'custom_jsonl'},
+                        'dataset_info': json.loads((args.inputs.parent/'provenance.json').read_text()) if (args.inputs.parent/'provenance.json').exists() else {'source':'custom_jsonl'},
                         'instruction': INSTRUCTION, 'cuda': torch.version.cuda,
                         'gpu': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}
             dump(manifest_path,manifest)

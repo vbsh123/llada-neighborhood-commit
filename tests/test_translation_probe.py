@@ -16,6 +16,7 @@ import torch
 from confidence_geography.run import collect_sample, score_gsm8k
 from experiments.translation_probe import run as runner
 from experiments.translation_probe.evaluate import evaluate, score_translation
+from experiments.translation_probe.render import collect, visible_text
 
 
 class Tokenizer:
@@ -53,6 +54,29 @@ class TranslationTests(unittest.TestCase):
         cls.old_threads=torch.get_num_threads();torch.set_num_threads(1)
     @classmethod
     def tearDownClass(cls):torch.set_num_threads(cls.old_threads)
+
+    def test_invisible_output_detection(self):
+        for text in ('', ' \n', '\u200b', '\u200b\u200c'):
+            self.assertFalse(visible_text(text))
+        self.assertTrue(visible_text('Translation\u200b'))
+        self.assertTrue(visible_text('猫'))
+
+    def test_four_sentence_inputs_preserve_alignment(self):
+        directory=runner.HERE/'inputs_four_sentences'
+        rows=[json.loads(line) for line in (directory/'flores_zh_en_dev_10.jsonl').read_text().splitlines()]
+        self.assertEqual(len(rows),10)
+        ids=[]
+        for row in rows:
+            pairs=row['sentence_pairs']
+            self.assertEqual(len(pairs),4)
+            self.assertEqual(row['source_text'],'\n'.join(p['source_text'] for p in pairs))
+            self.assertEqual(row['reference'],'\n'.join(p['reference'] for p in pairs))
+            self.assertEqual(row['flores_ids'],[p['flores_id'] for p in pairs])
+            ids.extend(row['flores_ids'])
+        self.assertEqual(len(set(ids)),40)
+        provenance=json.loads((directory/'provenance.json').read_text())
+        self.assertEqual(provenance['flores_ids'],ids)
+        self.assertEqual(provenance['selected_inputs_sha256'],hashlib.sha256((directory/'flores_zh_en_dev_10.jsonl').read_bytes()).hexdigest())
 
     def test_fixed_ten_pairs_and_exact_prompt(self):
         path=runner.HERE/'inputs/flores_zh_en_dev_10.jsonl'
@@ -113,6 +137,9 @@ class TranslationTests(unittest.TestCase):
             self.assertEqual(summary['policies']['top1']['total_forwards'],8)
             self.assertEqual(summary['policies']['threshold']['total_forwards'],2)
             self.assertEqual(summary['policies']['top1']['chrfpp'],100)
+            reports,audit=collect(args.out)
+            self.assertEqual(len(reports),4)
+            self.assertEqual(audit['identical_translation_pairs'],2)
             with contextlib.redirect_stdout(io.StringIO()), patch.object(runner,'load_model',side_effect=AssertionError('Resume must not load model')):
                 runner.run(args)
             with contextlib.redirect_stdout(io.StringIO()):report=evaluate(args.out)
