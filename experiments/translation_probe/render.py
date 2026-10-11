@@ -119,7 +119,7 @@ def render(run,out):
     (out/'audit.json').write_text(json.dumps(audit,indent=2)+'\n')
     (out/'README.md').write_text(
         '# Translation commitment viewer\n\nOpen `translation_commitment_slider.html`; it is self-contained. '
-        'All ten examples and both policies are included. No model inference was run.\n\n'
+        'All saved examples and policies are included. No model inference was run.\n\n'
         'Default view shows the full response window. Unchecking the full-window box restricts positions to the final translation before its first stop token. '
         'The full-window checkbox includes special/post-stop fills. Frame 0 is before decoding; '
         'frame t+1 is after forward t. Regions are filled-token groups separated by at least '
@@ -128,8 +128,7 @@ def render(run,out):
         'The commitment timeline shows all saved commitment locations in the selected view, '
         'including future forwards, for retrospective inspection. The orange line identifies the '
         'selected frame. The token panel and merge graph show only history up through that frame.\n\n'
-        'Two outputs contain only U+200B (zero-width space), rather than usable translations. '
-        'They are flagged explicitly; original raw output/scoring are preserved. Corpus scores '
+        'Invisible-only outputs, if present, are flagged explicitly; original raw output/scoring are preserved. Corpus scores '
         'are not accuracy percentages.\n\n'
         'Code: `experiments/translation_probe/render.py`. Validation: `audit.json`.\n',encoding='utf-8')
     print(json.dumps(audit,indent=2));print(target)

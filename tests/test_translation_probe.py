@@ -99,6 +99,18 @@ class TranslationTests(unittest.TestCase):
         self.assertTrue(score_translation('',sample)['empty_translation'])
         self.assertTrue(score_gsm8k('The answer is 42',{'answer':'reasoning\n#### 42'})['correct_numeric'])
 
+    def test_explicit_four_sentence_instruction(self):
+        path=runner.HERE/'inputs_four_sentences/flores_zh_en_dev_10.jsonl'
+        default=runner.load_samples(path,2)
+        diagnostic=runner.load_samples(path,2,runner.ALL_INSTRUCTION)
+        for a,b in zip(default,diagnostic):
+            self.assertEqual(b['question'],runner.ALL_INSTRUCTION+a['source_text'])
+            self.assertEqual(a['answer'],b['answer'])
+            self.assertEqual(a['source_text'],b['source_text'])
+            self.assertEqual(a['id'],b['id'])
+            self.assertNotIn(b['answer'],b['question'])
+        self.assertFalse(runner.parser().parse_args(['--out','unused']).translate_all)
+
     def test_real_trace_writer_top1_threshold_and_fallback(self):
         sample={'id':'00001','question':runner.INSTRUCTION+'猫在睡觉。','source_text':'猫在睡觉。','answer':'The cat sleeps'}
         for policy,threshold,steps in [('top1',.9,4),('threshold',.9,1),('threshold',1.,4)]:

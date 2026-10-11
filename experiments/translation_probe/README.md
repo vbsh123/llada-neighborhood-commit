@@ -109,6 +109,18 @@ python -m experiments.translation_probe.prepare --archive /path/to/flores200_dat
   --out experiments/translation_probe/inputs_four_sentences --sentences-per-input 4
 ```
 
+To check explicit instruction following on the first two four-sentence inputs,
+use a separate output directory. This changes only the task instruction, with a
+distinct prompt protocol stored in the manifest and trace headers:
+
+```bash
+python -u -m experiments.translation_probe.run \
+  --inputs experiments/translation_probe/inputs_four_sentences/flores_zh_en_dev_10.jsonl \
+  --out runs/translation_all_four_check_v1 --samples 2 --translate-all \
+  --policies top1 threshold --length 256 --commit-threshold 0.9
+bash scripts/export.sh runs/translation_all_four_check_v1
+```
+
 Re-score saved translations without loading LLaDA:
 
 ```bash

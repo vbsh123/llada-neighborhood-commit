@@ -13,9 +13,11 @@ from .evaluate import SCORING_PROTOCOL, evaluate, score_translation
 HERE = Path(__file__).resolve().parent
 PROMPT_PROTOCOL = 'flores_zh_en_translation_only_chat_v1'
 INSTRUCTION = 'Translate the following Chinese text into English.\nReturn only the translation.\n\n'
+ALL_INSTRUCTION = 'Translate all four Chinese sentences below into English, preserving their order.\nTranslate every sentence; do not omit any. Return only the translations.\n\n'
+ALL_PROMPT_PROTOCOL = 'flores_zh_en_translate_all_four_chat_v1'
 
 
-def load_samples(path, count):
+def load_samples(path, count, instruction=INSTRUCTION):
     rows = [json.loads(line) for line in Path(path).read_text(encoding='utf-8').splitlines() if line.strip()]
     if count < 1 or count > len(rows):
         raise ValueError(f'Requested {count} examples; input has {len(rows)}')
@@ -29,7 +31,7 @@ def load_samples(path, count):
             raise ValueError('Expected Simplified Chinese→English inputs')
         if not row['source_text'].strip() or not row['reference'].strip():
             raise ValueError('Empty source/reference')
-    return [{**r, 'question': INSTRUCTION+r['source_text'], 'answer': r['reference']} for r in selected]
+    return [{**r, 'question': instruction+r['source_text'], 'answer': r['reference']} for r in selected]
 
 
 def fingerprint():
@@ -43,12 +45,16 @@ def run(args):
     import torch
     if args.length < 1 or args.log_every < 1 or not 0 <= args.commit_threshold <= 1:
         raise ValueError('Positive length/log interval and threshold in [0,1] required')
-    samples = load_samples(args.inputs, args.samples)
+    instruction = ALL_INSTRUCTION if args.translate_all else INSTRUCTION
+    protocol = ALL_PROMPT_PROTOCOL if args.translate_all else PROMPT_PROTOCOL
+    samples = load_samples(args.inputs, args.samples, instruction)
+    if args.translate_all and any(len(s.get('sentence_pairs',[]))!=4 for s in samples):
+        raise ValueError('--translate-all requires four-sentence inputs')
     config = {'model': MODEL, 'revision': REVISION, 'mask_id': 126336, 'length': args.length,
               'block_length': args.length, 'policies': args.policies, 'seed': args.seed,
               'samples': args.samples, 'commit_threshold': args.commit_threshold,
               'thresholds': [.5,.7,.8,.9,.95,.99], 'top_k': 5, 'log_every': args.log_every,
-              'prompt_protocol': PROMPT_PROTOCOL, 'scoring_protocol': SCORING_PROTOCOL,
+              'prompt_protocol': protocol, 'scoring_protocol': SCORING_PROTOCOL,
               'inputs_sha256': hashlib.sha256(args.inputs.read_bytes()).hexdigest()}
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -69,7 +75,7 @@ def run(args):
                         'git_commit': command('git','rev-parse','HEAD'),
                         'packages': {d.metadata['Name']: d.version for d in importlib.metadata.distributions()},
                         'dataset_info': json.loads((args.inputs.parent/'provenance.json').read_text()) if (args.inputs.parent/'provenance.json').exists() else {'source':'custom_jsonl'},
-                        'instruction': INSTRUCTION, 'cuda': torch.version.cuda,
+                        'instruction': instruction, 'cuda': torch.version.cuda,
                         'gpu': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}
             dump(manifest_path,manifest)
         pending=[]
@@ -92,7 +98,7 @@ def run(args):
                 random.seed(args.seed);np.random.seed(args.seed);torch.manual_seed(args.seed)
                 directory.mkdir(parents=True,exist_ok=True);torch.cuda.reset_peak_memory_stats()
                 result=collect_sample(model,tokenizer,{**config,'policy':policy},sample,directory,
-                                      prompt_protocol=PROMPT_PROTOCOL,score_output=score_translation)
+                                      prompt_protocol=protocol,score_output=score_translation)
                 print(f"DONE policy={policy} sample={sample['id']} chrF++={result['chrfpp']:.2f} forwards={result['steps']} seconds={result['elapsed_seconds']:.1f}",flush=True)
             del model
         evaluate(out)
@@ -108,6 +114,7 @@ def parser():
     p.add_argument('--commit-threshold',type=float,default=.9)
     p.add_argument('--seed',type=int,default=1729)
     p.add_argument('--log-every',type=int,default=32)
+    p.add_argument('--translate-all',action='store_true',help='Explicitly require translating all four sentences; diagnostic prompt variant')
     return p
 
 
