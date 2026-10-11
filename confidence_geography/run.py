@@ -132,7 +132,19 @@ def final_word_map(tokenizer, tokens):
             'words': [text[a:b] for a, b in spans] if valid else None}
 
 
-def collect_sample(model, tokenizer, config, sample, output):
+def score_gsm8k(answer, sample):
+    """Keep GSM8K evaluation separate from the shared trace decoder."""
+    predicted, method = numeric_answer(answer)
+    gold, _ = numeric_answer(sample['answer'], reference=True)
+    correct = predicted == gold and gold is not None
+    return {'predicted_answer': predicted, 'gold_answer': gold,
+            'scoring_protocol': SCORING_PROTOCOL, 'answer_extraction': method,
+            'correct_numeric': correct, 'correct_strict': method == 'marked' and correct,
+            'correct_lenient': correct}
+
+
+def collect_sample(model, tokenizer, config, sample, output, *,
+                   prompt_protocol=PROMPT_PROTOCOL, score_output=score_gsm8k):
     import torch
     # Preserve the dataset question verbatim; add no task or answer-format instructions.
     prompt_text = tokenizer.apply_chat_template([{'role': 'user', 'content': sample['question']}],
@@ -158,7 +170,7 @@ def collect_sample(model, tokenizer, config, sample, output):
     partial = output / 'trace.jsonl.gz.partial'
     with gzip.open(partial, 'wt', encoding='utf-8', compresslevel=3) as handle, torch.inference_mode():
         emit(handle, {'type': 'header', 'schema_version': 1, 'config': config, 'sample': sample,
-                      'prompt_protocol': PROMPT_PROTOCOL, 'user_message': sample['question'],
+                      'prompt_protocol': prompt_protocol, 'user_message': sample['question'],
                       'prompt_text': prompt_text, 'prompt_ids': prompt_ids, 'stop_ids': sorted(stop_ids)})
         for block_start in range(0, length, block):
             block_end = min(length, block_start + block)
@@ -224,18 +236,12 @@ def collect_sample(model, tokenizer, config, sample, output):
         tokens = x[0, pl:].tolist()
         end = min((i for i, t in enumerate(tokens) if t in stop_ids), default=length)
         answer = tokenizer.decode(tokens[:end], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        predicted, method = numeric_answer(answer)
-        gold, _ = numeric_answer(sample['answer'], reference=True)
         summary = {'type': 'result', 'sample_id': sample['id'], 'steps': step,
                    'question': sample['question'], 'reference': sample['answer'],
                    'final_ids': tokens, 'answer': answer, 'first_stop_position': end if end < length else None,
                    'first_stop_step': first_stop_step, 'answer_token_length': end,
-                   'hit_length_limit': end == length, 'predicted_answer': predicted, 'gold_answer': gold,
-                   'prompt_protocol': PROMPT_PROTOCOL, 'scoring_protocol': SCORING_PROTOCOL,
-                   'answer_extraction': method, 'correct_numeric': predicted == gold and gold is not None,
-                   # Keep legacy fields for old analysis consumers; strict is marker-only diagnostic.
-                   'correct_strict': method == 'marked' and predicted == gold and gold is not None,
-                   'correct_lenient': predicted == gold and gold is not None,
+                   'hit_length_limit': end == length, 'prompt_protocol': prompt_protocol,
+                   **score_output(answer, sample),
                    'elapsed_seconds': time.perf_counter()-start_time,
                    'peak_gpu_bytes': torch.cuda.max_memory_allocated() if x.is_cuda else None, 'token_dictionary': dictionary,
                    'word_map': final_word_map(tokenizer, tokens)}

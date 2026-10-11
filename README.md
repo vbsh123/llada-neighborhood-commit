@@ -4,6 +4,11 @@ GSM8K experiment: ordinary highest-confidence top1 and a top1-anchored
 three- or four-position window. Independent repository; no model inference runs locally.
 Collector derived from [dllm-confidence-geography](https://github.com/vbsh123/dllm-confidence-geography).
 
+Separate ten-example Chinese→English translation probe:
+[instructions and exact protocol](experiments/translation_probe/README.md).
+Run `RUN_NAME=translation_10_v1 bash scripts/vast_translation.sh pilot` for the
+same 10 FLORES pairs under TOP1 and threshold 0.9, with full traces and chrF++/BLEU.
+
 ## Decoder
 
 `top1_window` finds the highest-confidence eligible masked position p, then
