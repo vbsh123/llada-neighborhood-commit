@@ -51,7 +51,7 @@ for(const r of ctx.reports){for(const gap of [1,2,3,4,5,6,7,8,9,10])for(const sh
  }
  variants++;ctx.clearCache();
 }}
-console.log(JSON.stringify({questions:10,policy_examples:ctx.reports.length,variants_checked:variants,frames_checked:total,control_frames_checked:controls,all_checks_passed:true}));
+console.log(JSON.stringify({questions:new Set(ctx.reports.map(r=>r.sample)).size,policy_examples:ctx.reports.length,variants_checked:variants,frames_checked:total,control_frames_checked:controls,all_checks_passed:true}));
 '''
 
 

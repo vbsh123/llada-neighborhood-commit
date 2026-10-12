@@ -45,13 +45,16 @@ def run(args):
     import torch
     if args.length < 1 or args.log_every < 1 or not 0 <= args.commit_threshold <= 1:
         raise ValueError('Positive length/log interval and threshold in [0,1] required')
+    block_length = args.length if args.block_length is None else args.block_length
+    if block_length < 1 or args.length % block_length:
+        raise ValueError('block-length must be positive and divide length')
     instruction = ALL_INSTRUCTION if args.translate_all else INSTRUCTION
     protocol = ALL_PROMPT_PROTOCOL if args.translate_all else PROMPT_PROTOCOL
     samples = load_samples(args.inputs, args.samples, instruction)
     if args.translate_all and any(len(s.get('sentence_pairs',[]))!=4 for s in samples):
         raise ValueError('--translate-all requires four-sentence inputs')
     config = {'model': MODEL, 'revision': REVISION, 'mask_id': 126336, 'length': args.length,
-              'block_length': args.length, 'policies': args.policies, 'seed': args.seed,
+              'block_length': block_length, 'policies': args.policies, 'seed': args.seed,
               'samples': args.samples, 'commit_threshold': args.commit_threshold,
               'thresholds': [.5,.7,.8,.9,.95,.99], 'top_k': 5, 'log_every': args.log_every,
               'prompt_protocol': protocol, 'scoring_protocol': SCORING_PROTOCOL,
@@ -88,7 +91,7 @@ def run(args):
                     continue
                 pending.append((policy,sample,directory))
         if pending:
-            print(f'Translation run: {len(samples)} matched examples; policies={args.policies}; pending={len(pending)}; length={args.length}',flush=True)
+            print(f'Translation run: {len(samples)} matched examples; policies={args.policies}; pending={len(pending)}; length={args.length}; block_length={block_length}',flush=True)
             print('Loading pinned LLaDA checkpoint...',flush=True)
             model,tokenizer=load_model(config)
             torch.backends.cuda.matmul.allow_tf32=False
@@ -111,6 +114,7 @@ def parser():
     p.add_argument('--samples',type=int,default=10)
     p.add_argument('--policies',nargs='+',choices=['top1','threshold'],default=['top1','threshold'])
     p.add_argument('--length',type=int,default=256)
+    p.add_argument('--block-length',type=int,default=None,help='Commit only within successive blocks; default remains the full response window')
     p.add_argument('--commit-threshold',type=float,default=.9)
     p.add_argument('--seed',type=int,default=1729)
     p.add_argument('--log-every',type=int,default=32)

@@ -159,6 +159,48 @@ class TranslationTests(unittest.TestCase):
             args.commit_threshold=.8
             with self.assertRaisesRegex(ValueError,'arguments/source changed'):runner.run(args)
 
+    def test_blockwise_translation_defers_remote_eos(self):
+        class EarlyEOSModel(Model):
+            def __call__(self,x,use_cache=False):
+                logits=torch.zeros(1,x.shape[1],9)
+                for p,tid in enumerate((1,2,3,6)):logits[0,p+1,tid]=16-p
+                logits[0,4,6]=24
+                if x[0,4].item()==6 and x[0,1].item()==0:
+                    logits[0,1,8]=25
+                return SimpleNamespace(logits=logits)
+        sample={'id':'00001','question':'Translate all four sentences.','source_text':'猫在睡觉。','answer':'The cat sleeps'}
+        for policy in ('top1','threshold'):
+            with self.subTest(policy=policy),tempfile.TemporaryDirectory() as tmp:
+                config={'mask_id':0,'length':4,'block_length':2,'top_k':5,'policy':policy,
+                        'commit_threshold':.9,'thresholds':[.9],'log_every':32}
+                result=collect_sample(EarlyEOSModel(),Tokenizer(),config,sample,Path(tmp),
+                                      prompt_protocol=runner.ALL_PROMPT_PROTOCOL,score_output=score_translation)
+                self.assertEqual(result['translation'],'The cat sleeps')
+                with gzip.open(Path(tmp)/'trace.jsonl.gz','rt') as f:steps=[json.loads(l) for l in f if '"type":"step"' in l]
+                self.assertTrue(steps)
+                self.assertTrue(all(p<2 for p in steps[0]['commit_positions']))
+                self.assertTrue(all(s['block_start']<=p<s['block_end'] for s in steps for p in s['commit_positions']))
+        with tempfile.TemporaryDirectory() as tmp:
+            global_config={**config,'block_length':4,'policy':'top1'}
+            result=collect_sample(EarlyEOSModel(),Tokenizer(),global_config,sample,Path(tmp),
+                                  prompt_protocol=runner.ALL_PROMPT_PROTOCOL,score_output=score_translation)
+            self.assertEqual(result['translation'],'zcat sleeps')
+        with tempfile.TemporaryDirectory() as tmp:
+            args=runner.parser().parse_args(['--out',tmp,'--length','4','--block-length','3'])
+            with self.assertRaisesRegex(ValueError,'block-length'):runner.run(args)
+
+    def test_runner_records_block_length(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args=runner.parser().parse_args(['--out',tmp,'--samples','2','--length','4','--block-length','2'])
+            with contextlib.redirect_stdout(io.StringIO()),patch.object(runner,'load_model',return_value=(Model(),Tokenizer())),patch.object(runner,'collect_sample',side_effect=collect_fixture),patch('torch.cuda.reset_peak_memory_stats'):
+                runner.run(args)
+            manifest=json.loads((Path(tmp)/'manifest.json').read_text())
+            self.assertEqual(manifest['config']['block_length'],2)
+            self.assertEqual(manifest['config']['length'],4)
+            reports,audit=collect(Path(tmp))
+            self.assertEqual(len(reports),4)
+            self.assertEqual(audit['threshold']['all_forwards'],4)
+
     def test_incorrect_result_reference_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);directory=root/'top1/samples/00001';directory.mkdir(parents=True)

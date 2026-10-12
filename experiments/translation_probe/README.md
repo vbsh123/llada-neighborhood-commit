@@ -121,6 +121,39 @@ python -u -m experiments.translation_probe.run \
 bash scripts/export.sh runs/translation_all_four_check_v1
 ```
 
+The above full-window diagnostic still produced invisible-only output for both
+inputs under both policies. A stronger instruction did not fix these cases.
+The LLaDA paper's Appendix B.3 warns that globally selecting confident tokens
+can overproduce EOS for the Instruct checkpoint and uses 32-token blocks:
+https://arxiv.org/html/2502.09992v1#A2.SS3
+
+Check the same two inputs with the existing blockwise decoder:
+
+```bash
+git pull
+source .venv/bin/activate
+python -u -m experiments.translation_probe.run \
+  --inputs experiments/translation_probe/inputs_four_sentences/flores_zh_en_dev_10.jsonl \
+  --out runs/translation_block32_check_v1 --samples 2 --translate-all \
+  --policies top1 threshold --length 256 --block-length 32 --commit-threshold 0.9
+bash scripts/export.sh runs/translation_block32_check_v1
+```
+
+This changes only block eligibility relative to the failed explicit-instruction
+run: commit within each consecutive 32-token block before advancing. No stop
+suppression, forced minimum output, cache, sampling, or early stop is added.
+TOP1 still commits one token; threshold still commits all eligible predictions
+at least 0.9, with a TOP1 fallback. The complete 256-slot window is still filled.
+Model, prompt, input IDs, scoring, and seed are unchanged. This is a diagnostic
+based on the paper's recommendation, not proof of successful translation and
+not an exact reproduction of its scheduled decoder. Local checks use synthetic
+CPU logits; actual translation must be checked on Vast before a larger run.
+
+Blocks constrain where commitments can occur, so this run cannot serve as an
+unrestricted-region comparison against the older full-window math traces.
+The default remains full-window decoding unless `--block-length` is supplied.
+The Vast wrapper also accepts `BLOCK_LENGTH=32`.
+
 Re-score saved translations without loading LLaDA:
 
 ```bash
