@@ -8,6 +8,7 @@ import random
 import time
 
 from confidence_geography.run import MODEL, REVISION, collect_sample, command, dump, load_model, run_lock
+from confidence_geography.core import select
 from .evaluate import SCORING_PROTOCOL, evaluate, score_translation
 
 HERE = Path(__file__).resolve().parent
@@ -15,6 +16,24 @@ PROMPT_PROTOCOL = 'flores_zh_en_translation_only_chat_v1'
 INSTRUCTION = 'Translate the following Chinese text into English.\nReturn only the translation.\n\n'
 ALL_INSTRUCTION = 'Translate all four Chinese sentences below into English, preserving their order.\nTranslate every sentence; do not omit any. Return only the translations.\n\n'
 ALL_PROMPT_PROTOCOL = 'flores_zh_en_translate_all_four_chat_v1'
+
+
+def select_translation(rows, config, stop_ids):
+    """Full-window control or explicitly labeled stop-deferral diagnostic.
+
+    Deferral never changes logits, raw probabilities, or predicted token IDs.
+    While any eligible position predicts a non-stop token, stop predictions are
+    withheld from commitment. If all remaining predictions are stop tokens,
+    the ordinary selection rule applies. There is no spatial restriction.
+    """
+    mode = config.get('stop_policy', 'unchanged')
+    if mode not in ('unchanged', 'defer'):
+        raise ValueError('Unknown translation stop policy')
+    candidates = [r for r in rows if r['eligible']]
+    non_stop = [r for r in candidates if r['token_id'] not in stop_ids]
+    deferred = [r['position'] for r in candidates if r['token_id'] in stop_ids] if mode == 'defer' and non_stop else []
+    chosen = select(non_stop if deferred else rows, config['policy'], 1, config['commit_threshold'])
+    return chosen, {'stop_selection': {'policy': mode, 'deferred_positions': deferred}}
 
 
 def load_samples(path, count, instruction=INSTRUCTION):
@@ -41,13 +60,13 @@ def fingerprint():
 
 
 def run(args):
-    import numpy as np
-    import torch
     if args.length < 1 or args.log_every < 1 or not 0 <= args.commit_threshold <= 1:
         raise ValueError('Positive length/log interval and threshold in [0,1] required')
     block_length = args.length if args.block_length is None else args.block_length
-    if block_length < 1 or args.length % block_length:
-        raise ValueError('block-length must be positive and divide length')
+    if block_length != args.length:
+        raise ValueError('Translation geography requires full-window decoding: block-length must equal length. Smaller blocks impose left-to-right progression.')
+    import numpy as np
+    import torch
     instruction = ALL_INSTRUCTION if args.translate_all else INSTRUCTION
     protocol = ALL_PROMPT_PROTOCOL if args.translate_all else PROMPT_PROTOCOL
     samples = load_samples(args.inputs, args.samples, instruction)
@@ -55,6 +74,7 @@ def run(args):
         raise ValueError('--translate-all requires four-sentence inputs')
     config = {'model': MODEL, 'revision': REVISION, 'mask_id': 126336, 'length': args.length,
               'block_length': block_length, 'policies': args.policies, 'seed': args.seed,
+              'stop_policy': args.stop_policy,
               'samples': args.samples, 'commit_threshold': args.commit_threshold,
               'thresholds': [.5,.7,.8,.9,.95,.99], 'top_k': 5, 'log_every': args.log_every,
               'prompt_protocol': protocol, 'scoring_protocol': SCORING_PROTOCOL,
@@ -92,6 +112,9 @@ def run(args):
                 pending.append((policy,sample,directory))
         if pending:
             print(f'Translation run: {len(samples)} matched examples; policies={args.policies}; pending={len(pending)}; length={args.length}; block_length={block_length}',flush=True)
+            print(f'Selection: full-window; stop_policy={args.stop_policy}. No sequential blocks.',flush=True)
+            if args.stop_policy == 'defer':
+                print('DIAGNOSTIC: defer stop predictions while any eligible non-stop prediction remains; raw probabilities unchanged. This differs from the unchanged GSM8K decoder.',flush=True)
             print('Loading pinned LLaDA checkpoint...',flush=True)
             model,tokenizer=load_model(config)
             torch.backends.cuda.matmul.allow_tf32=False
@@ -101,7 +124,8 @@ def run(args):
                 random.seed(args.seed);np.random.seed(args.seed);torch.manual_seed(args.seed)
                 directory.mkdir(parents=True,exist_ok=True);torch.cuda.reset_peak_memory_stats()
                 result=collect_sample(model,tokenizer,{**config,'policy':policy},sample,directory,
-                                      prompt_protocol=protocol,score_output=score_translation)
+                                      prompt_protocol=protocol,score_output=score_translation,
+                                      select_output=select_translation)
                 print(f"DONE policy={policy} sample={sample['id']} chrF++={result['chrfpp']:.2f} forwards={result['steps']} seconds={result['elapsed_seconds']:.1f}",flush=True)
             del model
         evaluate(out)
@@ -114,7 +138,9 @@ def parser():
     p.add_argument('--samples',type=int,default=10)
     p.add_argument('--policies',nargs='+',choices=['top1','threshold'],default=['top1','threshold'])
     p.add_argument('--length',type=int,default=256)
-    p.add_argument('--block-length',type=int,default=None,help='Commit only within successive blocks; default remains the full response window')
+    p.add_argument('--block-length',type=int,default=None,help='Compatibility option: must equal length. Smaller blocks are rejected.')
+    p.add_argument('--stop-policy',choices=['unchanged','defer'],default='unchanged',
+                   help='unchanged = original GSM8K selection; defer = explicit diagnostic withholding stop commits while non-stop predictions remain')
     p.add_argument('--commit-threshold',type=float,default=.9)
     p.add_argument('--seed',type=int,default=1729)
     p.add_argument('--log-every',type=int,default=32)

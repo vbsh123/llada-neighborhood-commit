@@ -144,7 +144,7 @@ def score_gsm8k(answer, sample):
 
 
 def collect_sample(model, tokenizer, config, sample, output, *,
-                   prompt_protocol=PROMPT_PROTOCOL, score_output=score_gsm8k):
+                   prompt_protocol=PROMPT_PROTOCOL, score_output=score_gsm8k, select_output=None):
     import torch
     # Preserve the dataset question verbatim; add no task or answer-format instructions.
     prompt_text = tokenizer.apply_chat_template([{'role': 'user', 'content': sample['question']}],
@@ -200,13 +200,16 @@ def collect_sample(model, tokenizer, config, sample, output, *,
                                 'beyond_observed_stop': p > observed_stop if observed_stop is not None else None})
                 quota = 1  # Window size is determined by offsets, not a quota.
                 window_size = config.get('window_size', 3)
-                chosen = select(rows, config['policy'], quota, config['commit_threshold'], window_size)
+                selection_metadata = {}
+                if select_output is None:
+                    chosen = select(rows, config['policy'], quota, config['commit_threshold'], window_size)
+                else:
+                    chosen, selection_metadata = select_output(rows, config, stop_ids)
                 committed = [r['position'] for r in chosen]
                 selected = set(committed)
                 for row in rows:
                     row['committed'] = row['position'] in selected
                 metrics = step_metrics(rows, previous_metrics, last_commits, config['thresholds'])
-                selection_metadata = {}
                 if config['policy'] == 'top1_window':
                     anchor = committed[0]
                     selection_metadata = {'selection': {

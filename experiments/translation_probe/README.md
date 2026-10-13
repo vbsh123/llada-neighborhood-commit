@@ -121,111 +121,59 @@ python -u -m experiments.translation_probe.run \
 bash scripts/export.sh runs/translation_all_four_check_v1
 ```
 
-The above full-window diagnostic still produced invisible-only output for both
-inputs under both policies. A stronger instruction did not fix these cases.
-The LLaDA paper's Appendix B.3 warns that globally selecting confident tokens
-can overproduce EOS for the Instruct checkpoint and uses 32-token blocks:
-https://arxiv.org/html/2502.09992v1#A2.SS3
+## Full-window comparison and EOS failure
 
-Check the same two inputs with the existing blockwise decoder:
+Translation geography now requires `block_length == length`. Smaller blocks
+are rejected before model loading. Previous `translation_block32_*` outputs
+used sequential 32-token blocks; they cannot establish spontaneous whole-answer
+commitment order. The viewer labels those saved runs as block-constrained diagnostics.
+Do not use them as the GSM8K comparison.
+
+The unchanged full-window four-sentence runs produced excessive early EOS and
+invisible/partial translations. The explicit four-sentence instruction alone did
+not fix the two-example check. Repeating that exact configuration is a control,
+not a promised fix.
+
+An optional **EOS-deferred diagnostic** keeps all 256 positions available and
+leaves model logits, token predictions and probabilities unchanged. At each
+forward, if any eligible masked position predicts a non-stop token, only those
+non-stop predictions compete for commitment. If every remaining prediction is
+a stop token, ordinary selection resumes. TOP1 commits the most confident
+remaining candidate; threshold commits all remaining candidates above 0.9,
+falling back to one if none qualify. No position proximity or prefix constraint
+is added. Both EOS and EOT are stop tokens, as in the existing decoder.
+
+This changes stop commitment timing and therefore future context. It is **not**
+the unchanged GSM8K decoder and is not proven to fix real translation outputs.
+It may postpone stopping too far, allow trailing material, or still fail when
+all positions predict stop tokens. There is no reference-based length constraint,
+no logit boost, no probability renormalization, no cache, and no early stopping.
+Special tokens other than EOS/EOT are not filtered. Every run records
+`stop_policy`; every diagnostic step records withheld positions. Raw highest
+confidence statistics can therefore differ from the selected candidate.
+
+On an existing Vast installation, run all 10 examples with this diagnostic:
 
 ```bash
-git pull
+cd /workspace/llada-neighborhood-commit
+git pull --ff-only
 source .venv/bin/activate
 python -u -m experiments.translation_probe.run \
   --inputs experiments/translation_probe/inputs_four_sentences/flores_zh_en_dev_10.jsonl \
-  --out runs/translation_block32_check_v1 --samples 2 --translate-all \
-  --policies top1 threshold --length 256 --block-length 32 --commit-threshold 0.9
-bash scripts/export.sh runs/translation_block32_check_v1
+  --out runs/translation_fullwindow_defer_10_v1 \
+  --samples 10 --translate-all --policies top1 threshold \
+  --length 256 --block-length 256 --stop-policy defer \
+  --commit-threshold 0.9 --seed 1729 --log-every 16
+bash scripts/export.sh runs/translation_fullwindow_defer_10_v1
 ```
 
-This changes only block eligibility relative to the failed explicit-instruction
-run: commit within each consecutive 32-token block before advancing. No stop
-suppression, forced minimum output, cache, sampling, or early stop is added.
-TOP1 still commits one token; threshold still commits all eligible predictions
-at least 0.9, with a TOP1 fallback. The complete 256-slot window is still filled.
-Model, prompt, input IDs, scoring, and seed are unchanged. This is a diagnostic
-based on the paper's recommendation, not proof of successful translation and
-not an exact reproduction of its scheduled decoder. Local checks use synthetic
-CPU logits; actual translation must be checked on Vast before a larger run.
+For the exact unchanged-selection control, use `--stop-policy unchanged` and
+`--out runs/translation_fullwindow_control_10_v1`. Inputs, prompt, model, length
+and policies are identical. The previously downloaded explicit two-example
+full-window check already serves as a control for the first two examples.
+Never overwrite or relabel previous results as this new run.
 
-Blocks constrain where commitments can occur, so this run cannot serve as an
-unrestricted-region comparison against the older full-window math traces.
-The default remains full-window decoding unless `--block-length` is supplied.
-The Vast wrapper also accepts `BLOCK_LENGTH=32`.
-
-Re-score saved translations without loading LLaDA:
-
-```bash
-source .venv/bin/activate
-python -m experiments.translation_probe.evaluate --out runs/translation_10_v1
-```
-
-## Exact choices
-
-- Model: `GSAI-ML/LLaDA-8B-Instruct`, checkpoint
-  `08b83a6feb34df1a6011b80c3c00c7563e963b07`, CUDA BF16.
-- Original FLORES-200 `dev`, Simplified Chinese `zho_Hans` to English `eng_Latn`.
-  Shuffle the 997 paired rows with seed 1729 and take 10, without filtering for
-  sentence length or translation quality. Original row IDs and archive/input
-  SHA256 hashes are retained. The English reference is never given to the model.
-- User message is exactly:
-
-  ```text
-  Translate the following Chinese text into English.
-  Return only the translation.
-
-  {original Chinese source}
-  ```
-
-  Rendered with the checkpoint's chat template and assistant-generation marker.
-  This is an explicit translation instruction, with no added system message,
-  examples, answer prefix, or reasoning request.
-- Full 256-MASK response window, one block. TOP1 commits the highest-confidence
-  eligible position; lower position wins confidence ties. Threshold commits all
-  eligible predictions ≥0.9, falling back to one TOP1 commit if none qualify.
-  Simultaneous threshold commits use the same forward's predictions.
-- The shared decoder excludes MASK from commitment, retaining unrenormalized
-  token probabilities. No neighborhood forcing, remasking, cache or sampling.
-- Fill the full window even after EOS appears, matching our prior traces. Final
-  translation is decoded before the first final EOS/eot token; full-window
-  states/commits are retained. Special/post-stop fills remain distinguishable.
-- Per masked position per forward: top1 token/probability, top five predictions,
-  vocabulary entropy, previous-prediction probability and confidence changes,
-  eligibility/special/category flags, distance information and commitment flag.
-  Record all states, selected positions/IDs, previous commits, and forward timing.
-- Primary quality metric: corpus chrF++ (`CHRF(word_order=2)`). Secondary:
-  corpus BLEU with English `13a` tokenization. Metric signatures are saved.
-  Sentence chrF++ is available for inspection. No numeric-answer extraction or
-  exact-match "accuracy" is used. Outputs are scored as generated before the
-  stop boundary; explanations/quotes are not silently stripped. Ten examples
-  support qualitative exploration, not a reliable translation benchmark claim.
-- Reported elapsed time includes trace/scoring overhead; forward times exclude
-  those costs. Full-window forward counts include special/post-stop work.
-
-The common `collect_sample()` now accepts an explicit task scoring callback and
-prompt-protocol label. Existing GSM8K calls retain their original scoring and
-prompt behavior. Translation does not invoke the GSM8K `execute()` dataset path.
-
-## Data provenance / license
-
-These 10 sentence pairs retain the dataset's **CC BY-SA 4.0** license.
-Attribution: FLORES-200 / NLLB Team, Meta AI, *No Language Left Behind: Scaling
-Human-Centered Machine Translation* (2022). Sources:
-
-- https://github.com/facebookresearch/flores/tree/main/flores200
-- https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz
-- https://creativecommons.org/licenses/by-sa/4.0/
-- https://github.com/mjpost/sacrebleu
-
-To reproduce the exact bundled selection from the original public archive:
-
-```bash
-curl -fL --retry 3 -o /tmp/flores200_dataset.tar.gz \
-  https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz
-python -m experiments.translation_probe.prepare --archive /tmp/flores200_dataset.tar.gz
-```
-
-Preparation verifies the pinned archive hash and reads only the paired dev text
-members, without extracting archive paths. No model inference runs in preparation
-or evaluation. Local validation uses tiny synthetic logits, never LLaDA weights.
+The Vast wrapper also supports `STOP_POLICY=defer` and `TRANSLATE_ALL=1`, with
+`INPUTS` pointing to the four-sentence file. Its default stop policy remains
+`unchanged`. It rejects `BLOCK_LENGTH` different from `LENGTH` before installing
+packages or launching inference. GSM8K scripts and default selection are unchanged.

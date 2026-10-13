@@ -2,6 +2,12 @@
 # CUDA inference only on Vast. Default: 10 matched examples per policy, never GSM8K/window/SOAR.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+translation_length="${LENGTH:-256}"
+[[ "${BLOCK_LENGTH:-$translation_length}" == "$translation_length" ]] || { echo 'ERROR: translation geography requires BLOCK_LENGTH=LENGTH. Sequential blocks are not allowed.'; exit 2; }
+translation_stop_policy="${STOP_POLICY:-unchanged}"
+[[ "$translation_stop_policy" == unchanged || "$translation_stop_policy" == defer ]] || { echo 'STOP_POLICY must be unchanged or defer'; exit 2; }
+translation_prompt_args=()
+if [[ "${TRANSLATE_ALL:-0}" == 1 ]]; then translation_prompt_args+=(--translate-all); fi
 mode="${1:-pilot}"
 case "$mode" in
   pilot) count=10 ;;
@@ -38,7 +44,8 @@ nvidia-smi > "$experiment_out/nvidia-smi.txt"
 python -u -m experiments.translation_probe.run \
   --inputs "${INPUTS:-experiments/translation_probe/inputs/flores_zh_en_dev_10.jsonl}" \
   --out "$experiment_out" --samples "$count" --policies top1 threshold \
-  --length "${LENGTH:-256}" --block-length "${BLOCK_LENGTH:-${LENGTH:-256}}" \
+  --length "$translation_length" --block-length "$translation_length" \
+  --stop-policy "$translation_stop_policy" "${translation_prompt_args[@]}" \
   --commit-threshold "${COMMIT_THRESHOLD:-0.9}"
 bash scripts/export.sh "$experiment_out"
 echo "Complete: $experiment_out"

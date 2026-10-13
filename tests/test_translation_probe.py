@@ -189,17 +189,80 @@ class TranslationTests(unittest.TestCase):
             args=runner.parser().parse_args(['--out',tmp,'--length','4','--block-length','3'])
             with self.assertRaisesRegex(ValueError,'block-length'):runner.run(args)
 
-    def test_runner_records_block_length(self):
+    def test_runner_requires_full_window_before_model_loading(self):
         with tempfile.TemporaryDirectory() as tmp:
             args=runner.parser().parse_args(['--out',tmp,'--samples','2','--length','4','--block-length','2'])
+            with patch.object(runner,'load_model',side_effect=AssertionError('Must reject before loading')):
+                with self.assertRaisesRegex(ValueError,'full-window'):runner.run(args)
+            self.assertFalse((Path(tmp)/'manifest.json').exists())
+            args.block_length=4
             with contextlib.redirect_stdout(io.StringIO()),patch.object(runner,'load_model',return_value=(Model(),Tokenizer())),patch.object(runner,'collect_sample',side_effect=collect_fixture),patch('torch.cuda.reset_peak_memory_stats'):
                 runner.run(args)
             manifest=json.loads((Path(tmp)/'manifest.json').read_text())
-            self.assertEqual(manifest['config']['block_length'],2)
+            self.assertEqual(manifest['config']['block_length'],4)
             self.assertEqual(manifest['config']['length'],4)
+            self.assertEqual(manifest['config']['stop_policy'],'unchanged')
             reports,audit=collect(Path(tmp))
             self.assertEqual(len(reports),4)
-            self.assertEqual(audit['threshold']['all_forwards'],4)
+            self.assertEqual(audit['threshold']['all_forwards'],2)
+
+    def test_stop_deferral_keeps_remote_positions_available_and_raw_confidence(self):
+        rows=[{'position':p,'token_id':tid,'confidence':prob,'eligible':True}
+              for p,tid,prob in [(0,1,.6),(2,6,.99),(200,2,.95),(255,6,.999)]]
+        for policy in ('top1','threshold'):
+            config={'policy':policy,'commit_threshold':.9,'stop_policy':'unchanged'}
+            chosen,metadata=runner.select_translation(rows,config,{6})
+            self.assertEqual(chosen[0]['position'],255)
+            self.assertEqual(metadata['stop_selection']['deferred_positions'],[])
+            config['stop_policy']='defer'
+            chosen,metadata=runner.select_translation(rows,config,{6})
+            self.assertEqual([r['position'] for r in chosen],[200])
+            self.assertEqual(chosen[0]['confidence'],.95)
+            self.assertEqual(set(metadata['stop_selection']['deferred_positions']),{2,255})
+            config['commit_threshold']=1.
+            chosen,_=runner.select_translation(rows,config,{6})
+            self.assertEqual(chosen[0]['position'],200)  # Ordinary fallback, any distance.
+            only_stop=[r for r in rows if r['token_id']==6]
+            chosen,metadata=runner.select_translation(only_stop,config,{6})
+            self.assertEqual(chosen[0]['position'],255)
+            self.assertEqual(metadata['stop_selection']['deferred_positions'],[])
+
+    def test_stop_deferral_prevents_early_eos_context_change(self):
+        class EarlyEOSModel(Model):
+            def __call__(self,x,use_cache=False):
+                logits=torch.zeros(1,x.shape[1],9)
+                for p,tid in enumerate((1,2,3,6)):logits[0,p+1,tid]=16-p
+                logits[0,4,6]=24
+                if x[0,4].item()==6 and x[0,1].item()==0:logits[0,1,8]=25
+                return SimpleNamespace(logits=logits)
+        sample={'id':'00001','question':'Translate.','source_text':'猫在睡觉。','answer':'The cat sleeps'}
+        for policy in ('top1','threshold'):
+            for stop_policy in ('unchanged','defer'):
+                with self.subTest(policy=policy,stop_policy=stop_policy),tempfile.TemporaryDirectory() as tmp:
+                    config={'mask_id':0,'length':4,'block_length':4,'top_k':5,'policy':policy,
+                            'commit_threshold':.9,'thresholds':[.9],'log_every':32,'stop_policy':stop_policy}
+                    result=collect_sample(EarlyEOSModel(),Tokenizer(),config,sample,Path(tmp),
+                        prompt_protocol=runner.PROMPT_PROTOCOL,score_output=score_translation,select_output=runner.select_translation)
+                    if stop_policy=='defer':self.assertEqual(result['translation'],'The cat sleeps')
+                    with gzip.open(Path(tmp)/'trace.jsonl.gz','rt') as f:steps=[r for r in map(json.loads,f) if r['type']=='step']
+                    self.assertTrue(all((r['block_start'],r['block_end'])==(0,4) for r in steps))
+                    if stop_policy=='defer':
+                        self.assertNotIn(3,steps[0]['commit_positions'])
+                        self.assertEqual(steps[0]['stop_selection']['deferred_positions'],[3])
+
+    def test_diagnostic_runner_manifest_resume_and_viewer_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args=runner.parser().parse_args(['--out',tmp,'--samples','2','--length','4','--stop-policy','defer'])
+            with contextlib.redirect_stdout(io.StringIO()),patch.object(runner,'load_model',return_value=(Model(),Tokenizer())),patch.object(runner,'collect_sample',side_effect=collect_fixture),patch('torch.cuda.reset_peak_memory_stats'):
+                runner.run(args)
+            reports,audit=collect(Path(tmp))
+            self.assertEqual(len(reports),4)
+            self.assertTrue(audit['top1']['all_states_and_selections_verified'])
+            self.assertTrue(audit['threshold']['all_states_and_selections_verified'])
+            with contextlib.redirect_stdout(io.StringIO()),patch.object(runner,'load_model',side_effect=AssertionError('Resume must not load model')):
+                runner.run(args)
+            args.stop_policy='unchanged'
+            with self.assertRaisesRegex(ValueError,'arguments/source changed'):runner.run(args)
 
     def test_incorrect_result_reference_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

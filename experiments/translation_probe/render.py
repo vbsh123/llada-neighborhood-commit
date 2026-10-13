@@ -51,7 +51,17 @@ def collect(run):
                     assert len(rows)==len(record['positions'])
                     assert set(rows)=={p for p,t in enumerate(state) if t==mask}
                     candidates=sorted((r for r in rows.values() if r['eligible']),key=lambda r:(-r['confidence'],r['position']))
+                    assert record['block_end']-record['block_start'] <= config['block_length']
+                    assert all(r['eligible']==(record['block_start']<=p<record['block_end']) for p,r in rows.items())
                     assert candidates and all(math.isfinite(r['confidence']) and 0<=r['confidence']<=1 for r in rows.values())
+                    stop_policy=config.get('stop_policy','unchanged')
+                    assert stop_policy in ('unchanged','defer')
+                    non_stop=[r for r in candidates if r['token_id'] not in stop_ids]
+                    deferred=[r['position'] for r in candidates if r['token_id'] in stop_ids] if stop_policy=='defer' and non_stop else []
+                    if deferred:candidates=non_stop
+                    if 'stop_selection' in record:
+                        assert record['stop_selection']['policy']==stop_policy
+                        assert set(record['stop_selection']['deferred_positions'])==set(deferred)
                     chosen=([r for r in candidates if r['confidence']>=config['commit_threshold']] or candidates[:1]) if policy=='threshold' else candidates[:1]
                     commits=[r['position'] for r in chosen]
                     assert commits==record['commit_positions']
@@ -114,6 +124,16 @@ def render(run,out):
     text=TEMPLATE.replace('__DATA__',json.dumps(payload,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c'))
     text=text.replace('__COUNT__',str(len({r['sample'] for r in reports})))
     text=text.replace('__THRESHOLD__',str(json.loads((run/'manifest.json').read_text())['config']['commit_threshold']))
+    config=json.loads((run/'manifest.json').read_text())['config']
+    block=config.get('block_length',config['length'])
+    stop_policy=config.get('stop_policy','unchanged')
+    description=(f'BLOCK-CONSTRAINED DIAGNOSTIC: {block}-token blocks force left-to-right progression between blocks. This is not an unrestricted comparison.'
+                 if block!=config['length'] else f'Full-window decoding: all {config["length"]} response positions compete; no sequential blocks.')
+    description+=(' Stop policy: unchanged, as in the original GSM8K decoder.' if stop_policy=='unchanged' else
+                  ' EOS-DEFERRED DIAGNOSTIC: stop predictions are withheld while any eligible non-stop prediction remains. This differs from the original GSM8K decoder; raw probabilities are unchanged.')
+    text=text.replace('__DECODER_DESCRIPTION__',description)
+    audit['decoder']={'length':config['length'],'block_length':block,'stop_policy':stop_policy,
+                      'unrestricted_positions':block==config['length']}
     target=out/'translation_commitment_slider.html'
     target.write_text(text,encoding='utf-8')
     (out/'audit.json').write_text(json.dumps(audit,indent=2)+'\n')
@@ -142,6 +162,7 @@ body{font:16px system-ui;color:#233247;max-width:1400px;margin:20px auto;padding
 </style>
 <h1>Translation — commitment locations</h1>
 <p class="muted">__COUNT__ matched Chinese→English examples · TOP1 and threshold __THRESHOLD__ · saved traces only</p>
+<p class="warning">__DECODER_DESCRIPTION__</p>
 <section class="controls">
 <label>Example <select id="sample" aria-label="Example"></select></label>
 <label>Policy <select id="policy" aria-label="Decoding policy"><option value="top1">TOP1</option><option value="threshold">THRESHOLD __THRESHOLD__</option></select></label>
