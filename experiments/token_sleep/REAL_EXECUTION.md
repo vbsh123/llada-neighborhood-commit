@@ -25,16 +25,22 @@ layer chain. Waking recomputes all layers from the current input embedding. The
 first forward initializes every cache position; an uninitialized sparse call is
 rejected. Caches are reset for each question/condition. No gradients are supported.
 
-## Three conditions and fair attribution
+## Conditions and fair attribution
 
-1. `original`: ordinary pinned model forward, including its original full-window
+1. `original` (optional): ordinary pinned model forward, including its original full-window
    vocabulary projection, and the same compact scoring/selection loop below.
 2. `active_baseline`: the new forward with sleep disabled. All transformer rows
    compute, but only currently masked positions receive vocabulary logits.
 3. `real_sleep`: the identical new forward with two-forward sleep. Only awake
    masked positions receive vocabulary logits.
 
-The original-versus-real comparison measures the combined practical change.
+By default only `active_baseline` and `real_sleep` are timed. Full vanilla timing
+is opt-in with `--include-original`, or `INCLUDE_ORIGINAL=1` in the Vast script.
+A few original-model validation forwards remain mandatory even without vanilla
+timing. Existing vanilla results can be retained as historical context, but their
+different tracing/timing setup makes them unsuitable for isolating sleep speedup.
+
+When requested, the original-versus-real comparison measures the combined practical change.
 **Active-baseline-versus-real isolates the additional benefit from sleep.**
 Do not attribute the original-versus-active LM-head savings to sleep. Quality and
 paired correctness are measured separately for all conditions; gathered matrix
@@ -109,7 +115,7 @@ RUN_NAME=real_sleep_smoke_v1 SKIP_INSTALL=1 \
 ```
 
 This reuses the first two questions in the saved study, runs GPU parity checks,
-then two questions under each of three conditions. It loads the real checkpoint.
+then two questions under each of the two default conditions. It loads the real checkpoint.
 If the old sample file is unavailable, omit `SAMPLES_FROM` for deterministic GSM8K
 selection. The sample loader records the dataset revision/input hash.
 
@@ -133,4 +139,4 @@ either requires a new output folder. An interrupted question/condition reruns
 from its beginning. Runs export to `exports/` with checksums.
 
 Read `selective.py` for the model path; `benchmark.py:decode` for scheduling and
-timing, `validate` for GPU checks, and `evaluate` for the three comparisons.
+timing, `validate` for GPU checks, and `evaluate` for the selected comparisons.

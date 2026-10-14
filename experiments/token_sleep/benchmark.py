@@ -14,7 +14,7 @@ from .run import load_samples
 from .simulation import FrozenStates, SleepSchedule, checked_blocks
 from .selective import SelectiveForward
 
-MODES = ('original', 'active_baseline', 'real_sleep')
+MODES = ('active_baseline', 'real_sleep')
 HERE = Path(__file__).resolve().parent
 
 
@@ -222,9 +222,9 @@ def decode(model,tokenizer,sample,config,mode,directory):
     return result
 
 
-def evaluate(out,samples):
+def evaluate(out,samples,modes=MODES):
     results = {mode:[json.loads((out/mode/'samples'/s['id']/'result.json').read_text()) for s in samples]
-               for mode in MODES}
+               for mode in modes}
     summary = {'samples':len(samples),'modes':{},'comparisons':{},
         'timing_scope':'Full response including post-stop slots; decode loop includes scoring/timers/cache updates; excludes warmup, validation, model loading and serialization.'}
     for mode,rr in results.items():
@@ -235,6 +235,8 @@ def evaluate(out,samples):
         mm=summary['modes'][mode]
         mm['sleep_fraction_of_masked_position_forwards']=mm['sleep_position_forwards']/mm['masked_position_forwards']
     for baseline,treatment in [('original','active_baseline'),('active_baseline','real_sleep'),('original','real_sleep')]:
+        if baseline not in results or treatment not in results:
+            continue
         a,b = summary['modes'][baseline],summary['modes'][treatment]
         counts = dict(both_correct=0,both_wrong=0,baseline_only_correct=0,treatment_only_correct=0)
         for ra,rb in zip(results[baseline],results[treatment]):
@@ -269,7 +271,8 @@ def run(args):
                   high_entropy=args.high_entropy,high_sleep=args.high_sleep,low_sleep=0)
     config = {k:v for k,v in vars(args).items() if k!='out'}
     config['samples_from'] = str(args.samples_from.resolve()) if args.samples_from else None
-    config.update(model=MODEL,revision=REVISION,mask_id=126336,modes=list(MODES),experiment='real_token_sleep_v1')
+    modes = ('original',*MODES) if args.include_original else MODES
+    config.update(model=MODEL,revision=REVISION,mask_id=126336,modes=list(modes),experiment='real_token_sleep_v1')
     out = args.out; out.mkdir(parents=True,exist_ok=True)
     with run_lock(out):
         manifest_path = out/'manifest.json'
@@ -293,13 +296,14 @@ def run(args):
         pending = []
         for index,sample in enumerate(samples):
             # Rotate order to avoid always measuring sleeping last on a warmer GPU.
-            order = MODES[index%3:]+MODES[:index%3]
+            rotation = index%len(modes)
+            order = modes[rotation:]+modes[:rotation]
             for mode in order:
                 directory = out/mode/'samples'/sample['id']
                 if not (directory/'result.json').exists(): pending.append((sample,mode,directory))
                 elif not (directory/'trace.jsonl.gz').exists(): raise ValueError('Missing completed trace')
         if pending:
-            print(f'Loading pinned LLaDA: {len(samples)} matched questions × 3 modes; full window={args.length}.',flush=True)
+            print(f'Loading pinned LLaDA: {len(samples)} matched questions × {len(modes)} modes {modes}; full window={args.length}.',flush=True)
             model,tokenizer = load_model(config)
             torch.backends.cuda.matmul.allow_tf32=False; torch.backends.cudnn.allow_tf32=False
             report = validate(model,tokenizer,samples[0],config)
@@ -312,7 +316,7 @@ def run(args):
                 result = decode(model,tokenizer,sample,config,mode,directory)
                 print(f"DONE mode={mode} sample={sample['id']} correct={result['correct_numeric']} forwards={result['steps']} decode_seconds={result['decode_seconds']:.3f}",flush=True)
             del model
-        print(json.dumps(evaluate(out,samples),indent=2),flush=True)
+        print(json.dumps(evaluate(out,samples,modes),indent=2),flush=True)
 
 
 def parser():
@@ -324,6 +328,7 @@ def parser():
     p.add_argument('--seed',type=int,default=1729)
     p.add_argument('--length',type=int,default=256)
     p.add_argument('--policy',choices=['top1','threshold'],default='top1')
+    p.add_argument('--include-original',action='store_true',help='Optionally rerun full vanilla timing; default compares active_baseline and real_sleep only')
     p.add_argument('--commit-threshold',type=float,default=.9)
     p.add_argument('--sleep-confidence',type=float,default=.5)
     p.add_argument('--high-entropy',type=float,default=2.)

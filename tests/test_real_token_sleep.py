@@ -10,7 +10,7 @@ from torch.nn import functional as F
 
 from experiments.token_sleep.selective import SelectiveForward
 from experiments.token_sleep.simulation import FrozenStates
-from experiments.token_sleep.benchmark import compact_rows,probability_comparison,validate,decode,evaluate
+from experiments.token_sleep.benchmark import compact_rows,probability_comparison,validate,decode,evaluate,parser
 
 
 class Rotary(nn.Module):
@@ -173,9 +173,16 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertEqual(results['original']['final_ids'],results['active_baseline']['final_ids'])
                 self.assertEqual(results['active_baseline']['vocabulary_head_rows'],15)
                 self.assertEqual(results['original']['vocabulary_head_rows'],35)
-                summary=evaluate(out,[sample])
+                summary=evaluate(out,[sample],('original','active_baseline','real_sleep'))
                 self.assertIn('active_baseline_vs_real_sleep',summary['comparisons'])
                 self.assertAlmostEqual(summary['comparisons']['original_vs_active_baseline']['vocabulary_head_row_reduction_fraction'],1-15/35)
+                default=evaluate(out,[sample])
+                self.assertNotIn('original',default['modes'])
+                self.assertEqual(set(default['comparisons']),{'active_baseline_vs_real_sleep'})
+
+    def test_vanilla_benchmark_is_opt_in(self):
+        self.assertFalse(parser().parse_args(['--out','fixture']).include_original)
+        self.assertTrue(parser().parse_args(['--out','fixture','--include-original']).include_original)
 
 
 if __name__=='__main__': unittest.main()

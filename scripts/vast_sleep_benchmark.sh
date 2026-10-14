@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real sparse execution: original, identical backend without sleep, and real sleep.
+# Real sparse execution: identical backend without sleep versus real sleep.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 case "${1:-pilot}" in
@@ -32,7 +32,9 @@ python -m pip freeze > "$experiment_out/packages.txt"
 nvidia-smi > "$experiment_out/nvidia-smi.txt"
 input_args=()
 if [[ -n "${SAMPLES_FROM:-}" ]]; then input_args+=(--samples-from "$SAMPLES_FROM"); fi
-echo "REAL SLEEP: $count questions × 3 modes; GPU parity checks required before timing."
+conditions=2
+if [[ "${INCLUDE_ORIGINAL:-0}" == 1 ]]; then input_args+=(--include-original); conditions=3; fi
+echo "REAL SLEEP: $count questions × $conditions modes; GPU parity checks required before timing."
 python -u -m experiments.token_sleep.benchmark \
   --out "$experiment_out" --samples "$count" --length 256 \
   --policy "${POLICY:-top1}" --commit-threshold "${COMMIT_THRESHOLD:-0.9}" \
