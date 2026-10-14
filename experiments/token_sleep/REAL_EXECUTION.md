@@ -88,6 +88,25 @@ indexing error in the tested state; it does not waive end-to-end validation or
 prove correctness on every state. Extra memory is needed for one promoted block
 and the captured layer states, rather than an entire FP32 checkpoint.
 
+An explicit alternate gate is available with `--allow-scaled-fp32-drift`, or
+`ALLOW_SCALED_FP32_DRIFT=1` in the Vast script. It does not increase the BF16
+probability tolerance or alter BF16 execution. If strict BF16 validation fails,
+it runs the local layer diagnostic and can proceed only when:
+
+- Original/all-active and the sparse-pattern checks still meet their original
+  probability limits, and both sets of tested commitment selections match.
+- Every local FP32 layer output and captured stage has RMS error <=
+  `1e-6 + 1e-5 * reference_RMS` and maximum absolute error <=
+  `1e-5 + 1e-4 * reference_RMS`.
+
+These are explicit engineering tolerances relative to the reference tensor's
+scale, with absolute floors for near-zero tensors. They are not a quality theorem.
+Nonfinite values fail. The default remains strict; the alternate route requires
+the flag. The report preserves strict `passed: false`, records the acceptance
+route and all errors, and the benchmark summary carries that status. Actual
+generated accuracy must be evaluated independently of the simulator's accuracy.
+The diagnostic runs on one local state and does not prove global equivalence.
+
 ## Timing scope and limitations
 
 - Each condition gets two untimed full-shape warm-up forwards per question, then

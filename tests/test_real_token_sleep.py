@@ -10,8 +10,8 @@ from torch.nn import functional as F
 
 from experiments.token_sleep.selective import SelectiveForward
 from experiments.token_sleep.simulation import FrozenStates
-from experiments.token_sleep.benchmark import compact_rows,probability_comparison,validate,decode,evaluate,parser
-from experiments.token_sleep.diagnostics import diagnose
+from experiments.token_sleep.benchmark import compact_rows,probability_comparison,validate,decode,evaluate,parser,validation_acceptance
+from experiments.token_sleep.diagnostics import diagnose,difference
 
 
 class Rotary(nn.Module):
@@ -148,6 +148,29 @@ class Tokenizer:
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_scaled_gate_is_opt_in_and_does_not_ignore_selection_or_fp32_failures(self):
+        report={'passed':False,'max_probability_tolerance':.02,
+                'steps':[{'dense_selection_equal':True,'sleep_selection_equal':True,
+                          'dense_vs_original':{'max_probability_difference':0.}}],
+                'sparse_original_position_check':{'max_probability_difference':.016}}
+        local={'layers':[{}],'all_fp32_scaled_checks_passed':True}
+        self.assertFalse(validation_acceptance(report,local)['accepted'])
+        self.assertTrue(validation_acceptance(report,local,True)['accepted'])
+        self.assertFalse(validation_acceptance(report,None,True)['accepted'])
+        local['all_fp32_scaled_checks_passed']=False
+        self.assertFalse(validation_acceptance(report,local,True)['accepted'])
+        local['all_fp32_scaled_checks_passed']=True
+        report['steps'][0]['sleep_selection_equal']=False
+        self.assertFalse(validation_acceptance(report,local,True)['accepted'])
+
+    def test_scaled_error_uses_reference_size_and_rejects_nonfinite(self):
+        big=torch.full((10,),1000.)
+        small=torch.ones(10)
+        self.assertTrue(difference(big+.001,big)['fp32_scaled_check_passed'])
+        self.assertFalse(difference(small+.001,small)['fp32_scaled_check_passed'])
+        with self.assertRaisesRegex(ValueError,'Nonfinite'):
+            difference(torch.tensor([float('nan')]),torch.ones(1))
+
     def test_teacher_forced_validation_and_timed_decoder_plumbing(self):
         torch.manual_seed(81)
         model=Model().eval(); tokenizer=Tokenizer()
@@ -184,6 +207,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_vanilla_benchmark_is_opt_in(self):
         self.assertFalse(parser().parse_args(['--out','fixture']).include_original)
         self.assertTrue(parser().parse_args(['--out','fixture','--include-original']).include_original)
+        self.assertFalse(parser().parse_args(['--out','fixture']).allow_scaled_fp32_drift)
 
     def test_layer_diagnostic_identical_inputs_and_dtype_restoration(self):
         self.exercise_layer_diagnostic(torch.float32)
@@ -199,6 +223,7 @@ class BenchmarkTests(unittest.TestCase):
         with patch('experiments.token_sleep.diagnostics.checked_blocks',lambda m:list(m.model.transformer.blocks)):
             report=diagnose(model,Tokenizer(),dict(question='fixture'),config)
         self.assertTrue(report['all_fp32_local_layers_within_tolerance'])
+        self.assertTrue(report['all_fp32_scaled_checks_passed'])
         self.assertEqual(len(report['layers']),3)
         self.assertIn('q_proj',report['layers'][0]['fp32']['stages'])
         for name,p in model.named_parameters():

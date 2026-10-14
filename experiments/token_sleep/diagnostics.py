@@ -8,9 +8,21 @@ from .simulation import FrozenStates, SleepSchedule, checked_blocks
 
 
 def difference(a,b):
+    import torch
     a,b=a.float(),b.float()
-    return {'max_absolute_difference':(a-b).abs().max().item(),
-            'mean_absolute_difference':(a-b).abs().mean().item()}
+    if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+        raise ValueError('Nonfinite layer diagnostic values')
+    delta=a-b
+    maximum=delta.abs().max().item()
+    rms_error=delta.square().mean().sqrt().item()
+    rms_reference=b.square().mean().sqrt().item()
+    return {'max_absolute_difference':maximum,
+            'mean_absolute_difference':delta.abs().mean().item(),
+            'rms_error':rms_error,'reference_rms':rms_reference,
+            'max_error_over_reference_rms':maximum/max(rms_reference,1e-12),
+            'relative_rms_error':rms_error/max(rms_reference,1e-12),
+            'fp32_scaled_check_passed':(rms_error <= 1e-6+1e-5*rms_reference
+                                       and maximum <= 1e-5+1e-4*rms_reference)}
 
 
 def compare_layer(model,block,inputs,seed,sleepers):
@@ -87,6 +99,8 @@ def diagnose(model,tokenizer,sample,config):
     report={'scope':'each layer receives identical simulator inputs and identical seeded K/V',
         'sleep_source':source,'sleep_positions':sleepers,'layers':[],
         'fp32_local_output_tolerance':.0001,
+        'fp32_scaled_tolerances':{'rms_error_absolute_floor':1e-6,'rms_error_relative':1e-5,
+                                 'max_error_absolute_floor':1e-5,'max_error_relative_to_reference_rms':1e-4},
         'note':'No generations or timing benchmark. One block at a time promoted; native weights restored. Local parity does not establish global quality or speed.'}
     with torch.inference_mode():
         for index,block in enumerate(blocks):
@@ -101,8 +115,11 @@ def diagnose(model,tokenizer,sample,config):
                 block.to(dtype=original_dtype)
             entry={'layer':index,'native_dtype':str(original_dtype),'native':native,'fp32':fp32}
             report['layers'].append(entry)
-            print(f"layer={index} native_max={native['output']['max_absolute_difference']:.8g} fp32_max={fp32['output']['max_absolute_difference']:.8g}",flush=True)
+            print(f"layer={index} native_max={native['output']['max_absolute_difference']:.8g} fp32_max={fp32['output']['max_absolute_difference']:.8g} fp32_relative_rms={fp32['output']['relative_rms_error']:.8g}",flush=True)
     report['max_native_local_output_difference']=max(r['native']['output']['max_absolute_difference'] for r in report['layers'])
     report['max_fp32_local_output_difference']=max(r['fp32']['output']['max_absolute_difference'] for r in report['layers'])
     report['all_fp32_local_layers_within_tolerance']=report['max_fp32_local_output_difference']<=report['fp32_local_output_tolerance']
+    report['all_fp32_scaled_checks_passed']=all(
+        metrics['fp32_scaled_check_passed'] for layer in report['layers']
+        for metrics in [layer['fp32']['output'],*layer['fp32']['stages'].values()])
     return report

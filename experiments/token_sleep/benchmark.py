@@ -57,6 +57,28 @@ def probability_comparison(actual, reference, mask_id):
     return result
 
 
+def validation_acceptance(report,layer_report=None,allow_scaled_drift=False):
+    """Keep strict validation intact; an explicitly requested alternate gate uses
+    independent local FP32 checks, never a larger BF16 probability tolerance.
+    """
+    if report['passed']:
+        return {'accepted':True,'route':'strict_probability_and_selection_checks'}
+    steps=report['steps']
+    tolerance=report['max_probability_tolerance']
+    dense_ok=bool(steps) and all(s['dense_selection_equal'] and
+        s['dense_vs_original']['max_probability_difference']<=tolerance for s in steps)
+    selection_ok=bool(steps) and all(s['sleep_selection_equal'] for s in steps)
+    sparse=report.get('sparse_original_position_check',{})
+    sparse_ok=sparse.get('max_probability_difference',float('inf'))<=tolerance
+    local_ok=bool(layer_report and layer_report.get('layers') and
+                  layer_report.get('all_fp32_scaled_checks_passed'))
+    accepted=allow_scaled_drift and dense_ok and selection_ok and sparse_ok and local_ok
+    return {'accepted':bool(accepted),'route':'explicit_local_fp32_checks_with_reported_bf16_drift',
+            'dense_check_passed':dense_ok,'tested_sleep_selections_match':selection_ok,
+            'sparse_check_passed':sparse_ok,'all_local_fp32_scaled_checks_passed':local_ok,
+            'note':'Local FP32 agreement on one state is not full BF16 equivalence or a quality guarantee. Measure actual generated accuracy.'}
+
+
 def validate(model, tokenizer, sample, config):
     """Teacher-forced identical inputs, real versus dense and frozen-state simulator.
 
@@ -227,6 +249,11 @@ def evaluate(out,samples,modes=MODES):
                for mode in modes}
     summary = {'samples':len(samples),'modes':{},'comparisons':{},
         'timing_scope':'Full response including post-stop slots; decode loop includes scoring/timers/cache updates; excludes warmup, validation, model loading and serialization.'}
+    validation_path=out/'validation.json'
+    if validation_path.exists():
+        validation=json.loads(validation_path.read_text())
+        summary['validation_acceptance']=validation.get('acceptance',{'accepted':validation['passed'],'route':'legacy_strict'})
+        summary['strict_bf16_validation_passed']=validation['passed']
     for mode,rr in results.items():
         summary['modes'][mode] = {'numeric_accuracy':sum(r['correct_numeric'] for r in rr)/len(rr),
             **{key:sum(r[key] for r in rr) for key in ('steps','decode_seconds','model_seconds',
@@ -314,9 +341,19 @@ def run(args):
                 print(json.dumps({key:value for key,value in report.items() if key!='layers'},indent=2),flush=True)
                 return
             report = validate(model,tokenizer,samples[0],config)
+            layer_report=None
+            if not report['passed'] and args.allow_scaled_fp32_drift:
+                from .diagnostics import diagnose
+                print('Strict BF16 parity failed; checking local FP32 math before any benchmark.',flush=True)
+                layer_report=diagnose(model,tokenizer,samples[0],config)
+                dump(out/'layer_diagnostics.json',layer_report)
+            report['acceptance']=validation_acceptance(report,layer_report,args.allow_scaled_fp32_drift)
             dump(out/'validation.json',report)
             print('GPU validation:',json.dumps(report),flush=True)
-            if not report['passed']: raise RuntimeError('GPU numerical/selection parity failed; inspect validation.json before benchmarking')
+            if not report['acceptance']['accepted']:
+                raise RuntimeError('GPU numerical/selection validation failed; inspect validation.json before benchmarking')
+            if not report['passed']:
+                print('Proceeding with explicitly allowed BF16 drift after local FP32 checks. Strict BF16 validation remains false in the report; actual quality must be measured.',flush=True)
             for sample,mode,directory in pending:
                 random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
                 directory.mkdir(parents=True,exist_ok=True)
@@ -337,6 +374,7 @@ def parser():
     p.add_argument('--policy',choices=['top1','threshold'],default='top1')
     p.add_argument('--include-original',action='store_true',help='Optionally rerun full vanilla timing; default compares active_baseline and real_sleep only')
     p.add_argument('--diagnose-only',action='store_true',help='Local layer parity in native dtype versus FP32; no generations or benchmark')
+    p.add_argument('--allow-scaled-fp32-drift',action='store_true',help='Explicit alternate validation: allow BF16 probability drift only if local FP32 scaled checks pass and tested selections/dense/sparse checks still pass')
     p.add_argument('--commit-threshold',type=float,default=.9)
     p.add_argument('--sleep-confidence',type=float,default=.5)
     p.add_argument('--high-entropy',type=float,default=2.)
