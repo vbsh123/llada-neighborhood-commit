@@ -1,5 +1,8 @@
 # Simulated sleep of unresolved positions
 
+Actual selective execution is now a separate runner; see
+[REAL_EXECUTION.md](REAL_EXECUTION.md). This document describes the simulator.
+
 This first experiment tests quality and context influence, **not acceleration**.
 It uses the existing `confidence_geography.run.collect_sample` decoder and pinned
 LLaDA-8B-Instruct weights. It temporarily instruments the model; it neither
