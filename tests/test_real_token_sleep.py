@@ -171,6 +171,16 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Nonfinite'):
             difference(torch.tensor([float('nan')]),torch.ones(1))
 
+    def test_max_error_uses_max_norm_on_peaked_tensors(self):
+        reference=torch.zeros(10000); reference[0]=100.
+        actual=reference.clone(); actual[0]+=.0003
+        metrics=difference(actual,reference)
+        self.assertEqual(metrics['reference_max_absolute'],100.)
+        self.assertFalse(metrics['legacy_fp32_scaled_check_passed'])
+        self.assertTrue(metrics['fp32_scaled_check_passed'])
+        actual[1]=.01
+        self.assertFalse(difference(actual,reference)['fp32_scaled_check_passed'])
+
     def test_teacher_forced_validation_and_timed_decoder_plumbing(self):
         torch.manual_seed(81)
         model=Model().eval(); tokenizer=Tokenizer()

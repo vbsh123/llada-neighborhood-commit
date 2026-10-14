@@ -97,7 +97,7 @@ it runs the local layer diagnostic and can proceed only when:
   probability limits, and both sets of tested commitment selections match.
 - Every local FP32 layer output and captured stage has RMS error <=
   `1e-6 + 1e-5 * reference_RMS` and maximum absolute error <=
-  `1e-5 + 1e-4 * reference_RMS`.
+  `1e-5 + 1e-5 * reference_max_absolute`.
 
 These are explicit engineering tolerances relative to the reference tensor's
 scale, with absolute floors for near-zero tensors. They are not a quality theorem.
@@ -106,6 +106,12 @@ the flag. The report preserves strict `passed: false`, records the acceptance
 route and all errors, and the benchmark summary carries that status. Actual
 generated accuracy must be evaluated independently of the simulator's accuracy.
 The diagnostic runs on one local state and does not prove global equivalence.
+The maximum-error check uses a maximum reference norm, while the RMS check uses
+the reference RMS. The earlier max-error-versus-RMS rule could reject sparse
+large activations despite small normwise FP32 error. That earlier decision remains
+recorded as `legacy_fp32_scaled_check_passed`; the matching-norm criteria are
+versioned in the report. These are normwise checks, not elementwise relative-error
+guarantees near zero.
 
 ## Timing scope and limitations
 

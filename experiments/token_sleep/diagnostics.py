@@ -16,13 +16,17 @@ def difference(a,b):
     maximum=delta.abs().max().item()
     rms_error=delta.square().mean().sqrt().item()
     rms_reference=b.square().mean().sqrt().item()
+    max_reference=b.abs().max().item()
+    rms_ok=rms_error <= 1e-6+1e-5*rms_reference
     return {'max_absolute_difference':maximum,
             'mean_absolute_difference':delta.abs().mean().item(),
             'rms_error':rms_error,'reference_rms':rms_reference,
+            'reference_max_absolute':max_reference,
             'max_error_over_reference_rms':maximum/max(rms_reference,1e-12),
+            'relative_max_error':maximum/max(max_reference,1e-12),
             'relative_rms_error':rms_error/max(rms_reference,1e-12),
-            'fp32_scaled_check_passed':(rms_error <= 1e-6+1e-5*rms_reference
-                                       and maximum <= 1e-5+1e-4*rms_reference)}
+            'legacy_fp32_scaled_check_passed':rms_ok and maximum <= 1e-5+1e-4*rms_reference,
+            'fp32_scaled_check_passed':rms_ok and maximum <= 1e-5+1e-5*max_reference}
 
 
 def compare_layer(model,block,inputs,seed,sleepers):
@@ -99,8 +103,9 @@ def diagnose(model,tokenizer,sample,config):
     report={'scope':'each layer receives identical simulator inputs and identical seeded K/V',
         'sleep_source':source,'sleep_positions':sleepers,'layers':[],
         'fp32_local_output_tolerance':.0001,
-        'fp32_scaled_tolerances':{'rms_error_absolute_floor':1e-6,'rms_error_relative':1e-5,
-                                 'max_error_absolute_floor':1e-5,'max_error_relative_to_reference_rms':1e-4},
+        'fp32_scaled_tolerances':{'version':'matching_rms_and_max_norms_v2',
+                                 'rms_error_absolute_floor':1e-6,'rms_error_relative':1e-5,
+                                 'max_error_absolute_floor':1e-5,'max_error_relative_to_reference_max':1e-5},
         'note':'No generations or timing benchmark. One block at a time promoted; native weights restored. Local parity does not establish global quality or speed.'}
     with torch.inference_mode():
         for index,block in enumerate(blocks):
