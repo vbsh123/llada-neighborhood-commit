@@ -1,0 +1,43 @@
+{
+  "repository": "https://github.com/EleutherAI/lm-evaluation-harness",
+  "commit": "84aa9f95fea2e1bd298e1859cab0b12094f80e0b",
+  "task_version": 3.0,
+  "upstream_files": {
+    "lm_eval/api/filter.py": "e174744a3ecaff78af34a60d6074bc8945801da50c6028d58f464cb2866c7dfe",
+    "lm_eval/filters/extraction.py": "1359bc9688d57a7df911007d0a279f6b2e28bf7e30ca133cf07368539f32bdb8",
+    "lm_eval/filters/selection.py": "5f8264dce91dd1282b84487d703e7e2bb11bef5fd6c93f91b4e51342a4fb76ab",
+    "lm_eval/api/metrics.py": "53d0684f91b554a30df9efa87e07d71611573027a24ff679a754babd0c853d62",
+    "lm_eval/tasks/gsm8k/gsm8k.yaml": "442b817bc83138ec89bd30ea9d6b4acac977dfc4653c177ad778f354c8543d29"
+  },
+  "selected_components": [
+    {
+      "name": "Filter",
+      "upstream_file": "lm_eval/api/filter.py",
+      "source_sha256": "5c7c3513cefd0344c26a85569cddaa53f0c3e17350f412401c787969f013875b"
+    },
+    {
+      "name": "RegexFilter",
+      "upstream_file": "lm_eval/filters/extraction.py",
+      "source_sha256": "dd4857460959d8199fd7539ceadec1f726e79b764f38db1da2124216e599b578"
+    },
+    {
+      "name": "TakeFirstFilter",
+      "upstream_file": "lm_eval/filters/selection.py",
+      "source_sha256": "26a96bf1489fde36778afda1f0675c7502374d89fb17a8acc9ae1e4056979dca"
+    },
+    {
+      "name": "exact_match_hf_evaluate",
+      "upstream_file": "lm_eval/api/metrics.py",
+      "source_sha256": "2adb64601d07fb1a78e8c06845a910243a11c1771857ce9650e912896fc4edb5"
+    }
+  ],
+  "bundled_file_sha256": {
+    "LICENSE-APACHE-2.0.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "LICENSE-MIT.txt": "a806e42547620dffbc2ec0333322c8b3523b4af11e059be14ef81aa5b1ae021f",
+    "__init__.py": "5be5a6cff74cf2ecbac90aa8db4c14e30f8e8e776361f95d2eca3e75ce377de8",
+    "gsm8k.yaml": "442b817bc83138ec89bd30ea9d6b4acac977dfc4653c177ad778f354c8543d29",
+    "snapshot.py": "09a30a6c9c0f153473aa0e4accbe8f559943acfc686bd0198a8bc7b6252566cc",
+    "task.json": "394e3d4fd97929c5c787e1e1fc35b0735462685a07fa7bf457af12c278f9cde8"
+  },
+  "changes": "Registration decorators removed; imports consolidated. Selected class/function bodies unchanged. task.json is a JSON serialization of the upstream YAML."
+}
