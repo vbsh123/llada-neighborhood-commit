@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from experiments.token_sleep.selective import SelectiveForward
 from experiments.token_sleep.simulation import FrozenStates
 from experiments.token_sleep.benchmark import compact_rows,probability_comparison,validate,decode,evaluate,parser
+from experiments.token_sleep.diagnostics import diagnose
 
 
 class Rotary(nn.Module):
@@ -183,6 +184,25 @@ class BenchmarkTests(unittest.TestCase):
     def test_vanilla_benchmark_is_opt_in(self):
         self.assertFalse(parser().parse_args(['--out','fixture']).include_original)
         self.assertTrue(parser().parse_args(['--out','fixture','--include-original']).include_original)
+
+    def test_layer_diagnostic_identical_inputs_and_dtype_restoration(self):
+        self.exercise_layer_diagnostic(torch.float32)
+
+    def test_layer_diagnostic_bf16_weights_restored(self):
+        self.exercise_layer_diagnostic(torch.bfloat16)
+
+    def exercise_layer_diagnostic(self,dtype):
+        torch.manual_seed(81)
+        model=Model().eval().to(dtype=dtype); original={name:p.clone() for name,p in model.named_parameters()}
+        config=dict(length=5,mask_id=0,sleep_confidence=.5,high_entropy=2.,high_sleep=2,
+                    policy='top1',commit_threshold=.9)
+        with patch('experiments.token_sleep.diagnostics.checked_blocks',lambda m:list(m.model.transformer.blocks)):
+            report=diagnose(model,Tokenizer(),dict(question='fixture'),config)
+        self.assertTrue(report['all_fp32_local_layers_within_tolerance'])
+        self.assertEqual(len(report['layers']),3)
+        self.assertIn('q_proj',report['layers'][0]['fp32']['stages'])
+        for name,p in model.named_parameters():
+            self.assertTrue(torch.equal(p,original[name]))
 
 
 if __name__=='__main__': unittest.main()

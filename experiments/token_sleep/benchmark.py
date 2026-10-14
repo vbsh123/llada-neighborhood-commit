@@ -303,9 +303,16 @@ def run(args):
                 if not (directory/'result.json').exists(): pending.append((sample,mode,directory))
                 elif not (directory/'trace.jsonl.gz').exists(): raise ValueError('Missing completed trace')
         if pending:
-            print(f'Loading pinned LLaDA: {len(samples)} matched questions × {len(modes)} modes {modes}; full window={args.length}.',flush=True)
+            description = 'layer diagnostic only; no generation or timing' if args.diagnose_only else f'{len(samples)} matched questions × {len(modes)} modes {modes}'
+            print(f'Loading pinned LLaDA: {description}; full window={args.length}.',flush=True)
             model,tokenizer = load_model(config)
             torch.backends.cuda.matmul.allow_tf32=False; torch.backends.cudnn.allow_tf32=False
+            if args.diagnose_only:
+                from .diagnostics import diagnose
+                report=diagnose(model,tokenizer,samples[0],config)
+                dump(out/'layer_diagnostics.json',report)
+                print(json.dumps({key:value for key,value in report.items() if key!='layers'},indent=2),flush=True)
+                return
             report = validate(model,tokenizer,samples[0],config)
             dump(out/'validation.json',report)
             print('GPU validation:',json.dumps(report),flush=True)
@@ -329,6 +336,7 @@ def parser():
     p.add_argument('--length',type=int,default=256)
     p.add_argument('--policy',choices=['top1','threshold'],default='top1')
     p.add_argument('--include-original',action='store_true',help='Optionally rerun full vanilla timing; default compares active_baseline and real_sleep only')
+    p.add_argument('--diagnose-only',action='store_true',help='Local layer parity in native dtype versus FP32; no generations or benchmark')
     p.add_argument('--commit-threshold',type=float,default=.9)
     p.add_argument('--sleep-confidence',type=float,default=.5)
     p.add_argument('--high-entropy',type=float,default=2.)

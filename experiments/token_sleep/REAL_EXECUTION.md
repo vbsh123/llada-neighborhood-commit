@@ -76,6 +76,18 @@ CPU fixtures additionally check tighter FP32 agreement, two sleeping forwards,
 waking, original positions, grouped-query layouts and actual module row counts.
 Full-checkpoint/CUDA validation can only be verified on Vast.
 
+If dense parity is exact but sleeping parity fails, diagnose before changing the
+tolerance. Run `python -m experiments.token_sleep.benchmark --out runs/NEW_DIAG
+--samples 1 --samples-from runs/sleep_study_v1/samples.jsonl --diagnose-only`.
+This performs no generations or timing benchmark. `layer_diagnostics.json` compares
+each block on identical current inputs and identical seeded caches, first at its
+native dtype, then with only that block promoted to FP32. Weights are restored
+in a finally clause. Stage errors identify whether differences begin in QKV,
+attention projection or FFN. Local FP32 agreement supports numerical rather than
+indexing error in the tested state; it does not waive end-to-end validation or
+prove correctness on every state. Extra memory is needed for one promoted block
+and the captured layer states, rather than an entire FP32 checkpoint.
+
 ## Timing scope and limitations
 
 - Each condition gets two untimed full-shape warm-up forwards per question, then
