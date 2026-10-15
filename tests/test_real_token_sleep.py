@@ -229,6 +229,15 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(SystemExit), patch('sys.stderr'):
             parser().parse_args(['--out','fixture','--include-original','--original-only'])
 
+    def test_sleep_only_reuses_baseline_without_scheduling_it(self):
+        args=parser().parse_args(['--out','fixture','--sleep-only',
+                                 '--high-entropy','3','--high-sleep','1'])
+        self.assertEqual(requested_modes(args),('real_sleep',))
+        self.assertEqual((args.high_entropy,args.high_sleep),(3.,1))
+        for other in ('--include-original','--original-only'):
+            with self.subTest(other=other), self.assertRaises(SystemExit), patch('sys.stderr'):
+                parser().parse_args(['--out','fixture','--sleep-only',other])
+
     def test_layer_diagnostic_identical_inputs_and_dtype_restoration(self):
         self.exercise_layer_diagnostic(torch.float32)
 

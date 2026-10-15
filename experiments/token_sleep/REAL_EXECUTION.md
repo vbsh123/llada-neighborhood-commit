@@ -59,6 +59,19 @@ rerun. Because this measurement is collected later rather than interleaved,
 hardware/load/clock drift can affect comparison even on the same GPU. The
 standalone summary has only the original mode and no cross-run comparison.
 
+For subsequent sleep-rule ablations, use `--sleep-only` (or `SLEEP_ONLY=1`
+in the Vast script), the saved study's `SAMPLES_FROM`, and a new output folder.
+This runs only `real_sleep`; it does not rerun either baseline. For example,
+`HIGH_ENTROPY=2 HIGH_SLEEP=1` tests shorter sleep, while
+`HIGH_ENTROPY=3 HIGH_SLEEP=2` tests a stricter entropy gate. Keep
+`SLEEP_CONFIDENCE=0.5` in both to change one parameter at a time relative to
+the initial H=2, sleep=2 study. H=3 is an exploratory cutoff, not a calibrated
+optimum. Validation still uses the requested uncertainty rule and can reject a
+configuration. Single-mode summaries contain no cross-run comparisons; apply
+the same saved-answer scorer to all folders and use matched sample IDs when
+comparing outcomes. These reused 100 questions are development data for choosing
+parameters, so final evaluation requires separate held-out questions.
+
 When requested, the original-versus-real comparison measures the combined practical change.
 **Active-baseline-versus-real isolates the additional benefit from sleep.**
 Do not attribute the original-versus-active LM-head savings to sleep. Quality and

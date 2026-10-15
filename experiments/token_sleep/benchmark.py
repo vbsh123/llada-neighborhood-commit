@@ -21,6 +21,8 @@ HERE = Path(__file__).resolve().parent
 def requested_modes(args):
     if args.original_only:
         return ('original',)
+    if args.sleep_only:
+        return ('real_sleep',)
     return ('original', *MODES) if args.include_original else MODES
 
 
@@ -381,6 +383,7 @@ def parser():
     mode_flags = p.add_mutually_exclusive_group()
     mode_flags.add_argument('--include-original',action='store_true',help='Add full vanilla timing to active_baseline and real_sleep')
     mode_flags.add_argument('--original-only',action='store_true',help='Run only ordinary model(x), in a new output folder; use --samples-from to match an existing study')
+    mode_flags.add_argument('--sleep-only',action='store_true',help='Run only real_sleep in a new output folder, reusing a separately measured baseline')
     p.add_argument('--diagnose-only',action='store_true',help='Local layer parity in native dtype versus FP32; no generations or benchmark')
     p.add_argument('--allow-scaled-fp32-drift',action='store_true',help='Explicit alternate validation: allow BF16 probability drift only if local FP32 scaled checks pass and tested selections/dense/sparse checks still pass')
     p.add_argument('--commit-threshold',type=float,default=.9)
