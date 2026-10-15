@@ -40,6 +40,25 @@ A few original-model validation forwards remain mandatory even without vanilla
 timing. Existing vanilla results can be retained as historical context, but their
 different tracing/timing setup makes them unsuitable for isolating sleep speedup.
 
+To add vanilla after a completed two-mode study, run it alone in a new folder:
+
+```bash
+SAMPLES_FROM=runs/real_sleep_study_v1/samples.jsonl \
+ORIGINAL_ONLY=1 ALLOW_SCALED_FP32_DRIFT=1 \
+RUN_NAME=vanilla_sleep_reference_v1 SKIP_INSTALL=1 \
+  bash scripts/vast_sleep_benchmark.sh study
+```
+
+This uses the exact saved 100 questions and times only `original`: ordinary
+`model(x, use_cache=False)` with full-position vocabulary projection. It retains
+BF16, TOP1, length 256, two untimed warmups per question and the same scoring and
+timing loop. Startup validation is still performed, including selective-backend
+checks outside timing; the alternate acceptance flag is for those checks, not a
+change to vanilla computation. The completed two-mode study is not modified or
+rerun. Because this measurement is collected later rather than interleaved,
+hardware/load/clock drift can affect comparison even on the same GPU. The
+standalone summary has only the original mode and no cross-run comparison.
+
 When requested, the original-versus-real comparison measures the combined practical change.
 **Active-baseline-versus-real isolates the additional benefit from sleep.**
 Do not attribute the original-versus-active LM-head savings to sleep. Quality and

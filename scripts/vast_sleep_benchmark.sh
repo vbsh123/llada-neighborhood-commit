@@ -33,6 +33,10 @@ nvidia-smi > "$experiment_out/nvidia-smi.txt"
 input_args=()
 if [[ -n "${SAMPLES_FROM:-}" ]]; then input_args+=(--samples-from "$SAMPLES_FROM"); fi
 conditions=2
+if [[ "${ORIGINAL_ONLY:-0}" == 1 && "${INCLUDE_ORIGINAL:-0}" == 1 ]]; then
+  echo 'Choose ORIGINAL_ONLY=1 or INCLUDE_ORIGINAL=1, not both'; exit 2
+fi
+if [[ "${ORIGINAL_ONLY:-0}" == 1 ]]; then input_args+=(--original-only); conditions=1; fi
 if [[ "${INCLUDE_ORIGINAL:-0}" == 1 ]]; then input_args+=(--include-original); conditions=3; fi
 if [[ "${ALLOW_SCALED_FP32_DRIFT:-0}" == 1 ]]; then input_args+=(--allow-scaled-fp32-drift); fi
 echo "REAL SLEEP: $count questions × $conditions modes; GPU parity checks required before timing."

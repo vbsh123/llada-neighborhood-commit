@@ -18,6 +18,12 @@ MODES = ('active_baseline', 'real_sleep')
 HERE = Path(__file__).resolve().parent
 
 
+def requested_modes(args):
+    if args.original_only:
+        return ('original',)
+    return ('original', *MODES) if args.include_original else MODES
+
+
 def compact_rows(logits, response_positions, mask_id):
     rows = score_logits(logits[0], list(range(len(response_positions))), {}, mask_id, 2)
     for row, position in zip(rows,response_positions):
@@ -298,7 +304,7 @@ def run(args):
                   high_entropy=args.high_entropy,high_sleep=args.high_sleep,low_sleep=0)
     config = {k:v for k,v in vars(args).items() if k!='out'}
     config['samples_from'] = str(args.samples_from.resolve()) if args.samples_from else None
-    modes = ('original',*MODES) if args.include_original else MODES
+    modes = requested_modes(args)
     config.update(model=MODEL,revision=REVISION,mask_id=126336,modes=list(modes),experiment='real_token_sleep_v1')
     out = args.out; out.mkdir(parents=True,exist_ok=True)
     with run_lock(out):
@@ -372,7 +378,9 @@ def parser():
     p.add_argument('--seed',type=int,default=1729)
     p.add_argument('--length',type=int,default=256)
     p.add_argument('--policy',choices=['top1','threshold'],default='top1')
-    p.add_argument('--include-original',action='store_true',help='Optionally rerun full vanilla timing; default compares active_baseline and real_sleep only')
+    mode_flags = p.add_mutually_exclusive_group()
+    mode_flags.add_argument('--include-original',action='store_true',help='Add full vanilla timing to active_baseline and real_sleep')
+    mode_flags.add_argument('--original-only',action='store_true',help='Run only ordinary model(x), in a new output folder; use --samples-from to match an existing study')
     p.add_argument('--diagnose-only',action='store_true',help='Local layer parity in native dtype versus FP32; no generations or benchmark')
     p.add_argument('--allow-scaled-fp32-drift',action='store_true',help='Explicit alternate validation: allow BF16 probability drift only if local FP32 scaled checks pass and tested selections/dense/sparse checks still pass')
     p.add_argument('--commit-threshold',type=float,default=.9)

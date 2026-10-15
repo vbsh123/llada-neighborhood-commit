@@ -10,7 +10,7 @@ from torch.nn import functional as F
 
 from experiments.token_sleep.selective import SelectiveForward
 from experiments.token_sleep.simulation import FrozenStates
-from experiments.token_sleep.benchmark import compact_rows,probability_comparison,validate,decode,evaluate,parser,validation_acceptance
+from experiments.token_sleep.benchmark import compact_rows,probability_comparison,validate,decode,evaluate,parser,validation_acceptance,requested_modes
 from experiments.token_sleep.diagnostics import diagnose,difference
 
 
@@ -218,6 +218,16 @@ class BenchmarkTests(unittest.TestCase):
         self.assertFalse(parser().parse_args(['--out','fixture']).include_original)
         self.assertTrue(parser().parse_args(['--out','fixture','--include-original']).include_original)
         self.assertFalse(parser().parse_args(['--out','fixture']).allow_scaled_fp32_drift)
+
+    def test_original_only_does_not_schedule_other_modes(self):
+        self.assertEqual(requested_modes(parser().parse_args(['--out','fixture'])),
+                         ('active_baseline','real_sleep'))
+        self.assertEqual(requested_modes(parser().parse_args(['--out','fixture','--include-original'])),
+                         ('original','active_baseline','real_sleep'))
+        self.assertEqual(requested_modes(parser().parse_args(['--out','fixture','--original-only'])),
+                         ('original',))
+        with self.assertRaises(SystemExit), patch('sys.stderr'):
+            parser().parse_args(['--out','fixture','--include-original','--original-only'])
 
     def test_layer_diagnostic_identical_inputs_and_dtype_restoration(self):
         self.exercise_layer_diagnostic(torch.float32)
