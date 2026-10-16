@@ -66,14 +66,14 @@ def compare_layer(model,block,inputs,seed,sleepers):
         for handle in handles: handle.remove()
 
 
-def diagnose(model,tokenizer,sample,config):
+def diagnose(model,tokenizer,sample,config,schedule_factory=SleepSchedule):
     import torch
     from confidence_geography.core import select
     from .benchmark import checked_input,compact_rows
     blocks=checked_blocks(model)
     x,pl=checked_input(model,tokenizer,sample['question'],config['length'],config['mask_id'])
     if config['length']<3: raise ValueError('Layer diagnosis needs response length >=3')
-    schedule=SleepSchedule(config['length'],'simulated_sleep',confidence=config['sleep_confidence'],
+    schedule=schedule_factory(config['length'],'simulated_sleep',confidence=config['sleep_confidence'],
         high_entropy=config['high_entropy'],high_sleep=config['high_sleep'],low_sleep=0)
     current_inputs={}; handles=[]
     with torch.inference_mode(),FrozenStates(blocks) as frozen:

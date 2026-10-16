@@ -87,7 +87,7 @@ def validation_acceptance(report,layer_report=None,allow_scaled_drift=False):
             'note':'Local FP32 agreement on one state is not full BF16 equivalence or a quality guarantee. Measure actual generated accuracy.'}
 
 
-def validate(model, tokenizer, sample, config):
+def validate(model, tokenizer, sample, config, schedule_factory=SleepSchedule):
     """Teacher-forced identical inputs, real versus dense and frozen-state simulator.
 
     Cache updates from comparison forwards must not touch simulator caches. The
@@ -98,7 +98,7 @@ def validate(model, tokenizer, sample, config):
     x,pl = checked_input(model,tokenizer,sample['question'],config['length'],config['mask_id'])
     blocks = checked_blocks(model)
     dense, selective = SelectiveForward(model),SelectiveForward(model)
-    schedule = SleepSchedule(config['length'],'simulated_sleep',confidence=config['sleep_confidence'],
+    schedule = schedule_factory(config['length'],'simulated_sleep',confidence=config['sleep_confidence'],
         high_entropy=config['high_entropy'],high_sleep=config['high_sleep'],low_sleep=0)
     report = {'steps':[],'scope':'identical teacher-forced original inputs',
               'max_probability_tolerance':config['validation_tolerance'],'passed':True}
@@ -168,11 +168,11 @@ def validate(model, tokenizer, sample, config):
     return report
 
 
-def decode(model,tokenizer,sample,config,mode,directory):
+def decode(model,tokenizer,sample,config,mode,directory,schedule_factory=SleepSchedule):
     import torch
     x,pl = checked_input(model,tokenizer,sample['question'],config['length'],config['mask_id'])
     backend = None if mode=='original' else SelectiveForward(model)
-    schedule = SleepSchedule(config['length'],'simulated_sleep' if mode=='real_sleep' else 'baseline',
+    schedule = schedule_factory(config['length'],'baseline' if mode in ('original','active_baseline') else 'simulated_sleep',
         confidence=config['sleep_confidence'],high_entropy=config['high_entropy'],high_sleep=config['high_sleep'],low_sleep=0)
     # Equal untimed warm-up count. Reset all state afterward.
     warm_start = time.perf_counter()
@@ -214,14 +214,16 @@ def decode(model,tokenizer,sample,config,mode,directory):
             if not chosen: raise RuntimeError('No fresh candidate after fallback')
             assigned = schedule.finish(step,rows,[r['position'] for r in chosen])
             for row in chosen: x[0,pl+row['position']] = row['token_id']
-            slept += len(sleepers); masked_total += len(masked)
+            slept += sum(p in sleeping for p in masked); masked_total += len(masked)
             fallbacks += int(schedule.fallback)
             active_total += active_count; head_total += head_count
             trace.append({'step':step,'masked_count':len(masked),'sleep_positions':sleepers,
                 'active_rows':active_count,'head_rows':head_count,'model_seconds':seconds,
                 'all_asleep_full_wake':schedule.fallback,'assigned':assigned,
                 'commit_positions':[r['position'] for r in chosen],
-                'commit_ids':[r['token_id'] for r in chosen]})
+                'commit_ids':[r['token_id'] for r in chosen],
+                'commit_confidences':[r['confidence'] for r in chosen],
+                **({'window_schedule':schedule.snapshot()} if hasattr(schedule,'snapshot') else {})})
             step += 1
             del logits
             if step > config['length']: raise RuntimeError('Failed to make progress')
@@ -241,7 +243,8 @@ def decode(model,tokenizer,sample,config,mode,directory):
         'warmup_seconds_excluded':warmup_seconds,'warmup_forwards_excluded':config['warmup_forwards'],
         'sleep_position_forwards':slept,'masked_position_forwards':masked_total,
         'active_transformer_rows':active_total,'vocabulary_head_rows':head_total,
-        'all_asleep_full_wakes':fallbacks,'peak_gpu_bytes':torch.cuda.max_memory_allocated()}
+        'all_asleep_full_wakes':fallbacks,'peak_gpu_bytes':torch.cuda.max_memory_allocated(),
+        **({'window_stats':schedule.stats} if hasattr(schedule,'stats') else {})}
     # All serialization happens after the measured decode interval.
     with gzip.open(directory/'trace.jsonl.gz.partial','wt',compresslevel=3) as handle:
         emit(handle,{'type':'header','config':config,'mode':mode,'sample':sample,'prompt_ids':x[0,:pl].tolist()})
@@ -269,7 +272,12 @@ def evaluate(out,samples,modes=MODES):
             'vocabulary_head_rows','all_asleep_full_wakes')}}
         mm=summary['modes'][mode]
         mm['sleep_fraction_of_masked_position_forwards']=mm['sleep_position_forwards']/mm['masked_position_forwards']
-    for baseline,treatment in [('original','active_baseline'),('active_baseline','real_sleep'),('original','real_sleep')]:
+        if any('window_stats' in r for r in rr):
+            mm['window_stats']={key:(max if key=='max_window_count' else sum)(r['window_stats'][key] for r in rr)
+                                for key in rr[0]['window_stats']}
+            mm['response_slots_per_decode_second']=sum(len(r['final_ids']) for r in rr)/mm['decode_seconds']
+    for baseline,treatment in [('original','active_baseline'),('active_baseline','real_sleep'),('original','real_sleep'),
+                               ('active_baseline','multi_window'),('original','multi_window')]:
         if baseline not in results or treatment not in results:
             continue
         a,b = summary['modes'][baseline],summary['modes'][treatment]
@@ -289,13 +297,13 @@ def evaluate(out,samples,modes=MODES):
     return summary
 
 
-def fingerprint():
+def fingerprint(extra_sources=()):
     base = HERE.parents[1]/'confidence_geography'
-    paths = [*HERE.glob('*.py'),base/'run.py',base/'core.py']
+    paths = [*HERE.glob('*.py'),base/'run.py',base/'core.py',*extra_sources]
     return hashlib.sha256(b''.join(p.name.encode()+p.read_bytes() for p in sorted(paths))).hexdigest()
 
 
-def run(args):
+def run(args, *, schedule_factory=SleepSchedule, modes=None, experiment='real_token_sleep_v1', extra_sources=()):
     import torch
     import numpy as np
     if min(args.samples,args.length,args.validation_steps)<1 or min(args.offset,args.warmup_forwards,args.high_sleep)<0:
@@ -306,14 +314,14 @@ def run(args):
                   high_entropy=args.high_entropy,high_sleep=args.high_sleep,low_sleep=0)
     config = {k:v for k,v in vars(args).items() if k!='out'}
     config['samples_from'] = str(args.samples_from.resolve()) if args.samples_from else None
-    modes = requested_modes(args)
-    config.update(model=MODEL,revision=REVISION,mask_id=126336,modes=list(modes),experiment='real_token_sleep_v1')
+    modes = requested_modes(args) if modes is None else tuple(modes)
+    config.update(model=MODEL,revision=REVISION,mask_id=126336,modes=list(modes),experiment=experiment)
     out = args.out; out.mkdir(parents=True,exist_ok=True)
     with run_lock(out):
         manifest_path = out/'manifest.json'
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text())
-            if manifest['config']!=config or manifest['source_sha256']!=fingerprint():
+            if manifest['config']!=config or manifest['source_sha256']!=fingerprint(extra_sources):
                 raise ValueError('Arguments/source changed; use a new --out')
             source = (out/'samples.jsonl').read_bytes()
             if hashlib.sha256(source).hexdigest()!=manifest['samples_sha256']:
@@ -325,7 +333,7 @@ def run(args):
             source = ''.join(json.dumps(s,ensure_ascii=False)+'\n' for s in samples).encode()
             (out/'samples.jsonl').write_bytes(source)
             dump(manifest_path,{'config':config,'dataset_info':info,'samples_sha256':hashlib.sha256(source).hexdigest(),
-                'source_sha256':fingerprint(),'git_commit':command('git','rev-parse','HEAD'),
+                'source_sha256':fingerprint(extra_sources),'git_commit':command('git','rev-parse','HEAD'),
                 'created_unix':time.time(),'torch_version':torch.__version__,
                 'gpu':torch.cuda.get_device_name(0) if torch.cuda.is_available() else None})
         pending = []
@@ -344,16 +352,16 @@ def run(args):
             torch.backends.cuda.matmul.allow_tf32=False; torch.backends.cudnn.allow_tf32=False
             if args.diagnose_only:
                 from .diagnostics import diagnose
-                report=diagnose(model,tokenizer,samples[0],config)
+                report=diagnose(model,tokenizer,samples[0],config,schedule_factory)
                 dump(out/'layer_diagnostics.json',report)
                 print(json.dumps({key:value for key,value in report.items() if key!='layers'},indent=2),flush=True)
                 return
-            report = validate(model,tokenizer,samples[0],config)
+            report = validate(model,tokenizer,samples[0],config,schedule_factory)
             layer_report=None
             if not report['passed'] and args.allow_scaled_fp32_drift:
                 from .diagnostics import diagnose
                 print('Strict BF16 parity failed; checking local FP32 math before any benchmark.',flush=True)
-                layer_report=diagnose(model,tokenizer,samples[0],config)
+                layer_report=diagnose(model,tokenizer,samples[0],config,schedule_factory)
                 dump(out/'layer_diagnostics.json',layer_report)
             report['acceptance']=validation_acceptance(report,layer_report,args.allow_scaled_fp32_drift)
             dump(out/'validation.json',report)
@@ -365,7 +373,7 @@ def run(args):
             for sample,mode,directory in pending:
                 random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
                 directory.mkdir(parents=True,exist_ok=True)
-                result = decode(model,tokenizer,sample,config,mode,directory)
+                result = decode(model,tokenizer,sample,config,mode,directory,schedule_factory)
                 print(f"DONE mode={mode} sample={sample['id']} correct={result['correct_numeric']} forwards={result['steps']} decode_seconds={result['decode_seconds']:.3f}",flush=True)
             del model
         print(json.dumps(evaluate(out,samples,modes),indent=2),flush=True)
