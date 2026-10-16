@@ -273,7 +273,7 @@ def evaluate(out,samples,modes=MODES):
         mm=summary['modes'][mode]
         mm['sleep_fraction_of_masked_position_forwards']=mm['sleep_position_forwards']/mm['masked_position_forwards']
         if any('window_stats' in r for r in rr):
-            mm['window_stats']={key:(max if key=='max_window_count' else sum)(r['window_stats'][key] for r in rr)
+            mm['window_stats']={key:(max if key.startswith('max_') else sum)(r['window_stats'][key] for r in rr)
                                 for key in rr[0]['window_stats']}
             mm['response_slots_per_decode_second']=sum(len(r['final_ids']) for r in rr)/mm['decode_seconds']
     for baseline,treatment in [('original','active_baseline'),('active_baseline','real_sleep'),('original','real_sleep'),

@@ -35,13 +35,14 @@ if [[ -n "${SAMPLES_FROM:-}" ]]; then input_args+=(--samples-from "$SAMPLES_FROM
 if [[ "${ALLOW_SCALED_FP32_DRIFT:-0}" == 1 ]]; then input_args+=(--allow-scaled-fp32-drift); fi
 if [[ "${COMPARE_ACTIVE:-0}" == 1 ]]; then input_args+=(--compare-active); fi
 if [[ "${INCLUDE_ORIGINAL:-0}" == 1 ]]; then input_args+=(--include-original); fi
-echo "MULTI WINDOW: $count questions; radius=${RADIUS:-4}; refresh every ${REFRESH_EVERY:-8} forwards."
+echo "MULTI WINDOW: $count questions; MASK gap=${REGION_GAP:-4}; padding=${RADIUS:-4}; refresh every ${REFRESH_EVERY:-8} forwards."
 echo "Extra modes: active baseline=${COMPARE_ACTIVE:-0}; vanilla=${INCLUDE_ORIGINAL:-0}."
 python -u -m experiments.multi_window.run \
   --out "$experiment_out" --samples "$count" --length "${LENGTH:-256}" \
   --seed "${SEED:-1729}" --policy "${POLICY:-top1}" \
   --commit-threshold "${COMMIT_THRESHOLD:-0.9}" \
-  --radius "${RADIUS:-4}" --refresh-every "${REFRESH_EVERY:-8}" "${input_args[@]}"
+  --radius "${RADIUS:-4}" --region-gap "${REGION_GAP:-4}" \
+  --refresh-every "${REFRESH_EVERY:-8}" "${input_args[@]}"
 # Keep this driver independent of older export scripts' local line endings.
 mkdir -p exports
 archive_path="exports/${experiment_name}_$(date -u +%Y%m%dT%H%M%SZ).tar.gz"

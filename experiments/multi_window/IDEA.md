@@ -17,3 +17,12 @@ decoding progress without recomputing the entire interval between them. Refreshe
 provide global discovery. The first implementation tests this mechanism; it does
 not establish that commitment proximity predicts context safety, novelty, or an
 advantage over Window-Diffusion. Engineering choices are listed in README.md.
+
+Clarification (verbatim, 2026-10-17):
+
+> i think the point was to keep the response tokens because they are "Active" reigons meaning, the window will be -4....token committed in the past/masks/wahetevr...new token...again everything needed...+4 - so like a region would be a seperation of X (lets say 4 for now) masks in a row
+
+> prety much every -4 region +4 will have to be included even if there were no activity there in a while
+
+Version v2 implements persistent regions separated by >=4 consecutive MASKs,
+including every historical region's full span with +/-4 outer padding. No retirement.

@@ -8,7 +8,7 @@ from .schedule import WindowSchedule
 
 def run(args):
     def factory(length, mode, **kwargs):
-        return WindowSchedule(length, mode, radius=args.radius,
+        return WindowSchedule(length, mode, radius=args.radius,region_gap=args.region_gap,
                               refresh_every=args.refresh_every)
     # Validate before dataset/model loading.
     factory(args.length, 'simulated_sleep')
@@ -18,7 +18,7 @@ def run(args):
     if args.include_original:
         modes = ('original', *modes)
     return benchmark.run(args, schedule_factory=factory, modes=modes,
-                         experiment='commit_centered_multi_window_v1',
+                         experiment='persistent_mask_gap_multi_window_v2',
                          extra_sources=list(Path(__file__).parent.glob('*.py')))
 
 
@@ -45,6 +45,8 @@ def parser():
     p.set_defaults(original_only=False,sleep_only=False,diagnose_only=False,
                    sleep_confidence=.5,high_entropy=2.,high_sleep=2)
     p.add_argument('--radius', type=int, default=4)
+    p.add_argument('--region-gap', type=int, default=4,
+                   help='Consecutive MASKs required to separate two logical regions')
     p.add_argument('--refresh-every', type=int, default=8)
     p.add_argument('--compare-active', action='store_true',
                    help='Explicitly add full active computation; default treatment only')

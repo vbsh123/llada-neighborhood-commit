@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from experiments.multi_window.schedule import WindowSchedule, merge_windows
+from experiments.multi_window.schedule import WindowSchedule, merge_windows, region_bounds
 from experiments.multi_window.run import parser, run
 from experiments.token_sleep.benchmark import validate, decode, evaluate
 from test_real_token_sleep import Model, Tokenizer
@@ -19,67 +19,70 @@ class ScheduleTests(unittest.TestCase):
         for kwargs in (dict(radius=-1),dict(refresh_every=0)):
             with self.assertRaises(ValueError): WindowSchedule(20,'simulated_sleep',**kwargs)
 
-    def test_discovery_only_on_refresh_and_two_regions(self):
-        s=WindowSchedule(30,'simulated_sleep',radius=1,refresh_every=4)
+    def test_exact_mask_gap_and_interior(self):
+        self.assertEqual(region_bounds([2,6],4),[(2,6)])  # three MASKs
+        self.assertEqual(region_bounds([2,7],4),[(2,2),(7,7)])  # four MASKs
+        with self.assertRaises(ValueError): region_bounds([2],0)
+        schedule=WindowSchedule(20,'simulated_sleep',radius=0,region_gap=4)
+        state=[0]*20; state[2]=state[6]=1
+        sleepers=schedule.prepare(1,state,0)
+        self.assertEqual(schedule.windows,[(2,6)])
+        for p in range(2,7): self.assertNotIn(p,sleepers)
+        self.assertIn(7,sleepers)
+
+    def test_padding_overlap_does_not_merge_regions(self):
+        schedule=WindowSchedule(30,'simulated_sleep',radius=4,region_gap=4)
         state=[0]*30
-        self.assertEqual(s.prepare(0,state,0),[])
-        s.finish(0,[],[5]); state[5]=1
-        self.assertEqual(s.windows,[(4,6)])
-        sleepers=s.prepare(1,state,0)
-        self.assertIn(20,sleepers); self.assertNotIn(4,sleepers)
-        self.assertEqual(s.prepare(4,state,0),[])
-        s.finish(4,[],[20]); state[20]=1
-        self.assertEqual(s.windows,[(4,6),(19,21)])
-        self.assertEqual(s.stats['windows_opened'],2)
-        self.assertEqual(s.stats['global_refreshes'],2)
-        self.assertNotIn(5,s.prepare(5,state,0))
-        self.assertEqual(s.snapshot()['windows_before'],[[4,6],[19,21]])
+        schedule.prepare(0,state,0); schedule.finish(0,[],[5,10])
+        self.assertEqual(schedule.regions,[(5,5),(10,10)])
+        self.assertEqual(schedule.windows,[(1,14)])
+        self.assertEqual(schedule.stats['regions_opened'],2)
+        self.assertEqual(schedule.stats['windows_opened'],1)
+        state[5]=state[10]=1
+        schedule.prepare(1,state,0); schedule.finish(1,[],[7])
+        self.assertEqual(schedule.regions,[(5,10)])
+        self.assertEqual(schedule.stats['regions_merged'],1)
+        self.assertEqual(schedule.stats['windows_merged'],0)
 
-    def test_expansion_merger_and_batch_births(self):
-        s=WindowSchedule(20,'simulated_sleep',radius=2)
-        s.prepare(0,[0]*20,0); s.finish(0,[],[3,10])
-        self.assertEqual(s.windows,[(1,5),(8,12)])
-        s.prepare(1,[0]*20,0); s.finish(1,[],[5,8])
-        self.assertEqual(s.windows,[(1,12)])
-        self.assertEqual(s.stats['windows_merged'],1)
-        t=WindowSchedule(20,'simulated_sleep',radius=2)
-        t.prepare(0,[0]*20,0); t.finish(0,[],[3,4])
-        self.assertEqual(t.stats['windows_opened'],1)
-        self.assertEqual(t.stats['new_region_seeds'],2)
+    def test_inactive_and_completed_regions_never_retire(self):
+        schedule=WindowSchedule(30,'simulated_sleep',radius=1,region_gap=4)
+        state=[0]*30
+        for p in range(4,9): state[p]=1
+        state[22]=1
+        for step in [1,2,3,5,6,7,9,1001]:
+            sleepers=schedule.prepare(step,state,0)
+            self.assertEqual(schedule.regions,[(4,8),(22,22)])
+            for p in list(range(3,10))+list(range(21,24)):
+                self.assertNotIn(p,sleepers)
+            self.assertIn(15,sleepers)
+            self.assertFalse(set(sleepers) & {p for p,t in enumerate(state) if t})
+        self.assertEqual(schedule.stats['windows_retired'],0)
+        self.assertEqual(schedule.stats['sleeping_filled_position_forwards'],0)
 
-    def test_retirement_fallback_and_filled_rows_sleep(self):
-        s=WindowSchedule(10,'simulated_sleep',radius=1)
-        s.prepare(0,[0]*10,0); s.finish(0,[],[2])
-        # A filled position OUTSIDE the active window sleeps too.
-        state=[0]*10; state[8]=1
-        self.assertIn(8,s.prepare(1,state,0))
-        self.assertEqual(s.stats['sleeping_filled_position_forwards'],1)
-        state[1:4]=[1,1,1]
-        self.assertEqual(s.prepare(2,state,0),[])
-        self.assertTrue(s.fallback)
-        self.assertEqual(s.stats['windows_retired'],1)
-        self.assertEqual(s.snapshot()['refresh_reason'],'empty_windows')
+    def test_refresh_discovery_and_exhausted_padding_fallback(self):
+        schedule=WindowSchedule(30,'simulated_sleep',radius=1,region_gap=4,refresh_every=4)
+        state=[0]*30
+        self.assertEqual(schedule.prepare(0,state,0),[])
+        schedule.finish(0,[],[5]); state[5]=1
+        self.assertIn(20,schedule.prepare(1,state,0))
+        self.assertEqual(schedule.prepare(4,state,0),[])
+        schedule.finish(4,[],[20]); state[20]=1
+        self.assertEqual(schedule.regions,[(5,5),(20,20)])
+        self.assertEqual(schedule.windows,[(4,6),(19,21)])
+        schedule.radius=0
+        # With no interior MASK or padding candidate, refresh without retirement.
+        self.assertEqual(schedule.prepare(5,state,0),[])
+        self.assertTrue(schedule.fallback)
+        self.assertEqual(schedule.windows,[(5,5),(20,20)])
 
     def test_baseline_refresh_one_and_edges(self):
         for mode,refresh in [('baseline',8),('simulated_sleep',1)]:
-            s=WindowSchedule(8,mode,radius=2,refresh_every=refresh)
+            schedule=WindowSchedule(12,mode,radius=2,refresh_every=refresh)
+            state=[0]*12
             for step in range(3):
-                self.assertEqual(s.prepare(step,[0]*8,0),[])
-                s.finish(step,[],[0,7])
-            if mode!='baseline': self.assertEqual(s.windows,[(0,2),(5,7)])
-
-    def test_last_commit_wakes_even_when_its_window_retires(self):
-        s=WindowSchedule(12,'simulated_sleep',radius=1)
-        state=[0]*12
-        s.prepare(0,state,0); s.finish(0,[],[2,8])
-        state[1:4]=[1,1,1]; state[8]=1
-        # A final fill exhausted the first window while the other still has masks.
-        s.prepare(1,[0]*12,0); s.finish(1,[],[2])
-        sleepers=s.prepare(2,state,0)
-        self.assertEqual(s.windows,[(7,9)])
-        self.assertNotIn(2,sleepers)
-        self.assertIn(1,sleepers)
-        self.assertFalse(s.snapshot()['global_refresh'])
+                self.assertEqual(schedule.prepare(step,state,0),[])
+                schedule.finish(step,[],[0,11]); state[0]=state[11]=1
+            if mode!='baseline': self.assertEqual(schedule.windows,[(0,2),(9,11)])
 
     def test_default_runs_no_baseline(self):
         args=parser().parse_args(['--out','fixture'])
