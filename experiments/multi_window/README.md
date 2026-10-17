@@ -53,7 +53,7 @@ separately. Padding overlap is not reported as a logical region merger.
 3. Recompute every row in that union, including every filled response position
    and all interior MASKs. Only awake MASK rows receive vocabulary predictions.
    No forced neighbor commitments, confidence boosts, or entropy scheduling.
-4. Refresh all response positions at steps 0,8,16,... by default. Select among
+4. Refresh all response positions at steps 0,4,8,12,... by default. Select among
    all remaining MASKs on those forwards; distant commitments can create regions.
    Otherwise selection sees only freshly evaluated MASKs inside computation windows.
 5. If the window union supplies no masked candidate, do an additional global

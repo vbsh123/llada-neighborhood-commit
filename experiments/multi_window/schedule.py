@@ -46,7 +46,7 @@ class WindowSchedule:
     Logical region mergers depend on MASK gaps, not overlapping window padding.
     """
 
-    def __init__(self, length, mode, *, radius=4, region_gap=4, refresh_every=8, **unused):
+    def __init__(self, length, mode, *, radius=4, region_gap=4, refresh_every=4, **unused):
         if length < 1 or radius < 0 or region_gap < 1 or refresh_every < 1:
             raise ValueError('Require length>=1, radius>=0, region_gap>=1, refresh_every>=1')
         if mode not in ('baseline', 'simulated_sleep'):

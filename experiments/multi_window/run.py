@@ -47,7 +47,7 @@ def parser():
     p.add_argument('--radius', type=int, default=4)
     p.add_argument('--region-gap', type=int, default=4,
                    help='Consecutive MASKs required to separate two logical regions')
-    p.add_argument('--refresh-every', type=int, default=8)
+    p.add_argument('--refresh-every', type=int, default=4)
     p.add_argument('--compare-active', action='store_true',
                    help='Explicitly add full active computation; default treatment only')
     return p
