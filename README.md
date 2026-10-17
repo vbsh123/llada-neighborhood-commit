@@ -4,6 +4,10 @@ GSM8K experiment: ordinary highest-confidence top1 and a top1-anchored
 three- or four-position window. Independent repository; no model inference runs locally.
 Collector derived from [dllm-confidence-geography](https://github.com/vbsh123/dllm-confidence-geography).
 
+Separate DIFFA audio-representation study: [measurements and Vast setup](experiments/audio_drift/README.md).
+Run `RUN_NAME=audio_smoke_v1 bash scripts/vast_audio_drift.sh smoke` for a two-clip
+ASR smoke run with online hidden/KV drift metrics and an official-decoder check.
+
 Separate ten-example Chinese→English translation probe:
 [instructions and exact protocol](experiments/translation_probe/README.md).
 Run `RUN_NAME=translation_10_v1 bash scripts/vast_translation.sh pilot` for the

@@ -1,4 +1,6 @@
 .venv/
+.venv-audio/
+data/audio_drift/
 .cache/
 __pycache__/
 *.egg-info/
