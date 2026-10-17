@@ -51,14 +51,25 @@ else
   block="${BLOCK_LENGTH:-32}"
 fi
 extra=()
-if [[ "${INTERVENTIONS:-0}" == 1 ]]; then extra+=(--interventions freeze remove text_only); fi
+if [[ "${GROUP_STUDY:-0}" == 1 ]]; then
+  read -r -a refresh_intervals <<< "${REFRESH_INTERVALS:-1 2 4 8}"
+  read -r -a mixed_refresh <<< "${MIXED_REFRESH:-8:2 2:8}"
+  extra+=(--interventions freeze remove text_only --freeze-groups acoustic semantic both
+          --refresh-intervals "${refresh_intervals[@]}" --mixed-refresh "${mixed_refresh[@]}")
+elif [[ "${INTERVENTIONS:-0}" == 1 ]]; then
+  extra+=(--interventions freeze remove text_only)
+fi
+read -r -a branch_fractions <<< "${BRANCH_FRACTIONS:-0 .25 .5 .75}"
 if [[ "${TOKEN_METRICS:-0}" == 1 ]]; then extra+=(--token-metrics); fi
 python -u -m experiments.audio_drift.run \
   --diffa-root "$diffa_checkout" --manifest "$manifest" --out "runs/$experiment_name" \
   --samples "$count" --length "$length" --block-length "$block" --steps "${STEPS:-$length}" \
   --layers "${LAYERS:-all}" --reference-device "${REFERENCE_DEVICE:-cpu}" \
-  --verify-samples "${VERIFY_SAMPLES:-1}" --seed "${SEED:-1729}" "${extra[@]}"
+  --verify-samples "${VERIFY_SAMPLES:-1}" --seed "${SEED:-1729}" \
+  --progress-every "${PROGRESS_EVERY:-8}" --branch-fractions "${branch_fractions[@]}" "${extra[@]}"
 python -m experiments.audio_drift.analyze --run "runs/$experiment_name"
+python -m experiments.audio_drift.stability --run "runs/$experiment_name" --statistic median
+python -m experiments.audio_drift.stability --run "runs/$experiment_name" --statistic p90
 python -m pip freeze > "runs/$experiment_name/packages.txt"
 nvidia-smi > "runs/$experiment_name/nvidia-smi.txt"
 echo "Complete: runs/$experiment_name/summary.json"

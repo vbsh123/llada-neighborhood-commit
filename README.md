@@ -7,6 +7,8 @@ Collector derived from [dllm-confidence-geography](https://github.com/vbsh123/dl
 Separate DIFFA audio-representation study: [measurements and Vast setup](experiments/audio_drift/README.md).
 Run `RUN_NAME=audio_smoke_v1 bash scripts/vast_audio_drift.sh smoke` for a two-clip
 ASR smoke run with online hidden/KV drift metrics and an official-decoder check.
+Set `GROUP_STUDY=1` for separate acoustic/semantic freezing, periodic refresh,
+mixed schedules, and baseline stability timing (see the audio study instructions).
 
 Separate ten-example Chinese→English translation probe:
 [instructions and exact protocol](experiments/translation_probe/README.md).

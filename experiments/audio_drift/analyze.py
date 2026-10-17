@@ -62,6 +62,11 @@ def main():
                      "metric": key[4], "layer": layer, "progress_bin": bin_index,
                      "sample_count": len(values), "mean_sample_median": float(np.mean(values))})
     (output / "heatmap_values.json").write_text(json.dumps(rows, indent=2) + "\n")
+    shared_max = defaultdict(float)
+    for panel, values in panels.items():
+        if panel[1] in {"audio_semantic", "audio_acoustic", "prompt"}:
+            scale_key = panel[0], *panel[2:]
+            shared_max[scale_key] = max(shared_max[scale_key], max(values.values()))
     for panel, values in panels.items():
         layers = sorted({layer for layer, _ in values})
         matrix = np.full((len(layers), args.bins), np.nan)
@@ -69,7 +74,9 @@ def main():
             for b in range(args.bins):
                 matrix[i, b] = values.get((layer, b), np.nan)
         fig, ax = plt.subplots(figsize=(9, 6))
-        image = ax.imshow(matrix, aspect="auto", origin="lower", interpolation="nearest", vmin=0)
+        scale = shared_max.get((panel[0], *panel[2:])) if panel[1] in {"audio_semantic", "audio_acoustic", "prompt"} else None
+        image = ax.imshow(matrix, aspect="auto", origin="lower", interpolation="nearest", vmin=0,
+                          vmax=max(scale, 1e-8) if scale is not None else None)
         ax.set_yticks(range(len(layers)), layers)
         ax.set_xticks(range(args.bins), [f"{1 - (b + .5) / args.bins:.2f}" for b in range(args.bins)], rotation=45)
         ax.set(xlabel="Fraction of answer masks remaining (bin centers)", ylabel="Transformer layer (0 based)",
@@ -79,29 +86,57 @@ def main():
         fig.savefig(output / (safe_name("_".join(panel)) + ".png"), dpi=150)
         plt.close(fig)
     curves = defaultdict(lambda: defaultdict(list))
+    paired_baselines = defaultdict(dict)
     for path in sorted((args.run / "samples").glob("*/result.json")):
         result = json.loads(path.read_text())
         if path.parent.name.startswith("."):
             continue
         for branch in result["interventions"]:
-            for condition, score in ((branch["mode"], branch["score"]), ("baseline", result["score"])):
-                if score is None:
+            score = branch["score"]
+            if score is None:
+                continue
+            metric = "accuracy" if "correct" in score else "wer"
+            value = float(score["correct"]) if metric == "accuracy" else score["wer"]
+            baseline_score = result["score"]
+            baseline = float(baseline_score["correct"]) if metric == "accuracy" else baseline_score["wer"]
+            schedules = branch.get("schedule", [])
+            if branch["mode"] != "freeze":
+                panel = "remove / text-only"
+            elif len(schedules) > 1:
+                panel = "mixed schedules"
+            else:
+                panel = schedules[0]["group"] if schedules else "both"
+            for subset in ["all", "unfinished"]:
+                if subset == "unfinished" and branch["baseline_answer_already_revealed"]:
                     continue
-                metric = "accuracy" if "correct" in score else "wer"
-                value = float(score["correct"]) if metric == "accuracy" else score["wer"]
-                curves[result["task"], metric][condition, branch["anchor_step_fraction"]].append(value)
-    for (task, metric), values in curves.items():
-        fig, ax = plt.subplots(figsize=(7, 4))
-        for mode in sorted({k[0] for k in values}):
-            fractions = sorted({k[1] for k in values if k[0] == mode})
-            ax.plot(fractions, [np.mean(values[mode, f]) for f in fractions], marker="o", label=mode)
-        ax.set(xlabel="Anchor fraction of baseline forward calls", ylabel="Mean sample " + metric,
-               title=task + ": continued audio dependence")
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(output / (safe_name(task + "_interventions_" + metric) + ".png"), dpi=150)
+                key = result["task"], metric, subset, panel
+                condition = branch.get("condition", branch["mode"])
+                fraction = branch["anchor_step_fraction"]
+                curves[key][condition, fraction].append(value)
+                paired_baselines[key][fraction, result["id"]] = baseline
+    figures = defaultdict(list)
+    for key in curves:
+        figures[key[:3]].append(key)
+    for (task, metric, subset), keys in figures.items():
+        fig, axes = plt.subplots(2, 3, figsize=(16, 9), squeeze=False, layout="constrained")
+        for ax, key in zip(axes.flat, sorted(keys)):
+            values = curves[key]
+            for mode in sorted({k[0] for k in values}):
+                fractions = sorted({k[1] for k in values if k[0] == mode})
+                ax.plot(fractions, [np.mean(values[mode, f]) for f in fractions], marker="o", label=mode)
+            pairs = paired_baselines[key]
+            fractions = sorted({f for f, _ in pairs})
+            ax.plot(fractions, [np.mean([v for (f, _), v in pairs.items() if f == fraction]) for fraction in fractions],
+                    color="black", linestyle="--", label="paired baseline")
+            ax.set(xlabel="Baseline anchor fraction", ylabel="Mean sample " + metric,
+                   title=key[3])
+            ax.legend(fontsize=7)
+        for ax in list(axes.flat)[len(keys):]:
+            ax.set_visible(False)
+        fig.suptitle(f"{task}: {subset} baseline answers; sequential paired continuations")
+        fig.savefig(output / (safe_name(task + "_interventions_" + metric + "_" + subset) + ".png"), dpi=150)
         plt.close(fig)
-    print(f"Wrote {len(panels)} heatmaps and {len(curves)} intervention plots to {output}")
+    print(f"Wrote {len(panels)} heatmaps and {len(figures)} intervention plots to {output}")
 
 
 if __name__ == "__main__":

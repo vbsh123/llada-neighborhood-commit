@@ -1,6 +1,7 @@
 """Collect DIFFA audio drift on a local JSONL manifest; run inference on Vast."""
 import argparse
 from collections import defaultdict
+from contextlib import ExitStack
 import hashlib
 import importlib.metadata
 import json
@@ -16,6 +17,7 @@ from .decode import Prepared, decode, distribution_change, forward_logits, sched
 from .hooks import AttentionProbe, blocks_of
 from .inputs import load_audio, read_manifest, score
 from .metrics import DriftRecorder
+from .protocol import anchors_for, conditions, work_estimate
 from .model import (DIFFA_REPO, DIFFA_REVISION, LLM_REPO, LLM_REVISION,
                     load_model, prepare, resolve_revision)
 
@@ -35,93 +37,141 @@ def display_text(tokenizer, x, prompt_length):
     return tokenizer.decode(ids, skip_special_tokens=True).strip()
 
 
+def intervention_specs(args):
+    return conditions(args.interventions, getattr(args, "freeze_groups", ["both"]),
+                      getattr(args, "refresh_intervals", []), getattr(args, "mixed_refresh", []))
+
+
 @torch.no_grad()
 def interventions(llm, prepared, baseline, states, args, tokenizer, row):
-    if not args.interventions:
+    specifications = intervention_specs(args)
+    if not specifications:
         return []
-    from .hooks import AttentionProbe
     results = []
-    anchors = sorted({round(f * (len(states) - 1)) for f in args.branch_fractions})
+    anchors = anchors_for(len(states), args.branch_fractions)
+    total = len(anchors) * len(specifications)
+    baseline_ids = baseline[0, prepared.prompt.shape[1]:].tolist()
+    stop = baseline_ids.index(tokenizer.eos_token_id) if tokenizer.eos_token_id in baseline_ids else len(baseline_ids)
+    special = set(getattr(tokenizer, "all_special_ids", [tokenizer.eos_token_id]))
+    lexical = torch.tensor([[i < stop and token not in special for i, token in enumerate(baseline_ids)]])
     for anchor in anchors:
         start = anchor + 1
-        if start >= len(states):
-            continue
         anchor_x = states[anchor].to(llm.device)
-        # Capture the exact baseline audio memory after normalization and RoPE.
         with AttentionProbe(llm, prepared.audio_positions, mode="capture") as capture:
             anchor_logits = forward_logits(llm, prepared, anchor_x)
         del anchor_logits, anchor_x
         start_x = states[start].to(llm.device)
         reference = forward_logits(llm, prepared, start_x).cpu()
         remaining = start_x[:, prepared.prompt.shape[1]:].cpu() == prepared.mask_id
-        baseline_ids = baseline[0, prepared.prompt.shape[1]:].tolist()
-        stop = baseline_ids.index(tokenizer.eos_token_id) if tokenizer.eos_token_id in baseline_ids else len(baseline_ids)
-        # Posthoc diagnostic only: don't count already-fixed answers as evidence
-        # that audio can be removed while meaningful generation remains.
-        content_masks = int(remaining[0, :stop].sum())
-        for mode in args.interventions:
+        content_remaining = remaining & lexical
+        content_masks = int(content_remaining.sum())
+        for specification in specifications:
+            name, mode = specification["condition"], specification["mode"]
+            print(f"  branch {len(results) + 1}/{total}: {name}; anchor={anchor}; "
+                  f"{content_masks} baseline content masks remain", flush=True)
             branch_prepared = prepared
-            if mode == "text_only":
-                # Cold recomputation from IDs. Audio is absent; later RoPE
-                # positions shift, so this is a text-sufficiency diagnostic,
-                # not a clean estimate of audio attention's marginal effect.
-                branch_prepared = Prepared(prepared.prompt, prepared.speech[:, :0],
-                                           prepared.insertion, 0, prepared.mask_id)
-                context = AttentionProbe(llm, [], mode="observe")
-            else:
-                context = AttentionProbe(llm, prepared.audio_positions, mode=mode,
-                                         frozen=capture.frozen)
+            probes = []
             torch.cuda.synchronize()
             began = time.perf_counter()
-            with context:
+            with ExitStack() as stack:
+                if mode == "text_only":
+                    branch_prepared = Prepared(prepared.prompt, prepared.speech[:, :0],
+                                               prepared.insertion, 0, prepared.mask_id)
+                elif mode == "remove":
+                    stack.enter_context(AttentionProbe(llm, prepared.audio_positions, mode="remove"))
+                else:
+                    for schedule in specification["schedule"]:
+                        group = schedule["group"]
+                        positions = prepared.group_positions(group)
+                        if not positions:
+                            raise ValueError(f"No tokens in requested group {group}")
+                        # The capture bank contains all audio positions. Select
+                        # only this group's columns in the SAME position order.
+                        indices = torch.tensor([p - prepared.insertion for p in positions])
+                        bank = {layer: tuple(t.index_select(-2, indices) for t in pair)
+                                for layer, pair in capture.frozen.items()}
+                        probe = stack.enter_context(AttentionProbe(llm, positions, mode="freeze",
+                                      frozen=bank, refresh_every=schedule["refresh_every"], anchor_step=anchor))
+                        probes.append((group, probe))
+                    del bank
                 first = forward_logits(llm, branch_prepared, start_x)
-                immediate = distribution_change(reference, first.cpu(), remaining)
-                final, _, _ = decode(llm, branch_prepared, args.length, args.block_length,
+                first_cpu = first.cpu()
+                immediate = distribution_change(reference, first_cpu, remaining)
+                immediate_content = distribution_change(reference, first_cpu, content_remaining)
+                del first_cpu
+                final, _, branch_events = decode(llm, branch_prepared, args.length, args.block_length,
                                       args.steps, start_x=start_x, start_step=start,
                                       first_logits=first, save_states=False)
             torch.cuda.synchronize()
             text = display_text(tokenizer, final, prepared.prompt.shape[1])
-            results.append({"mode": mode, "anchor_step": anchor,
-                            "anchor_step_fraction": anchor / max(1, len(states) - 1),
-                            "start_step": start, "remaining_fraction": float(remaining.float().mean()),
-                            "baseline_content_masks_remaining": content_masks,
-                            "baseline_answer_already_revealed": content_masks == 0,
-                            "immediate": immediate, "text": text,
-                            "answer_ids": final[0, prepared.prompt.shape[1]:].tolist(),
-                            "same_final_tokens": torch.equal(final, baseline),
-                            "score": score(text, row.get("target"), row.get("metric", "none")),
-                            "diagnostic_elapsed_seconds": time.perf_counter() - began})
-            del first, final
+            result = {**specification, "anchor_step": anchor,
+                      "anchor_step_fraction": anchor / max(1, len(states) - 1),
+                      "start_step": start, "remaining_fraction": float(remaining.float().mean()),
+                      "baseline_content_masks_remaining": content_masks,
+                      "baseline_answer_already_revealed": content_masks == 0,
+                      "immediate": immediate, "immediate_content": immediate_content, "text": text,
+                      "answer_ids": final[0, prepared.prompt.shape[1]:].tolist(),
+                      "same_final_tokens": torch.equal(final, baseline),
+                      "score": score(text, row.get("target"), row.get("metric", "none")),
+                      "cache_events": {group: probe.cache_events for group, probe in probes},
+                      "commit_events": [{"step": e["step"], "positions": e["committed_positions"]}
+                                        for e in branch_events],
+                      "diagnostic_elapsed_seconds": time.perf_counter() - began}
+            # Refresh-every-forward is an identity control: it must not change
+            # decoding. This guards schedule/mapping correctness on the GPU too.
+            if mode == "freeze" and all(s["refresh_every"] == 1 for s in specification["schedule"]):
+                if not result["same_final_tokens"]:
+                    raise RuntimeError(f"Refresh-every-forward control differs from baseline: {name}")
+            results.append(result)
+            print(f"    done: same_tokens={result['same_final_tokens']}; score={result['score']}", flush=True)
+            del first, final, probes
         del reference, capture, start_x
     return results
+
+
+def summarize_pairs(entries):
+    scored = [e for e in entries if e["score"] is not None]
+    result = {"samples": len(entries), "scored": len(scored)}
+    correct = [e["score"]["correct"] for e in scored if "correct" in e["score"]]
+    if correct:
+        result["accuracy"] = sum(correct) / len(correct)
+    wer = [e for e in scored if e["score"]["metric"] == "wer"]
+    if wer:
+        denominator = max(1, sum(e["score"]["reference_words"] for e in wer))
+        result["corpus_wer"] = sum(e["score"]["edits"] for e in wer) / denominator
+        result["paired_baseline_corpus_wer"] = sum(e["baseline_score"]["edits"] for e in wer) / denominator
+        result["corpus_wer_delta"] = result["corpus_wer"] - result["paired_baseline_corpus_wer"]
+    if entries and all("same_final_tokens" in e for e in entries):
+        result["identical_tokens_fraction"] = sum(e["same_final_tokens"] for e in entries) / len(entries)
+    return result
 
 
 def aggregate(output):
     tasks = defaultdict(lambda: {"samples": 0, "conditions": defaultdict(list)})
     for path in sorted((output / "samples").glob("*/result.json")):
+        if path.parent.name.startswith("."):
+            continue
         result = json.loads(path.read_text())
         task = tasks[result["task"]]
         task["samples"] += 1
-        task["conditions"]["baseline"].append(result["score"])
+        task["conditions"]["baseline"].append({"score": result["score"], "baseline_score": result["score"]})
         for branch in result["interventions"]:
-            key = f"{branch['mode']}@{branch['anchor_step_fraction']:.3f}"
-            task["conditions"][key].append(branch["score"])
+            key = f"{branch.get('condition', branch['mode'])}@{branch['anchor_step_fraction']:.3f}"
+            task["conditions"][key].append({**branch, "baseline_score": result["score"]})
     summary = {}
     for name, task in tasks.items():
-        conditions = {}
-        for name2, scores in task["conditions"].items():
-            usable = [s for s in scores if s is not None]
-            counts = {"samples": len(scores), "scored": len(usable)}
-            correct = [s["correct"] for s in usable if "correct" in s]
-            wer = [s for s in usable if s["metric"] == "wer"]
-            if correct:
-                counts["accuracy"] = sum(correct) / len(correct)
-            if wer:
-                counts["corpus_wer"] = sum(s["edits"] for s in wer) / max(1, sum(s["reference_words"] for s in wer))
-            conditions[name2] = counts
-        summary[name] = {"samples": task["samples"], "conditions": conditions}
+        conditions_summary = {}
+        for name2, entries in task["conditions"].items():
+            counts = summarize_pairs(entries)
+            if name2 != "baseline":
+                unfinished = [e for e in entries if not e["baseline_answer_already_revealed"]]
+                counts["with_content_remaining"] = summarize_pairs(unfinished)
+                counts["already_revealed_samples"] = len(entries) - len(unfinished)
+            conditions_summary[name2] = counts
+        summary[name] = {"samples": task["samples"], "conditions": conditions_summary}
     write_json(output / "summary.json", {"tasks": summary,
-               "timing_note": "Instrumented diagnostic runtime; no optimized-cache speedup claim."})
+               "timing_note": "Instrumented diagnostic runtime; no optimized-cache speedup claim.",
+               "quality_note": "Compare the with_content_remaining subset; completed answers can hide damage."})
 
 
 def parser():
@@ -148,6 +198,12 @@ def parser():
     p.add_argument("--snapshot-steps", type=int, nargs="*", default=[])
     p.add_argument("--snapshot-layers", type=int, nargs="*", default=[])
     p.add_argument("--interventions", nargs="*", choices=["freeze", "remove", "text_only"], default=[])
+    p.add_argument("--freeze-groups", nargs="+", choices=["acoustic", "semantic", "both"], default=["both"])
+    p.add_argument("--refresh-intervals", type=int, nargs="*", default=[],
+                   help="Also test periodic refresh; 1 is an identity control, 0/permanent is automatic")
+    p.add_argument("--mixed-refresh", nargs="*", default=[], metavar="ACOUSTIC:SEMANTIC",
+                   help="Independent intervals for the two groups, e.g. 8:2 2:8; 0 means no refresh")
+    p.add_argument("--progress-every", type=int, default=8)
     p.add_argument("--branch-fractions", type=float, nargs="+", default=[0., .25, .5, .75])
     p.add_argument("--verify-samples", type=int, default=1,
                    help="Compare instrumented decoding with the official unmodified decoder")
@@ -158,6 +214,11 @@ def parser():
 def main():
     args = parser().parse_args()
     schedule(args.length, args.block_length, args.steps)
+    specifications = intervention_specs(args)
+    estimate = work_estimate(args.steps, args.branch_fractions, specifications)
+    print("Work per example:", json.dumps(estimate), flush=True)
+    if args.progress_every < 0:
+        raise ValueError("progress-every must be nonnegative")
     if args.verify_samples < 0 or not all(0 <= f < 1 for f in args.branch_fractions):
         raise ValueError("Invalid verification count or branch fractions")
     if bool(args.snapshot_steps) != bool(args.snapshot_layers):
@@ -180,7 +241,7 @@ def main():
         fingerprint.update(path.read_bytes())
     config = {"settings": settings, "resolved_revisions": revisions, "source_sha256": fingerprint.hexdigest(),
               "upstream_commit": COMMIT, "inputs": rows, "torch": torch.__version__,
-              "python": platform.python_version(), "protocol": "audio-drift-v1",
+              "python": platform.python_version(), "protocol": "audio-drift-v2",
               "packages": {name: importlib.metadata.version(name) for name in
                            ("transformers", "peft", "numpy", "datasets", "huggingface-hub", "torchaudio")}}
     args.out.mkdir(parents=True, exist_ok=True)
@@ -228,7 +289,7 @@ def main():
         try:
             with AttentionProbe(llm, prepared.audio_positions, recorder, layers):
                 final, states, events = decode(llm, prepared, args.length, args.block_length,
-                                               args.steps, recorder, layers)
+                                               args.steps, recorder, layers, progress_every=args.progress_every)
         finally:
             recorder.close()
         torch.cuda.synchronize()
@@ -244,8 +305,10 @@ def main():
             if not verified:
                 raise RuntimeError("Instrumented output differs from the official decoder; stopping")
             del official
-        branches = interventions(llm, prepared, final, states, args, tokenizer, row)
         text = display_text(tokenizer, final, prepared.prompt.shape[1])
+        baseline_score = score(text, row.get("target"), row.get("metric", "none"))
+        print(f"  baseline: official_match={verified}; score={baseline_score}; text={text!r}", flush=True)
+        branches = interventions(llm, prepared, final, states, args, tokenizer, row)
         write_json(work / "steps.json", events)
         result = {"id": row["id"], "task": row["task"], "prompt": row["prompt"],
                   "target": row.get("target"), "audio_seconds": duration,
@@ -253,7 +316,7 @@ def main():
                   "audio_acoustic_tokens": prepared.acoustic_count,
                   "prompt_tokens": prepared.prompt.shape[1], "labels": prepared.labels(args.length),
                   "text": text, "answer_ids": final[0, prepared.prompt.shape[1]:].tolist(),
-                  "score": score(text, row.get("target"), row.get("metric", "none")),
+                  "score": baseline_score,
                   "verified_against_upstream": verified, "forwards": len(events),
                   "instrumented_seconds": elapsed, "peak_allocated_bytes": peak_memory,
                   "interventions": branches}

@@ -6,6 +6,109 @@ The default checkpoint is **DIFFA-2**, with its original semantic/acoustic
 connectors, Whisper-large-v3, and LLaDA-8B-Instruct. This experiment does not
 change the existing neighborhood, sleep, or translation experiments.
 
+## Acoustic versus semantic timing study (v2)
+
+On the existing Vast machine after the original smoke run:
+
+```bash
+cd /workspace/llada-audio-drift
+git pull --ff-only
+nohup env RUN_NAME=audio_groups128_v2 SKIP_INSTALL=1 GROUP_STUDY=1 \
+  LENGTH=128 BLOCK_LENGTH=32 STEPS=128 VERIFY_SAMPLES=2 REFERENCE_DEVICE=cuda \
+  bash scripts/vast_audio_drift.sh smoke > audio_groups128_v2.log 2>&1 &
+tail -f audio_groups128_v2.log
+```
+
+This reuses the same two clips and installed packages, increases ASR output
+capacity, and checks **both** uncached baseline outputs against the official
+decoder. A fresh name is required: v1 results remain unchanged.
+
+**All drift measurements come from the ordinary uncached baseline.** It runs
+once per sample. Every intervention then starts from an identical saved baseline
+token state, and runs sequentially on the same GPU. Baseline anchor KVs are
+reconstructed with one forward; full representations are not archived.
+
+`GROUP_STUDY=1` runs this matrix at four baseline anchor fractions:
+
+| Condition | Acoustic KVs | Semantic KVs |
+|---|---|---|
+| Baseline | Recompute | Recompute |
+| Acoustic-only freeze/reuse | Reuse | Recompute |
+| Semantic-only freeze/reuse | Recompute | Reuse |
+| Both freeze/reuse | Reuse | Reuse |
+| Mixed A8:S2 | Refresh every 8 forwards | Refresh every 2 forwards |
+| Mixed A2:S8 | Refresh every 2 forwards | Refresh every 8 forwards |
+| Remove | No attention access | No attention access |
+| Text-only restart | Embeddings absent | Embeddings absent |
+
+For each of the three freeze groups, test permanent freezing and refresh
+intervals **1, 2, 4, 8**. Interval 1 is an identity control that must generate
+exactly the baseline's final IDs; the run stops if it fails. With an anchor at
+step `a`, interval 4 reuses at `a+1`, `a+2`, `a+3` and refreshes at `a+4`.
+Intervals continue across block boundaries. Refreshes use the intervention's
+**own current representations**, never a future baseline representation.
+Mixed schedules use independent intervals for the two disjoint token groups.
+
+There are **76 sequential continuations per clip**, totaling 6,023 continuation
+forwards at the 128-forward setting, plus baseline, verification, and anchor
+replay. This is substantially more work than the first smoke run. It prints
+baseline progress every 8 forwards and prints each condition before/after it
+runs. There are still only two examples: validate transcription quality before
+expanding the sample count or drawing conclusions.
+
+Controls: `REFRESH_INTERVALS="1 2 4 8"`, `MIXED_REFRESH="8:2 2:8"`,
+`BRANCH_FRACTIONS="0 .25 .5 .75"`, `PROGRESS_EVERY=8`. The Python CLI also
+supports a subset, e.g. `--interventions freeze --freeze-groups acoustic semantic
+--refresh-intervals 2 4 8 --mixed-refresh 8:2 2:8`.
+
+Each branch records its group schedule, every refresh's step/cache age, commit
+events, first-forward KL/top-1 changes on all masks **and on unresolved lexical
+baseline-answer positions**, final text/score, and exact-token agreement. The
+lexical subset excludes special tokens and positions after the baseline EOS;
+it is posthoc diagnostic information, never input to the decoding policy.
+`summary.json` separates branches with meaningful baseline content still
+unresolved and includes matched baseline WER/deltas.
+
+Plots separate acoustic, semantic, both, and mixed schedules, and show both
+all branches and branches with content remaining. Audio/prompt heatmaps share
+color scales for the same task, reference, representation, and metric.
+
+The launcher also computes `analysis/stability_relative_l2_median.json` and
+`analysis/stability_relative_l2_p90.json`. These sweep 1%, 2%, and 5% drift
+thresholds per layer/group/reference and require four consecutive forwards.
+They distinguish the **first sustained dip** from a window that stays below
+threshold through the end. Thresholds are exploratory, not quality guarantees
+or an implemented adaptive cache policy. A stable late tail may just be EOS
+padding after the meaningful answer has already finished.
+
+You can compute other posthoc thresholds from the saved baseline metrics:
+
+```bash
+python -m experiments.audio_drift.stability --run runs/audio_groups128_v2 \
+  --metric cosine_distance --statistic p90 --thresholds .0001 .001 .01 --window 4
+```
+
+After checking the two longer baselines, prepare a larger, speaker-diverse
+sample from the actual LibriSpeech test-clean split (not the dummy dataset):
+
+```bash
+source .venv-audio/bin/activate
+python -m experiments.audio_drift.prepare \
+  --dataset openslr/librispeech_asr --config clean --split test \
+  --streaming --shuffle-seed 1729 --shuffle-buffer 1000 --max-per-speaker 1 \
+  --samples 20 --out data/audio_drift/test_clean20.jsonl
+```
+
+The helper records the immutable dataset revision, speaker IDs, filters, and
+shuffle settings. It selects clips at most 30 seconds long and fails if too few
+qualify. This is a reproducible filtered pilot, not a full official benchmark.
+Then use `MANIFEST=$PWD/data/audio_drift/test_clean20.jsonl SAMPLES=20` with
+`GROUP_STUDY=1` and the `pilot` mode. Plan for the printed forward budget.
+
+V2 does not change model weights, prompt format, unmasking, or WER normalization.
+It remains a sensitivity study: current audio projections are still computed
+before substitution; these timings do **not** establish an execution speedup.
+
 ## First run on Vast
 
 From this repository, using Python 3.10–3.12 and a BF16 CUDA GPU:
@@ -155,7 +258,8 @@ all still-masked answer slots, including future blocks. Final continuations
 use the same remaining schedule and are scored against the same target.
 
 `baseline_content_masks_remaining` counts unresolved positions before the
-baseline's first EOS. This is a posthoc diagnostic, never a decoding signal.
+baseline's first EOS (excluding special tokens in v2). This is a posthoc
+diagnostic, never a decoding signal.
 If `baseline_answer_already_revealed` is true, unchanged final accuracy can be
 trivial: the meaningful answer was already committed before the intervention.
 Distinguish those branches when interpreting continued audio dependence.
@@ -192,8 +296,8 @@ Heatmaps show the mean across samples of token medians, first averaging steps
 within each progress bin. They are **not pooled medians across samples**.
 Empty bins stay missing. Age-zero comparisons are omitted from plots.
 Intervention WER curves show mean per-sample WER; `summary.json` reports corpus
-WER. To make an explicit audio/text comparison, use the same color scale when
-comparing separate heatmap panels (their default color scales are independent).
+WER. V2 shares color scales across acoustic/semantic/prompt panels for matching
+task, reference, representation, and metric; decoded-answer panels use their own scale.
 
 Run analysis again without any GPU/model downloads:
 

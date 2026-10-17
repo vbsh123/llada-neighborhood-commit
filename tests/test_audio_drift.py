@@ -9,6 +9,8 @@ import unittest
 from unittest.mock import patch
 
 from experiments.audio_drift.inputs import read_manifest, score
+from experiments.audio_drift.protocol import anchors_for, conditions, work_estimate
+from experiments.audio_drift.stability import timing
 
 HAS_TORCH = importlib.util.find_spec("torch") is not None
 if HAS_TORCH:
@@ -20,6 +22,36 @@ if HAS_TORCH:
 
 
 class InputTests(unittest.TestCase):
+    def test_full_condition_matrix_and_work_budget(self):
+        specs = conditions(["freeze", "remove", "text_only"], ["acoustic", "semantic", "both"],
+                           [1, 2, 4, 8], ["8:2", "2:8"])
+        self.assertEqual(len(specs), 19)
+        self.assertEqual(len({s["condition"] for s in specs}), 19)
+        mixed = next(s for s in specs if s["condition"] == "freeze_mixed_a8_s2")
+        self.assertEqual(mixed["schedule"], [{"group": "acoustic", "refresh_every": 8},
+                                             {"group": "semantic", "refresh_every": 2}])
+        estimate = work_estimate(128, [0, .25, .5, .75], specs)
+        self.assertEqual(estimate["branches"], 76)
+        self.assertEqual(estimate["continuation_forwards"], 6023)
+        self.assertEqual(anchors_for(4, [0, 0, .999]), [0])
+        for invalid in [["8"], ["-1:2"]]:
+            with self.assertRaises(ValueError):
+                conditions(["freeze"], mixed_refresh=invalid)
+        with self.assertRaises(ValueError):
+            conditions(["freeze"], refresh_intervals=[0])
+
+    def test_stability_distinguishes_temporary_dip_from_stable_tail(self):
+        values = [(0, .1), (1, .01), (2, .01), (3, .01), (4, .1),
+                  (5, .01), (6, .01), (7, .01)]
+        result = timing(values, .02, window=3)
+        self.assertEqual(result["first_sustained_step"], 1)
+        self.assertEqual(result["stable_through_end_step"], 5)
+        self.assertEqual(result["last_violation_step"], 4)
+        self.assertIsNone(timing([(0, .01), (2, .01), (3, .01)], .02, 3)["first_sustained_step"])
+        self.assertIsNone(timing([(0, .1), (1, .01)], .02, 3)["stable_through_end_step"])
+        with self.assertRaises(ValueError):
+            timing([(0, float("nan"))], .02)
+
     def test_reference_scoring(self):
         self.assertEqual(score("Hello, world!", "HELLO WORLD", "wer")["edits"], 0)
         self.assertEqual(score("a x c d", "a b c", "wer")["edits"], 2)
@@ -44,6 +76,74 @@ class InputTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TORCH, "Optional CPU torch dependency is absent")
 class MetricTests(unittest.TestCase):
+    def test_streaming_preparation_records_selection_and_speaker_cap(self):
+        from experiments.audio_drift.prepare import main
+        from types import SimpleNamespace
+        import soundfile
+        rows = [{"id": name, "speaker_id": speaker, "text": "HELLO",
+                 "audio": {"bytes": name.encode()}}
+                for name, speaker in [("long", 1), ("first", 1), ("duplicate_speaker", 1), ("second", 2)]]
+        calls = {}
+        class Dataset:
+            def cast_column(self, *args):
+                return self
+            def shuffle(self, **kwargs):
+                calls["shuffle"] = kwargs
+                return self
+            def __iter__(self):
+                return iter(rows)
+        def load_dataset(*args, **kwargs):
+            calls["load"] = kwargs
+            return Dataset()
+        datasets = SimpleNamespace(Audio=lambda **kwargs: object(), load_dataset=load_dataset)
+        hub = SimpleNamespace(HfApi=lambda: SimpleNamespace(dataset_info=lambda *a, **k: SimpleNamespace(sha="immutable")))
+        def read_audio(source, **kwargs):
+            seconds = 31 if source.read() == b"long" else 1
+            return np.zeros(16000 * seconds, dtype=np.float32), 16000
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "test.jsonl"
+            argv = ["prepare", "--out", str(manifest), "--samples", "2", "--streaming",
+                    "--shuffle-seed", "1729", "--max-per-speaker", "1"]
+            with patch.object(sys, "argv", argv), patch.dict(sys.modules, {"datasets": datasets, "huggingface_hub": hub}), \
+                    patch.object(soundfile, "read", side_effect=read_audio):
+                main()
+            result = read_manifest(manifest)
+            self.assertEqual([r["id"] for r in result], ["first", "second"])
+            self.assertEqual(calls["shuffle"], {"seed": 1729, "buffer_size": 1000})
+            self.assertTrue(calls["load"]["streaming"])
+            provenance = json.loads(manifest.with_suffix(".provenance.json").read_text())
+            self.assertEqual(provenance["revision"], "immutable")
+            self.assertEqual(provenance["skipped_duration"], 1)
+            self.assertEqual(provenance["speaker_counts"], {"1": 1, "2": 1})
+
+    def test_summary_keeps_conditions_separate_and_excludes_finished_answers(self):
+        from experiments.audio_drift.run import aggregate
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, (words, base_edits, changed_edits, finished) in enumerate(
+                    [(17, 1, 3, False), (11, 9, 9, True)]):
+                sample = root / "samples" / str(index)
+                sample.mkdir(parents=True)
+                baseline = {"metric": "wer", "edits": base_edits, "reference_words": words,
+                            "wer": base_edits / words}
+                branches = []
+                for condition in ["freeze_acoustic_r2", "freeze_semantic_r2"]:
+                    changed = {"metric": "wer", "edits": changed_edits, "reference_words": words,
+                               "wer": changed_edits / words}
+                    branches.append({"mode": "freeze", "condition": condition, "score": changed,
+                                     "anchor_step_fraction": .5, "same_final_tokens": False,
+                                     "baseline_answer_already_revealed": finished})
+                (sample / "result.json").write_text(json.dumps({"task": "asr", "score": baseline,
+                                                               "interventions": branches}))
+            aggregate(root)
+            summary = json.loads((root / "summary.json").read_text())["tasks"]["asr"]["conditions"]
+            self.assertEqual(len(summary), 3)
+            condition = summary["freeze_acoustic_r2@0.500"]
+            self.assertAlmostEqual(condition["corpus_wer"], 12 / 28)
+            self.assertEqual(condition["already_revealed_samples"], 1)
+            self.assertEqual(condition["with_content_remaining"]["samples"], 1)
+            self.assertAlmostEqual(condition["with_content_remaining"]["corpus_wer_delta"], 2 / 17)
+
     def test_magnitude_and_direction_are_distinct(self):
         current = torch.tensor([[2., 0.], [0., 1.], [0., 0.]])
         previous = torch.tensor([[1., 0.], [1., 0.], [0., 0.]])
@@ -178,6 +278,84 @@ class UpstreamTests(unittest.TestCase):
             for position, token in enumerate(states[start][0, 3:].tolist()):
                 if token != 31:
                     self.assertEqual(result["answer_ids"][position], token)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_group_only_freeze_and_refresh_do_not_mutate_anchor_bank(self):
+        from experiments.audio_drift.decode import forward_logits
+        anchor = torch.tensor([[1, 2, 3, 31, 31]])
+        changed = torch.tensor([[1, 2, 3, 4, 31]])
+        positions = self.prepared.group_positions("acoustic")
+        self.assertEqual(positions, [1])
+        self.assertEqual(self.prepared.group_positions("semantic"), [2])
+        with AttentionProbe(self.llm, positions, mode="capture") as capture:
+            forward_logits(self.llm, self.prepared, anchor)
+        original = {layer: tuple(t.clone() for t in pair) for layer, pair in capture.frozen.items()}
+        expected = forward_logits(self.llm, self.prepared, changed)
+        with AttentionProbe(self.llm, positions, mode="freeze", frozen=capture.frozen,
+                            refresh_every=2, anchor_step=7) as reuse:
+            forward_logits(self.llm, self.prepared, changed)  # step 8: reuse
+            refreshed = forward_logits(self.llm, self.prepared, changed)  # step 9: refresh
+        torch.testing.assert_close(expected, refreshed, rtol=0, atol=0)
+        self.assertEqual(reuse.cache_events, [{"step": 8, "refreshed": False, "cache_age": 1},
+                                            {"step": 9, "refreshed": True, "cache_age": 0}])
+        for layer, pair in original.items():
+            for before, after in zip(pair, capture.frozen[layer]):
+                torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_only_selected_group_kvs_are_replaced(self):
+        from experiments.audio_drift.decode import forward_logits
+        from types import MethodType
+        block = self.llm.model.transformer.blocks[1]
+        original = block._scaled_dot_product_attention
+        received = []
+        def spy(_block, q, k, v, **kwargs):
+            received.append((k.clone(), v.clone()))
+            return original(q, k, v, **kwargs)
+        block._scaled_dot_product_attention = MethodType(spy, block)
+        anchor = torch.tensor([[1, 2, 3, 31, 31]])
+        changed = torch.tensor([[1, 2, 3, 4, 31]])
+        try:
+            with AttentionProbe(self.llm, [1], mode="capture") as capture:
+                forward_logits(self.llm, self.prepared, anchor)
+            anchor_kv = received[-1]
+            forward_logits(self.llm, self.prepared, changed)
+            fresh_kv = received[-1]
+            with AttentionProbe(self.llm, [1], mode="freeze", frozen=capture.frozen):
+                forward_logits(self.llm, self.prepared, changed)
+            used_kv = received[-1]
+            for old, fresh, used in zip(anchor_kv, fresh_kv, used_kv):
+                torch.testing.assert_close(used[:, :, 1], old[:, :, 1], rtol=0, atol=0)
+                torch.testing.assert_close(used[:, :, 2], fresh[:, :, 2], rtol=0, atol=0)
+            self.assertFalse(torch.equal(anchor_kv[0][:, :, 1], fresh_kv[0][:, :, 1]))
+        finally:
+            block._scaled_dot_product_attention = original
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_group_matrix_including_mixed_schedules(self):
+        from experiments.audio_drift.run import interventions
+        from types import SimpleNamespace
+        baseline, states, _ = decode(self.llm, self.prepared, 4, 2, 4)
+        args = SimpleNamespace(interventions=["freeze"], branch_fractions=[0.], length=4,
+                               block_length=2, steps=4, freeze_groups=["acoustic", "semantic", "both"],
+                               refresh_intervals=[1, 2], mixed_refresh=["2:1", "1:2"])
+        tokenizer = SimpleNamespace(eos_token_id=30, all_special_ids=[30, 31],
+                                    decode=lambda ids, **kwargs: " ".join(map(str, ids)))
+        with patch("torch.cuda.synchronize"):
+            results = interventions(self.llm, self.prepared, baseline, states,
+                                     args, tokenizer, {"metric": "none"})
+        self.assertEqual(len(results), 11)
+        for result in results:
+            if result["condition"].endswith("_r1"):
+                self.assertTrue(result["same_final_tokens"])
+                self.assertEqual(result["immediate"]["kl_mean"], 0)
+            for group, events in result["cache_events"].items():
+                interval = next(s["refresh_every"] for s in result["schedule"] if s["group"] == group)
+                self.assertEqual(len(events), 3)
+                self.assertEqual([e["step"] for e in events], [1, 2, 3])
+                self.assertEqual([e["refreshed"] for e in events],
+                                 [bool(interval and s % interval == 0) for s in [1, 2, 3]])
+                self.assertLessEqual(result["immediate_content"]["count"], result["immediate"]["count"])
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_real_connectors_and_prompt_alignment(self):

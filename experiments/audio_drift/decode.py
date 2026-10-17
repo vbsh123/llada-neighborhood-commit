@@ -26,6 +26,15 @@ class Prepared:
     def audio_positions(self):
         return list(range(self.insertion, self.insertion + self.audio_count))
 
+    def group_positions(self, group):
+        if group == "acoustic":
+            return self.audio_positions[:self.acoustic_count]
+        if group == "semantic":
+            return self.audio_positions[self.acoustic_count:]
+        if group == "both":
+            return self.audio_positions
+        raise ValueError(f"Unknown audio group: {group}")
+
     def labels(self, length):
         groups = ["prompt"] * self.insertion
         groups += ["audio_acoustic"] * self.acoustic_count
@@ -77,7 +86,8 @@ def commit(x, logits, prepared, block, block_length, count):
 
 @torch.no_grad()
 def decode(llm, prepared, length, block_length, steps, recorder=None, layers=None,
-           start_x=None, start_step=0, first_logits=None, save_states=True):
+           start_x=None, start_step=0, first_logits=None, save_states=True,
+           progress_every=0):
     plan = schedule(length, block_length, steps)
     if start_x is None:
         x = prepared.prompt.new_full((1, prepared.prompt.shape[1] + length), prepared.mask_id)
@@ -109,6 +119,9 @@ def decode(llm, prepared, length, block_length, steps, recorder=None, layers=Non
         last_changes, positions = commit(x, logits, prepared, block, block_length, count)
         del logits
         events.append({**meta, "changed_tokens": last_changes, "committed_positions": positions})
+        if progress_every and (step == start_step or (step + 1) % progress_every == 0 or step + 1 == len(plan)):
+            print(f"  baseline forward {step + 1}/{len(plan)}; block {block + 1}; "
+                  f"{remaining - last_changes} answer masks remain", flush=True)
     if (x[:, prepared.prompt.shape[1]:] == prepared.mask_id).any():
         raise ValueError("Decoder finished with unresolved masks (upstream permits predicting MASK)")
     return x, states, events
