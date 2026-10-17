@@ -17,6 +17,7 @@ not the upstream generator. It does not force neighboring tokens to commit.
   manifests and resume checks. Optional factory injection preserves the existing
   entropy-sleep runner's defaults.
 - `../../tests/test_multi_window.py`: CPU scheduling and toy-model integration.
+- `profile.py` and `EXECUTION_AUDIT.md`: same-input old/new execution profiling on saved traces; no new answers.
 - `../../scripts/vast_multi_window.sh`: Vast setup, tests, generation, export.
 
 ## Corrected region definition (v2)

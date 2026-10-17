@@ -28,6 +28,9 @@ class SelectiveForward:
     def attention_methods(self, active, sequence_length):
         import torch
         originals = []
+        # Pinned LLaDA layers share rotary buffers. Gather the same positions
+        # once per buffer/dtype per forward, rather than once per layer.
+        rotary_tables = {}
         try:
             for index, block in enumerate(self.blocks):
                 originals.append((block, block.attention))
@@ -45,13 +48,27 @@ class SelectiveForward:
                     q = q.view(batch,count,this.config.n_heads,head_dim).transpose(1,2)
                     k = k.view(batch,count,this.config.effective_n_kv_heads,head_dim).transpose(1,2)
                     v = v.view(batch,count,this.config.effective_n_kv_heads,head_dim).transpose(1,2)
-                    q_work, k_work = (q.float(), k.float()) if this.config.rope_full_precision else (q,k)
-                    with torch.autocast(q.device.type, enabled=False):
-                        sin, cos = this.rotary_emb.get_rotary_embedding(sequence_length, q.device)
-                        sin = sin.type_as(q_work).index_select(2,active)
-                        cos = cos.type_as(q_work).index_select(2,active)
-                        q_rot = this.rotary_emb.apply_rotary_pos_emb(sin,cos,q_work).type_as(q)
-                        k_rot = this.rotary_emb.apply_rotary_pos_emb(sin,cos,k_work).type_as(k)
+                    if count == sequence_length:
+                        # Native full-sequence RoPE: identity position gathers
+                        # are unnecessary on every global refresh.
+                        q_rot, k_rot = this.rotary_emb(q,k)
+                    else:
+                        q_work, k_work = (q.float(), k.float()) if this.config.rope_full_precision else (q,k)
+                        with torch.autocast(q.device.type, enabled=False):
+                            source_sin, source_cos = this.rotary_emb.get_rotary_embedding(sequence_length, q.device)
+                            key = (source_sin.data_ptr(), source_cos.data_ptr(),
+                                   tuple(source_sin.shape), tuple(source_sin.stride()),
+                                   tuple(source_cos.shape), tuple(source_cos.stride()),
+                                   q.device, q_work.dtype)
+                            if key not in rotary_tables:
+                                sin = source_sin.type_as(q_work).index_select(2,active)
+                                cos = source_cos.type_as(q_work).index_select(2,active)
+                                # Retain source buffers too: prevent allocator
+                                # pointer reuse from aliasing distinct tables.
+                                rotary_tables[key] = (sin,cos,source_sin,source_cos)
+                            sin,cos,_,_ = rotary_tables[key]
+                            q_rot = this.rotary_emb.apply_rotary_pos_emb(sin,cos,q_work).type_as(q)
+                            k_rot = this.rotary_emb.apply_rotary_pos_emb(sin,cos,k_work).type_as(k)
                     if count == sequence_length:
                         # Already in original sorted order: no scatter or clone.
                         self.kv[_index] = (k_rot,v)
@@ -89,14 +106,21 @@ class SelectiveForward:
         active_list = [p for p in range(n) if p not in sleeping]
         if not prediction_positions or len(set(prediction_positions)) != len(prediction_positions):
             raise ValueError('Predictions must be nonempty and unique')
-        if any(p not in active_list for p in prediction_positions):
+        if any(p < 0 or p >= n or p in sleeping for p in prediction_positions):
             raise ValueError('Cannot predict a sleeper or an out-of-range position')
         if any(cache is None for cache in self.kv) and sleeping:
             raise ValueError('First forward must be fully awake')
-        active = torch.tensor(active_list, device=input_ids.device, dtype=torch.long)
-        prediction = torch.tensor(prediction_positions, device=input_ids.device, dtype=torch.long)
-        local = torch.searchsorted(active,prediction)
-        hidden = self.transformer.wte(input_ids.index_select(1,active))
+        if sleeping:
+            active = torch.tensor(active_list, device=input_ids.device, dtype=torch.long)
+            lookup = {p:i for i,p in enumerate(active_list)}
+            local_list = [lookup[p] for p in prediction_positions]
+            selected_ids = input_ids.index_select(1,active)
+        else:
+            active = None
+            local_list = prediction_positions
+            selected_ids = input_ids
+        local = torch.tensor(local_list, device=input_ids.device, dtype=torch.long)
+        hidden = self.transformer.wte(selected_ids)
         if self.config.input_emb_norm:
             hidden = hidden*(self.config.d_model**.5)
         hidden = self.transformer.emb_drop(hidden)
