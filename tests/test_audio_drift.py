@@ -22,6 +22,20 @@ if HAS_TORCH:
 
 
 class InputTests(unittest.TestCase):
+    def test_long_pilot_selects_only_named_conditions(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.run import intervention_specs
+        args = SimpleNamespace(interventions=["freeze"], freeze_groups=["acoustic", "semantic", "both"],
+                               refresh_intervals=[1, 4, 8], mixed_refresh=["8:2", "2:8"],
+                               condition_names=["freeze_acoustic", "freeze_semantic", "freeze", "freeze_both_r1",
+                                                "freeze_both_r4", "freeze_both_r8", "freeze_mixed_a8_s2", "freeze_mixed_a2_s8"])
+        specs = intervention_specs(args)
+        self.assertEqual({s["condition"] for s in specs}, set(args.condition_names))
+        self.assertEqual(work_estimate(128, [0], specs)["branches"], 8)
+        args.condition_names.append("typo")
+        with self.assertRaisesRegex(ValueError, "typo"):
+            intervention_specs(args)
+
     def test_full_condition_matrix_and_work_budget(self):
         specs = conditions(["freeze", "remove", "text_only"], ["acoustic", "semantic", "both"],
                            [1, 2, 4, 8], ["8:2", "2:8"])
@@ -76,6 +90,39 @@ class InputTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TORCH, "Optional CPU torch dependency is absent")
 class MetricTests(unittest.TestCase):
+    def test_duration_quotas_filter_boundaries_and_interleave(self):
+        from experiments.audio_drift.prepare import main
+        from types import SimpleNamespace
+        import soundfile
+        # A clip at the shared 20s boundary belongs only to the longer bin.
+        examples = [(9, 0), (20, 1), (30, 2), (25, 3), (10, 4), (19, 5), (15, 6)]
+        rows = [{"id": str(i), "speaker_id": i, "text": "HELLO", "audio": {"bytes": str(s).encode()}}
+                for s, i in examples]
+        class Dataset:
+            def cast_column(self, *args): return self
+            def __iter__(self): return iter(rows)
+            def __len__(self): return len(rows)
+        datasets = SimpleNamespace(Audio=lambda **kwargs: object(), load_dataset=lambda *a, **k: Dataset())
+        hub = SimpleNamespace(HfApi=lambda: SimpleNamespace(dataset_info=lambda *a, **k: SimpleNamespace(sha="fixed")))
+        def read_audio(source, **kwargs):
+            return np.zeros(int(source.read()) * 10, dtype=np.float32), 10
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "balanced.jsonl"
+            argv = ["prepare", "--out", str(manifest), "--samples", "4", "--min-seconds", "10",
+                    "--duration-bins", "10:20:2", "20:30:2"]
+            with patch.object(sys, "argv", argv), patch.dict(sys.modules, {"datasets": datasets, "huggingface_hub": hub}), \
+                    patch.object(soundfile, "read", side_effect=read_audio):
+                main()
+            selected = read_manifest(manifest)
+            self.assertEqual([r["audio_seconds"] for r in selected], [10, 20, 19, 30])
+            self.assertEqual([r["duration_bin"] for r in selected], ["10-20", "20-30"] * 2)
+            provenance = json.loads(manifest.with_suffix(".provenance.json").read_text())
+            self.assertEqual([b["selected"] for b in provenance["duration_bins"]], [2, 2])
+            for invalid in [["10:25:2", "20:30:2"], ["10:20:3"]]:
+                with patch.object(sys, "argv", ["prepare", "--out", str(manifest), "--samples", "4",
+                                                "--duration-bins", *invalid]):
+                    with self.assertRaises(ValueError): main()
+
     def test_streaming_preparation_records_selection_and_speaker_cap(self):
         from experiments.audio_drift.prepare import main
         from types import SimpleNamespace
@@ -219,6 +266,55 @@ class UpstreamTests(unittest.TestCase):
         self.llm.model.transformer.ff_out = output
         self.prepared = Prepared(torch.tensor([[1, 2, 3]]),
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_profiler_scopes_preserve_outputs_and_restore_on_exception(self):
+        from experiments.audio_drift.profile import decoder_scopes
+        from experiments.audio_drift.decode import forward_logits
+        x = torch.tensor([[1, 2, 3, 31, 31, 31, 31]])
+        baseline = forward_logits(self.llm, self.prepared, x)
+        block = self.llm.model.transformer.blocks[0]
+        original_keys = set(block.q_proj.__dict__)
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            with decoder_scopes(self.llm):
+                actual = forward_logits(self.llm, self.prepared, x)
+        torch.testing.assert_close(baseline, actual, rtol=0, atol=0)
+        names = {e.key for e in prof.key_averages()}
+        self.assertTrue({"decoder.qkv_projections", "decoder.feed_forward_projections",
+                         "decoder.attention_kernel", "decoder.vocabulary_projection"} <= names)
+        # Verify the timing fields exist on the installed torch API too.
+        self.assertTrue(all(hasattr(e, "device_time_total") and hasattr(e, "self_device_time_total")
+                            for e in prof.key_averages()))
+        with self.assertRaisesRegex(RuntimeError, "scope failure"):
+            with decoder_scopes(self.llm): raise RuntimeError("scope failure")
+        self.assertEqual(set(block.q_proj.__dict__), original_keys)
+        torch.testing.assert_close(baseline, forward_logits(self.llm, self.prepared, x), rtol=0, atol=0)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_baseline_profile_exports_trace_and_checks_clean_decode(self):
+        from experiments.audio_drift.profile import profile_baseline
+        from types import SimpleNamespace
+        baseline, states, _ = decode(self.llm, self.prepared, 4, 2, 4)
+        args = SimpleNamespace(length=4, block_length=2, steps=4)
+        real_profile = torch.profiler.profile
+        def cpu_profile(**kwargs):
+            kwargs["activities"] = [torch.profiler.ProfilerActivity.CPU]
+            return real_profile(**kwargs)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("experiments.audio_drift.model.prepare", return_value=self.prepared), \
+                patch.object(torch.cuda, "synchronize"), \
+                patch.object(torch.cuda, "reset_peak_memory_stats"), \
+                patch.object(torch.cuda, "max_memory_allocated", return_value=0), \
+                patch.object(torch.profiler, "profile", side_effect=cpu_profile):
+            root = Path(directory)
+            profile_baseline(SimpleNamespace(llm_model=self.llm), SimpleNamespace(eos_token_id=30),
+                             None, None, "Transcribe", self.prepared, baseline, states, args, root)
+            data = json.loads((root / "baseline_profile.json").read_text())
+            self.assertEqual(len(data["decoding_seconds"]), 2)
+            self.assertEqual(data["sampled_forward_steps"], [0, 1, 3])
+            self.assertTrue(data["scopes"])
+            self.assertTrue((root / "baseline_trace.json").is_file())
+            self.assertTrue((root / "baseline_operators.txt").is_file())
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_instrumented_decoder_matches_official_and_observes_all_layers(self):

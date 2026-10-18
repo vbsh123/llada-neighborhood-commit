@@ -316,6 +316,109 @@ example for long runs over all layers. Full activation snapshots are
 explicitly opt-in, using `--snapshot-steps 0 16 --snapshot-layers 0 15 31` in
 the Python CLI. They can be large. Layer selection: `LAYERS=0,7,15,23,31`.
 
+## Duration-stratified LibriSpeech pilot and baseline profiling
+
+Use `long-pilot` for the next study rather than repeating the 76-branch smoke
+matrix. It prepares **20 distinct clips from LibriSpeech clean/test**, with
+10 clips in `[10, 20)` seconds and 10 in `[20, 30]` seconds. Seeded streaming
+selection limits each speaker to at most two clips across both bins, hence at
+least ten speakers. Bins are interleaved in the manifest, so `SAMPLES=10` also
+gives a balanced first subset. Selection is duration-based, not quality-based;
+the immutable dataset revision, durations, speaker IDs and quotas are saved.
+It fails explicitly if the source cannot fill the quotas.
+
+```bash
+cd /workspace/llada-audio-drift
+git pull --ff-only
+nohup env RUN_NAME=audio_libri20_v3 SKIP_INSTALL=1 \
+  REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
+  bash scripts/vast_audio_drift.sh long-pilot \
+  > audio_libri20_v3.log 2>&1 &
+tail -f audio_libri20_v3.log
+```
+
+Use a fresh run name when changing sample count or code. To run only the first
+ten examples, add `SAMPLES=10` and use `RUN_NAME=audio_libri10_v3`. No reinstall
+or model weight download is needed if the previous audio environment/cache
+still exists. Creating the new manifest does download real test-set audio.
+
+Defaults are a 256-slot answer, 32-slot blocks, and 128 forwards (two commits
+per forward). The larger answer budget accommodates longer transcriptions;
+the baseline is still checked against the official decoder with identical
+settings. Fixed-budget decoding does not stop at EOS. Results record first
+EOS position, missing EOS, and the step at which baseline content was revealed
+so padding work and possible answer truncation remain visible.
+
+Eight continuations per clip all start immediately after the first forward:
+
+| Condition | Acoustic KV interval | Semantic KV interval |
+|---|---:|---:|
+| `freeze_acoustic` | Never refresh | Every forward |
+| `freeze_semantic` | Every forward | Never refresh |
+| `freeze` | Never refresh | Never refresh |
+| `freeze_both_r1` | 1 | 1 |
+| `freeze_both_r4` | 4 | 4 |
+| `freeze_both_r8` | 8 | 8 |
+| `freeze_mixed_a8_s2` | 8 | 2 |
+| `freeze_mixed_a2_s8` | 2 | 8 |
+
+This is 160 branches over 20 clips, rather than 1,520. No later anchors or
+audio-removal branches are included. `--condition-names` selects explicit
+names from the generated matrix and rejects typos. Baseline drift is collected
+at layers `0,7,15,23,31` by default; `LAYERS=all` opts into full-depth metrics.
+The intervention still acts on **every** transformer layer. Scalar group
+summaries are saved; no hidden-state vectors or per-position metrics are saved
+by default.
+
+The first two examples (one per duration bin) also get a **separate baseline
+profile** (`PROFILE_SAMPLES=0` disables it):
+
+* `samples/00000/baseline_profile.json`: two warmed, synchronized wall-time
+  repeats each of audio preparation and complete decoding. Decoding has no
+  drift hooks, no profiler scopes and no CPU activation copies; it still uses
+  the ordinary decoder's bookkeeping. Every repeated output must match baseline.
+* `baseline_operators.txt`: major CPU/CUDA operators from sampled forwards.
+* `baseline_trace.json`: Chrome/Perfetto trace for forward 0, the middle of the
+  first block, and the final forward. Scopes label QKV projections, attention,
+  feed-forward projections, attention output projection, and vocabulary output.
+
+Audio preparation includes CPU feature extraction, transfers, speech encoder,
+adapters and prompt setup; it excludes model loading and disk audio loading.
+It happens once per request, not every denoising forward. Timing repeats use
+already-resident audio. Traces are separate from clean timing repeats and have
+profiling overhead. Projection and attention times cover **all sequence tokens**;
+they do not directly identify audio-only runtime. No optimized cache execution
+or speedup is claimed. Dense token fractions are not latency fractions, and
+text queries must still attend to cached audio KVs.
+
+`baseline.json` and `steps.json` are saved before profiles/branches; each
+completed branch is flushed to `interventions.jsonl` immediately. During an
+unfinished sample these live in `samples/.00000.incomplete/`. Resume still
+restarts an incomplete sample; partial files are for inspection, not branch
+resume checkpoints.
+
+Package the completed run, including hidden partial directories if applicable:
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import zipfile
+root = Path('/workspace/llada-audio-drift')
+run = root / 'runs/audio_libri20_v3'
+assert (run / 'summary.json').is_file(), 'No completed-sample summary found'
+out = Path('/workspace/audio_libri20_v3.zip')
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+    for p in run.rglob('*'):
+        if p.is_file():
+            z.write(p, p.relative_to(root))
+    for p in (root / 'audio_libri20_v3.log',
+              root / 'data/audio_drift/librispeech_duration20_v3.provenance.json'):
+        if p.is_file():
+            z.write(p, p.relative_to(root))
+print(out, out.stat().st_size)
+PY
+```
+
 ## Validation
 
 Without optional GPU packages, pure manifest/scoring tests run and tensor

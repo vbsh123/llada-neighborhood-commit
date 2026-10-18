@@ -38,12 +38,19 @@ def display_text(tokenizer, x, prompt_length):
 
 
 def intervention_specs(args):
-    return conditions(args.interventions, getattr(args, "freeze_groups", ["both"]),
-                      getattr(args, "refresh_intervals", []), getattr(args, "mixed_refresh", []))
+    specs = conditions(args.interventions, getattr(args, "freeze_groups", ["both"]),
+                       getattr(args, "refresh_intervals", []), getattr(args, "mixed_refresh", []))
+    names = getattr(args, "condition_names", [])
+    if names:
+        unknown = set(names) - {s["condition"] for s in specs}
+        if unknown:
+            raise ValueError(f"Requested conditions not in generated matrix: {sorted(unknown)}")
+        specs = [s for s in specs if s["condition"] in names]
+    return specs
 
 
 @torch.no_grad()
-def interventions(llm, prepared, baseline, states, args, tokenizer, row):
+def interventions(llm, prepared, baseline, states, args, tokenizer, row, on_result=None):
     specifications = intervention_specs(args)
     if not specifications:
         return []
@@ -123,6 +130,8 @@ def interventions(llm, prepared, baseline, states, args, tokenizer, row):
                 if not result["same_final_tokens"]:
                     raise RuntimeError(f"Refresh-every-forward control differs from baseline: {name}")
             results.append(result)
+            if on_result is not None:
+                on_result(result)
             print(f"    done: same_tokens={result['same_final_tokens']}; score={result['score']}", flush=True)
             del first, final, probes
         del reference, capture, start_x
@@ -204,6 +213,10 @@ def parser():
     p.add_argument("--mixed-refresh", nargs="*", default=[], metavar="ACOUSTIC:SEMANTIC",
                    help="Independent intervals for the two groups, e.g. 8:2 2:8; 0 means no refresh")
     p.add_argument("--progress-every", type=int, default=8)
+    p.add_argument("--condition-names", nargs="*", default=[],
+                   help="Run only these named conditions from the generated matrix")
+    p.add_argument("--profile-samples", type=int, default=0,
+                   help="Profile this many initial samples separately, without drift hooks")
     p.add_argument("--branch-fractions", type=float, nargs="+", default=[0., .25, .5, .75])
     p.add_argument("--verify-samples", type=int, default=1,
                    help="Compare instrumented decoding with the official unmodified decoder")
@@ -219,7 +232,7 @@ def main():
     print("Work per example:", json.dumps(estimate), flush=True)
     if args.progress_every < 0:
         raise ValueError("progress-every must be nonnegative")
-    if args.verify_samples < 0 or not all(0 <= f < 1 for f in args.branch_fractions):
+    if min(args.verify_samples, args.profile_samples) < 0 or not all(0 <= f < 1 for f in args.branch_fractions):
         raise ValueError("Invalid verification count or branch fractions")
     if bool(args.snapshot_steps) != bool(args.snapshot_layers):
         raise ValueError("Specify both snapshot steps and layers")
@@ -306,20 +319,47 @@ def main():
                 raise RuntimeError("Instrumented output differs from the official decoder; stopping")
             del official
         text = display_text(tokenizer, final, prepared.prompt.shape[1])
+        answer_ids = final[0, prepared.prompt.shape[1]:].tolist()
+        first_eos = answer_ids.index(tokenizer.eos_token_id) if tokenizer.eos_token_id in answer_ids else None
+        visible = set()
+        content_positions = {i for i, token in enumerate(answer_ids)
+                             if (first_eos is None or i < first_eos)
+                             and token not in set(tokenizer.all_special_ids)}
+        content_revealed_step = None
+        for event in events:
+            visible.update(event["committed_positions"])
+            if content_positions <= visible:
+                content_revealed_step = event["step"]
+                break
         baseline_score = score(text, row.get("target"), row.get("metric", "none"))
         print(f"  baseline: official_match={verified}; score={baseline_score}; text={text!r}", flush=True)
-        branches = interventions(llm, prepared, final, states, args, tokenizer, row)
         write_json(work / "steps.json", events)
         result = {"id": row["id"], "task": row["task"], "prompt": row["prompt"],
                   "target": row.get("target"), "audio_seconds": duration,
+                  "duration_bin": row.get("duration_bin"), "speaker_id": row.get("speaker_id"),
                   "audio_semantic_tokens": prepared.audio_count - prepared.acoustic_count,
                   "audio_acoustic_tokens": prepared.acoustic_count,
                   "prompt_tokens": prepared.prompt.shape[1], "labels": prepared.labels(args.length),
-                  "text": text, "answer_ids": final[0, prepared.prompt.shape[1]:].tolist(),
+                  "text": text, "answer_ids": answer_ids,
+                  "first_eos_answer_position": first_eos,
+                  "answer_has_no_eos": first_eos is None,
+                  "baseline_content_revealed_step": content_revealed_step,
                   "score": baseline_score,
                   "verified_against_upstream": verified, "forwards": len(events),
                   "instrumented_seconds": elapsed, "peak_allocated_bytes": peak_memory,
-                  "interventions": branches}
+                  "interventions": []}
+        write_json(work / "baseline.json", result)
+        if index < args.profile_samples:
+            from .profile import profile_baseline
+            profile_baseline(model, tokenizer, extractor, audio, row["prompt"], prepared,
+                             final, states, args, work)
+        # Persist each completed branch even if the sample is interrupted later.
+        with (work / "interventions.jsonl").open("w") as branch_file:
+            def save_branch(branch):
+                branch_file.write(json.dumps(branch, allow_nan=False) + "\n")
+                branch_file.flush()
+            result["interventions"] = interventions(llm, prepared, final, states, args, tokenizer, row,
+                                                     on_result=save_branch)
         write_json(work / "result.json", result)
         if destination.exists():
             raise ValueError(f"Unexpected existing incomplete destination: {destination}")

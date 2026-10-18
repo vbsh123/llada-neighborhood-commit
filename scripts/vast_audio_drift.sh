@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mode="${1:-smoke}"
 case "$mode" in
-  setup|smoke|pilot) ;;
-  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot]'; exit 2 ;;
+  setup|smoke|pilot|long-pilot) ;;
+  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot]'; exit 2 ;;
 esac
 audio_venv="${AUDIO_VENV:-$PWD/.venv-audio}"
 if [[ ! -x "$audio_venv/bin/python" ]]; then
@@ -35,7 +35,18 @@ PY
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 experiment_name="${RUN_NAME:-audio_drift_${mode}_$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ "$experiment_name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid RUN_NAME'; exit 2; }
-if [[ "$mode" == smoke ]]; then
+if [[ "$mode" == long-pilot ]]; then
+  manifest="${MANIFEST:-$PWD/data/audio_drift/librispeech_duration20_v3.jsonl}"
+  if [[ ! -f "$manifest" && -z "${MANIFEST:-}" ]]; then
+    python -m experiments.audio_drift.prepare --out "$manifest" --samples 20 \
+      --dataset openslr/librispeech_asr --config clean --split test --streaming \
+      --shuffle-seed "${SEED:-1729}" --max-per-speaker 2 \
+      --min-seconds 10 --max-seconds 30 --duration-bins 10:20:10 20:30:10
+  fi
+  count="${SAMPLES:-20}"
+  length="${LENGTH:-256}"
+  block="${BLOCK_LENGTH:-32}"
+elif [[ "$mode" == smoke ]]; then
   manifest="${MANIFEST:-$PWD/data/audio_drift/smoke.jsonl}"
   if [[ ! -f "$manifest" && -z "${MANIFEST:-}" ]]; then
     python -m experiments.audio_drift.prepare --out "$manifest" --samples 2
@@ -51,7 +62,12 @@ else
   block="${BLOCK_LENGTH:-32}"
 fi
 extra=()
-if [[ "${GROUP_STUDY:-0}" == 1 ]]; then
+if [[ "$mode" == long-pilot ]]; then
+  extra+=(--interventions freeze --freeze-groups acoustic semantic both
+          --refresh-intervals 1 4 8 --mixed-refresh 8:2 2:8
+          --condition-names freeze_acoustic freeze_semantic freeze freeze_both_r1
+          freeze_both_r4 freeze_both_r8 freeze_mixed_a8_s2 freeze_mixed_a2_s8)
+elif [[ "${GROUP_STUDY:-0}" == 1 ]]; then
   read -r -a refresh_intervals <<< "${REFRESH_INTERVALS:-1 2 4 8}"
   read -r -a mixed_refresh <<< "${MIXED_REFRESH:-8:2 2:8}"
   extra+=(--interventions freeze remove text_only --freeze-groups acoustic semantic both
@@ -59,12 +75,20 @@ if [[ "${GROUP_STUDY:-0}" == 1 ]]; then
 elif [[ "${INTERVENTIONS:-0}" == 1 ]]; then
   extra+=(--interventions freeze remove text_only)
 fi
-read -r -a branch_fractions <<< "${BRANCH_FRACTIONS:-0 .25 .5 .75}"
+default_fractions="0 .25 .5 .75"
+default_profiles=0
+default_layers=all
+default_steps="$length"
+if [[ "$mode" == long-pilot ]]; then
+  default_fractions=0; default_profiles=2; default_layers=0,7,15,23,31; default_steps=128
+fi
+read -r -a branch_fractions <<< "${BRANCH_FRACTIONS:-$default_fractions}"
+extra+=(--profile-samples "${PROFILE_SAMPLES:-$default_profiles}")
 if [[ "${TOKEN_METRICS:-0}" == 1 ]]; then extra+=(--token-metrics); fi
 python -u -m experiments.audio_drift.run \
   --diffa-root "$diffa_checkout" --manifest "$manifest" --out "runs/$experiment_name" \
-  --samples "$count" --length "$length" --block-length "$block" --steps "${STEPS:-$length}" \
-  --layers "${LAYERS:-all}" --reference-device "${REFERENCE_DEVICE:-cpu}" \
+  --samples "$count" --length "$length" --block-length "$block" --steps "${STEPS:-$default_steps}" \
+  --layers "${LAYERS:-$default_layers}" --reference-device "${REFERENCE_DEVICE:-cpu}" \
   --verify-samples "${VERIFY_SAMPLES:-1}" --seed "${SEED:-1729}" \
   --progress-every "${PROGRESS_EVERY:-8}" --branch-fractions "${branch_fractions[@]}" "${extra[@]}"
 python -m experiments.audio_drift.analyze --run "runs/$experiment_name"
