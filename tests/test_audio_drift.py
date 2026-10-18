@@ -22,6 +22,108 @@ if HAS_TORCH:
 
 
 class InputTests(unittest.TestCase):
+    def test_final_numeric_answer_scoring(self):
+        for text, target in [("3 + 15 = 18.\n#### 18", "18"),
+                             ("Final answer: $1,200.00", "1200"),
+                             ("-0.00", "0"), ("#### -2.50", "-2.5"),
+                             ("18", "18.0"), ("#### 8\n#### 18", "18")]:
+            with self.subTest(text=text):
+                self.assertTrue(score(text, target, "numeric")["correct"])
+        for text in ["There are 18 apples", "Compute 3 + 15", "#### 1,20", "#### NaN",
+                     "#### 18 or 19", "#### 18\nMore calculation 4", "#### 1/0"]:
+            with self.subTest(text=text):
+                self.assertTrue(score(text, "18", "numeric")["parse_failed"])
+        self.assertFalse(score("#### 19", "18", "numeric")["correct"])
+        with self.assertRaises(ValueError):
+            score("18", "not a number", "numeric")
+
+    def test_three_group_refresh_and_benchmark_only(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.run import intervention_specs, interventions
+        args = SimpleNamespace(interventions=["freeze"], freeze_groups=["prefix"],
+                               refresh_intervals=[1, 4, 8], triple_refresh=["8:4:4", "16:4:4", "8:8:4"],
+                               condition_names=["freeze_prefix_r1", "freeze_prefix_r4", "freeze_prefix_r8",
+                                                "freeze_triple_a8_p4_s4", "freeze_triple_a16_p4_s4",
+                                                "freeze_triple_a8_p8_s4"], skip_dense_interventions=True)
+        specs = intervention_specs(args)
+        self.assertEqual(len(specs), 6)
+        triple = next(s for s in specs if s["condition"] == "freeze_triple_a8_p4_s4")
+        self.assertEqual(triple["schedule"], [{"group": "acoustic", "refresh_every": 8},
+                                              {"group": "prompt", "refresh_every": 4},
+                                              {"group": "semantic", "refresh_every": 4}])
+        self.assertEqual(interventions(None, None, None, None, args, None, None), [])
+        for bad in ["8:4", "8:-1:4"]:
+            with self.assertRaises(ValueError):
+                conditions(["freeze"], triple_refresh=[bad])
+
+    @unittest.skipUnless(HAS_TORCH, "audio dependencies unavailable")
+    def test_spoken_math_reservoir_and_duration_filter(self):
+        import io
+        import soundfile as sf
+        from experiments.audio_drift.prepare_gsm import select_rows
+        def rows():
+            for i in range(12):
+                data = io.BytesIO()
+                sf.write(data, np.zeros(1600 if i < 10 else 3200), 1600, format="WAV")
+                yield "data/test-0.parquet", i, {"audio": {"bytes": data.getvalue()}, "answer": str(i)}
+        a, counts = select_rows(rows(), 3, 1729, 0, 1.5)
+        b, _ = select_rows(rows(), 3, 1729, 0, 1.5)
+        self.assertEqual([r['source_row'] for r in a], [r['source_row'] for r in b])
+        self.assertEqual(counts, {"scanned": 12, "eligible": 10})
+        self.assertEqual(len({r['source_row'] for r in a}), 3)
+        self.assertTrue(all(r['audio_seconds'] == 1 for r in a))
+        with self.assertRaises(ValueError):
+            select_rows(rows(), 11, 1729, 0, 1.5)
+
+    def test_reasoning_report_pairs_accuracy_and_latency(self):
+        from experiments.audio_drift.reasoning_report import summarize
+        def result(i, baseline, cached):
+            return {"id": str(i), "target": "18", "score": score(baseline, "18", "numeric"),
+                    "answer_has_no_eos": False,
+                    "benchmark": {"baseline_median_seconds": 4, "baseline_forwards": 8,
+                      "policies": [{"condition": "test", "score": score(cached, "18", "numeric"),
+                                    "median_seconds": 2, "accounting": [{"forwards": 8}],
+                                    "same_forward_count_as_baseline": True, "answer_has_no_eos": False}]}}
+        rows, summary = summarize([result(0, "18", "19"), result(1, "19", "18"),
+                                   result(2, "18", "No final answer")])
+        item = summary["test"]
+        self.assertEqual(item["samples"], 3)
+        self.assertEqual(item["correct_to_wrong"], 2)
+        self.assertEqual(item["wrong_to_correct"], 1)
+        self.assertEqual(item["parse_failures"], 1)
+        self.assertEqual(item["decode_speedup_ratio_of_sums"], 2)
+        self.assertEqual(item["same_forward_count_samples"], 3)
+
+    @unittest.skipUnless(HAS_TORCH, "audio dependencies unavailable")
+    def test_spoken_math_preparation_from_local_parquet(self):
+        import io
+        import soundfile as sf
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from types import SimpleNamespace
+        from experiments.audio_drift.prepare_gsm import main, PROMPT
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            data = io.BytesIO()
+            sf.write(data, np.zeros(1600), 1600, format="WAV")
+            shard = directory / "test.parquet"
+            pq.write_table(pa.Table.from_pylist([{"audio": {"bytes": data.getvalue(), "path": "audio.wav"},
+                                                 "answer": str(i)} for i in range(5)]), shard)
+            manifest = directory / "pilot.jsonl"
+            api = SimpleNamespace(dataset_info=lambda *a, **k: SimpleNamespace(sha="pinned"),
+                                  list_repo_files=lambda *a, **k: ["data/test-00000-of-00001.parquet"])
+            with patch("sys.argv", ["prepare_gsm", "--out", str(manifest), "--samples", "2"]), \
+                 patch("huggingface_hub.HfApi", return_value=api), \
+                 patch("huggingface_hub.hf_hub_download", return_value=str(shard)):
+                main()
+            rows = read_manifest(manifest)
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(r['metric'] == 'numeric' and r['prompt'] == PROMPT for r in rows))
+            self.assertTrue(all(r['source_revision'] == 'pinned' for r in rows))
+            provenance = json.loads(manifest.with_suffix('.provenance.json').read_text())
+            self.assertEqual(provenance['scanned'], 5)
+            self.assertEqual(provenance['eligible'], 5)
+
     def test_long_pilot_selects_only_named_conditions(self):
         from types import SimpleNamespace
         from experiments.audio_drift.run import intervention_specs
@@ -349,6 +451,9 @@ class UpstreamTests(unittest.TestCase):
                      ["prompt", "both", "prefix", "audio_matched"] for r in [0, 1, 4]]
         schedules.append([{"group": "acoustic", "refresh_every": 0},
                           {"group": "semantic", "refresh_every": 2}])
+        schedules.append([{"group": "acoustic", "refresh_every": 8},
+                          {"group": "prompt", "refresh_every": 4},
+                          {"group": "semantic", "refresh_every": 4}])
         for policy in schedules:
             with self.subTest(policy=policy):
                 with AttentionProbe(self.llm, list(range(self.prepared.answer_start)), mode="capture") as capture:

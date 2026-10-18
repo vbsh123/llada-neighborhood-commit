@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mode="${1:-smoke}"
 case "$mode" in
-  setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot) ;;
-  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot]'; exit 2 ;;
+  setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot) ;;
+  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot]'; exit 2 ;;
 esac
 audio_venv="${AUDIO_VENV:-$PWD/.venv-audio}"
 if [[ ! -x "$audio_venv/bin/python" ]]; then
@@ -35,7 +35,15 @@ PY
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 experiment_name="${RUN_NAME:-audio_drift_${mode}_$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ "$experiment_name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid RUN_NAME'; exit 2; }
-if [[ "$mode" == long-pilot || "$mode" == control-pilot || "$mode" == cosine-pilot ]]; then
+if [[ "$mode" == gsm-pilot ]]; then
+  manifest="${MANIFEST:-$PWD/data/audio_drift/gsm8k_speech10_v7.jsonl}"
+  if [[ ! -f "$manifest" && -z "${MANIFEST:-}" ]]; then
+    python -m experiments.audio_drift.prepare_gsm --out "$manifest" --samples 10 --seed "${SEED:-1729}"
+  fi
+  count="${SAMPLES:-10}"
+  length="${LENGTH:-256}"
+  block="${BLOCK_LENGTH:-32}"
+elif [[ "$mode" == long-pilot || "$mode" == control-pilot || "$mode" == cosine-pilot ]]; then
   manifest="${MANIFEST:-$PWD/data/audio_drift/librispeech_duration20_v4.jsonl}"
   if [[ ! -f "$manifest" && -z "${MANIFEST:-}" ]]; then
     python -m experiments.audio_drift.prepare --out "$manifest" --samples 20 \
@@ -64,7 +72,15 @@ else
   block="${BLOCK_LENGTH:-32}"
 fi
 extra=()
-if [[ "$mode" == cosine-pilot ]]; then
+if [[ "$mode" == gsm-pilot ]]; then
+  extra+=(--interventions freeze --freeze-groups prefix --refresh-intervals 1 4 8
+          --triple-refresh 8:4:4 16:4:4 8:8:4
+          --condition-names freeze_prefix_r1 freeze_prefix_r4 freeze_prefix_r8
+          freeze_triple_a8_p4_s4 freeze_triple_a16_p4_s4 freeze_triple_a8_p8_s4
+          --skip-dense-interventions
+          --benchmark-samples "${BENCHMARK_SAMPLES:-$count}" --benchmark-repeats "${BENCHMARK_REPEATS:-2}"
+          --benchmark-stopping "${BENCHMARK_STOPPING:-eos}")
+elif [[ "$mode" == cosine-pilot ]]; then
   extra+=(--pairwise-count "${PAIRWISE_COUNT:-64}" --pairwise-stride "${PAIRWISE_STRIDE:-1}"
           --pairwise-layers "${PAIRWISE_LAYERS:-7,15,23,31}" --pairwise-device "${PAIRWISE_DEVICE:-cuda}")
 elif [[ "$mode" == control-pilot ]]; then
@@ -98,6 +114,9 @@ if [[ "$mode" == long-pilot || "$mode" == control-pilot || "$mode" == cosine-pil
   default_fractions=0; default_profiles=2; default_layers=0,7,15,23,31; default_steps=128
 fi
 if [[ "$mode" == control-pilot ]]; then default_profiles=0; fi
+if [[ "$mode" == gsm-pilot ]]; then
+  default_fractions=0; default_profiles=0; default_layers=0,7,15,23,31; default_steps=128
+fi
 if [[ "$mode" == cosine-pilot ]]; then default_profiles=0; default_layers=all; fi
 read -r -a branch_fractions <<< "${BRANCH_FRACTIONS:-$default_fractions}"
 extra+=(--profile-samples "${PROFILE_SAMPLES:-$default_profiles}")
@@ -110,6 +129,9 @@ python -u -m experiments.audio_drift.run \
   --cpu-threads "${CPU_THREADS:-4}" \
   --verify-samples "${VERIFY_SAMPLES:-1}" --seed "${SEED:-1729}" \
   --progress-every "${PROGRESS_EVERY:-8}" --branch-fractions "${branch_fractions[@]}" "${extra[@]}"
+if [[ "$mode" == gsm-pilot ]]; then
+  python -m experiments.audio_drift.reasoning_report --run "runs/$experiment_name"
+fi
 python -m experiments.audio_drift.analyze --run "runs/$experiment_name"
 python -m experiments.audio_drift.stability --run "runs/$experiment_name" --statistic median
 python -m experiments.audio_drift.stability --run "runs/$experiment_name" --statistic p90

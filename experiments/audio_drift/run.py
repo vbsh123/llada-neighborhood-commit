@@ -39,7 +39,8 @@ def display_text(tokenizer, x, prompt_length):
 
 def intervention_specs(args):
     specs = conditions(args.interventions, getattr(args, "freeze_groups", ["both"]),
-                       getattr(args, "refresh_intervals", []), getattr(args, "mixed_refresh", []))
+                       getattr(args, "refresh_intervals", []), getattr(args, "mixed_refresh", []),
+                       getattr(args, "triple_refresh", []))
     names = getattr(args, "condition_names", [])
     if names:
         unknown = set(names) - {s["condition"] for s in specs}
@@ -52,7 +53,7 @@ def intervention_specs(args):
 @torch.no_grad()
 def interventions(llm, prepared, baseline, states, args, tokenizer, row, on_result=None):
     specifications = intervention_specs(args)
-    if not specifications:
+    if not specifications or getattr(args, "skip_dense_interventions", False):
         return []
     results = []
     anchors = anchors_for(len(states), args.branch_fractions)
@@ -149,6 +150,9 @@ def summarize_pairs(entries):
     correct = [e["score"]["correct"] for e in scored if "correct" in e["score"]]
     if correct:
         result["accuracy"] = sum(correct) / len(correct)
+    numeric = [e["score"] for e in scored if e["score"].get("metric") == "numeric"]
+    if numeric:
+        result["parse_failures"] = sum(e["parse_failed"] for e in numeric)
     wer = [e for e in scored if e["score"]["metric"] == "wer"]
     if wer:
         denominator = max(1, sum(e["score"]["reference_words"] for e in wer))
@@ -234,6 +238,10 @@ def parser():
                    help="Also test periodic refresh; 1 is an identity control, 0/permanent is automatic")
     p.add_argument("--mixed-refresh", nargs="*", default=[], metavar="ACOUSTIC:SEMANTIC",
                    help="Independent intervals for the two groups, e.g. 8:2 2:8; 0 means no refresh")
+    p.add_argument("--triple-refresh", nargs="*", default=[], metavar="ACOUSTIC:PROMPT:SEMANTIC",
+                   help="Independent fixed-prefix schedules for all three groups")
+    p.add_argument("--skip-dense-interventions", action="store_true",
+                   help="Run generated policies only in the compact benchmark, without dense branches")
     p.add_argument("--progress-every", type=int, default=8)
     p.add_argument("--condition-names", nargs="*", default=[],
                    help="Run only these named conditions from the generated matrix")
@@ -268,8 +276,18 @@ def main():
     specifications = intervention_specs(args)
     if args.benchmark_samples and set(args.benchmark_conditions) - {s["condition"] for s in specifications if s["mode"] == "freeze"}:
         raise ValueError("Benchmark conditions must select generated freeze conditions")
-    estimate = work_estimate(args.steps, args.branch_fractions, specifications)
+    if args.skip_dense_interventions and not args.benchmark_samples:
+        raise ValueError("--skip-dense-interventions requires --benchmark-samples > 0")
+    estimate = work_estimate(args.steps, args.branch_fractions,
+                             [] if args.skip_dense_interventions else specifications)
     print("Work per example:", json.dumps(estimate), flush=True)
+    if args.benchmark_samples:
+        names = set(args.benchmark_conditions)
+        number = sum(s["mode"] == "freeze" and (not names or s["condition"] in names)
+                     for s in specifications)
+        print(f"Compact benchmark on first {args.benchmark_samples} samples: {number} policies; "
+              f"one warmup + {args.benchmark_repeats} timed decodes per policy; "
+              "three clean baseline decodes (warmup and before/after timing).", flush=True)
     if args.progress_every < 0:
         raise ValueError("progress-every must be nonnegative")
     if min(args.verify_samples, args.profile_samples, args.benchmark_samples) < 0 or args.benchmark_repeats < 1 or not all(0 <= f < 1 for f in args.branch_fractions):

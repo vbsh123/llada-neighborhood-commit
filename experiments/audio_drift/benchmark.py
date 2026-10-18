@@ -62,7 +62,7 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
               "refreshes, gathers/scatters, ordinary decoder bookkeeping and full vocabulary head. "
               "Model loading, disk I/O, audio preparation, drift collection and task scoring are excluded. "
               "EOS stopping waits until all positions before a revealed EOS are filled; baseline and "
-              "cache use the same rule. Compare latency together with WER and forwards. Policies can be "
+              "cache use the same rule. Compare latency together with task quality and forwards. Policies can be "
               "slower. The skipped-token-update fraction is not a wall-time prediction."}
     write_json(work / "cache_benchmark.json", report)
     for spec in specs:
@@ -86,6 +86,7 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
                   "peak_allocated_bytes": max(peaks), "accounting": accounting,
                   "text": text, "visible_answer_ids": outputs[0], "same_visible_tokens": outputs[0] == expected,
                   "score": score(text, row.get("target"), row.get("metric", "none")),
+                  "answer_has_no_eos": tokenizer.eos_token_id not in outputs[0],
                   "selected_positions": {s["group"]: prepared.group_positions(s["group"]) for s in spec["schedule"]}}
         paired = next((b for b in diagnostics if b["condition"] == spec["condition"] and b["anchor_step"] == 0), None)
         if paired:

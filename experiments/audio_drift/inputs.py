@@ -1,4 +1,5 @@
 """Explicit task manifest, audio validation, and simple reference scoring."""
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from pathlib import Path
@@ -22,8 +23,8 @@ def read_manifest(path, samples=None):
         row["audio"] = str((path.parent / row["audio"]).resolve())
         if not Path(row["audio"]).is_file():
             raise ValueError(f"Missing audio: {row['audio']}")
-        if row.get("metric", "none") not in {"none", "wer", "exact", "mcq"}:
-            raise ValueError("metric must be none, wer, exact, or mcq")
+        if row.get("metric", "none") not in {"none", "wer", "exact", "mcq", "numeric"}:
+            raise ValueError("metric must be none, wer, exact, mcq, or numeric")
         if row.get("metric", "none") != "none" and not isinstance(row.get("target"), str):
             raise ValueError("Scored manifest rows need a string target")
         row["audio_sha256"] = hashlib.sha256(Path(row["audio"]).read_bytes()).hexdigest()
@@ -41,9 +42,48 @@ def normalized(text):
     return re.findall(r"\w+", text.casefold())
 
 
+# Accept one finite scalar, with optional currency and valid thousands grouping.
+_NUMBER = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+
+
+def canonical_number(value):
+    value = value.strip()
+    match = re.fullmatch(r"\$?\s*(" + _NUMBER + r")", value)
+    if not match:
+        return None
+    try:
+        number = Decimal(match.group(1).replace(",", ""))
+    except InvalidOperation:
+        return None
+    if not number.is_finite():
+        return None
+    # Avoid Decimal.normalize(), whose rounding depends on the global context.
+    result = format(number, "f")
+    if "." in result:
+        result = result.rstrip("0").rstrip(".")
+    return "0" if number == 0 else result
+
+
+def final_number(text):
+    # An explicit final marker wins; malformed marked answers fail rather than
+    # falling back to an earlier intermediate calculation. Never take last number
+    # from arbitrary reasoning, where it may be an operand rather than an answer.
+    markers = list(re.finditer(r"####|final\s+answer\s*:", text, re.I))
+    answer = text[markers[-1].end():].strip() if markers else text.strip()
+    answer = answer.rstrip(".").strip()
+    return canonical_number(answer)
+
+
 def score(text, target, metric):
     if metric == "none":
         return None
+    if metric == "numeric":
+        reference = canonical_number(target)
+        if reference is None:
+            raise ValueError("Numeric targets must be a finite numeric scalar")
+        prediction = final_number(text)
+        return {"metric": metric, "prediction": prediction, "reference": reference,
+                "parse_failed": prediction is None, "correct": prediction == reference}
     if metric == "exact":
         return {"metric": metric, "correct": normalized(text) == normalized(target)}
     if metric == "mcq":

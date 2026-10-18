@@ -6,6 +6,108 @@ The default checkpoint is **DIFFA-2**, with its original semantic/acoustic
 connectors, Whisper-large-v3, and LLaDA-8B-Instruct. This experiment does not
 change the existing neighborhood, sleep, or translation experiments.
 
+## Spoken GSM8K refresh pilot (v7)
+
+Uses `mistralai/gsm8k_speech`, synthetic spoken GSM8K test questions with final
+numeric references. Resolves and records the dataset commit. Downloads/caches
+three test Parquet shards (about 978 MB total) and consumes them with local
+`ParquetFile` readers, avoiding the previous partially consumed streaming scanner
+shutdown problem. Audio headers determine eligibility; a seeded reservoir selects
+10 clips of at most 30 seconds without consulting model predictions. Longer clips
+are excluded, never truncated. Only selected audio payloads are retained in RAM.
+The prepared manifest and WAV files are reusable across runs.
+
+```bash
+cd /workspace/llada-audio-drift
+git pull --ff-only
+nohup env \
+  RUN_NAME=audio_gsm10_v7 \
+  SAMPLES=10 \
+  SKIP_INSTALL=1 \
+  REFERENCE_DEVICE=cuda \
+  VERIFY_SAMPLES=2 \
+  bash scripts/vast_audio_drift.sh gsm-pilot \
+  > audio_gsm10_v7.log 2>&1 &
+tail -f audio_gsm10_v7.log
+```
+
+For a two-example capability/timing check, use `SAMPLES=2` and a fresh run name
+such as `audio_gsm2_v7`. Preparation still selects the same reusable 10-row
+manifest. Subsequent 10-example runs need a fresh name; settings are fingerprinted.
+No new Python dependencies are needed after v6 setup. The fixed prompt asks the
+model to solve the **spoken** problem, think step by step, and end with
+`#### <number>`. No reference answer or text transcript is supplied to the model.
+The decoding budget is 256 answer slots, 32-slot blocks, 128 forwards; adjust only
+in a fresh run. Missing EOS is recorded as possible budget exhaustion.
+
+| Compact cache policy | Acoustic interval | Fixed prompt interval | Semantic interval |
+|---|---:|---:|---:|
+| Identity control | 1 | 1 | 1 |
+| Shared prefix | 4 | 4 | 4 |
+| Shared prefix | 8 | 8 | 8 |
+| Acoustic slower | 8 | 4 | 4 |
+| Acoustic slower still | 16 | 4 | 4 |
+| Acoustic and prompt slower | 8 | 8 | 4 |
+
+The ordinary uncached baseline collects scalar drift at layers 0, 7, 15, 23, 31.
+Policies run from the first decoding forward with real row skipping, one warmup
+and two synchronized timed repeats each. Every answer row remains active. There
+are **no dense continuation branches**, no pairwise tensor history, and no
+operator profiles in this preset. Verification checks the first two uncached
+samples when `VERIFY_SAMPLES=2`; refresh-every-forward must match baseline tokens.
+All policies use the same safe EOS stopping rule. Forward counts are reported
+because different reasoning lengths can influence total latency.
+
+`numeric` scoring accepts the last explicit `####` or `Final answer:` marker
+followed by one numeric scalar (or a response consisting solely of a number).
+Thousands grouping, optional dollar signs and decimal trailing zeros are
+normalized using exact decimal arithmetic. It never takes the last arbitrary
+number from an unmarked reasoning paragraph. Missing/malformed answers count as
+incorrect and are separately counted as parse failures. Explanations are saved
+for audit but are not graded. Unsupported output formats can be inspected in the
+per-sample texts before drawing task-capability conclusions.
+
+Results:
+
+- `summary.json`: baseline and compact-policy final-answer accuracy and speedup.
+- `analysis/reasoning_report.md`: paired accuracy, correct-to-wrong and
+  wrong-to-correct counts, parse failures and measured decode speedup.
+- `analysis/reasoning_pairs.csv`: per-example predictions, latency, forward counts
+  and missing-EOS flags.
+- `analysis/reasoning_summary.json`: machine-readable paired report including
+  missing-EOS totals.
+- `samples/*/result.json` and `cache_benchmark.json`: complete texts, scores,
+  schedules, repeated timings, selected positions and memory accounting.
+
+Ten examples are an exploratory capability/schedule pilot. Inspect the uncached
+accuracy, parse failures and output-budget flags first. A weak baseline prevents a
+useful cache-preservation conclusion. Tune on these examples, then validate the
+selected schedules on fresh examples. Compare the asymmetric schedules against
+both shared-prefix controls at measured latency and accuracy; a drift ratio alone
+does not determine a safe refresh interval. GPU timings for this task are not yet
+measured; use the first completed sample's wall time to estimate the remaining run.
+
+To export the completed folder and log:
+
+```bash
+python - <<'PYZIP'
+from pathlib import Path
+import zipfile
+run = Path('runs/audio_gsm10_v7')
+assert (run / 'summary.json').is_file(), 'Run has not produced a summary yet'
+out = Path('exports/audio_gsm10_v7.zip')
+out.parent.mkdir(exist_ok=True)
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+    for f in sorted(run.rglob('*')):
+        if f.is_file():
+            z.write(f, f.relative_to(run.parent))
+    log = Path('audio_gsm10_v7.log')
+    if log.is_file():
+        z.write(log)
+print(out, out.stat().st_size)
+PYZIP
+```
+
 ## Acoustic versus semantic timing study (v2)
 
 On the existing Vast machine after the original smoke run:
