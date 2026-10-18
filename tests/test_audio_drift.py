@@ -90,6 +90,25 @@ class InputTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TORCH, "Optional CPU torch dependency is absent")
 class MetricTests(unittest.TestCase):
+    def test_local_parquet_reader_reads_only_selected_split_and_closes_files(self):
+        from experiments.audio_drift.prepare import local_parquet_rows
+        from types import SimpleNamespace
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        files = ["clean/train.100/0000.parquet", "clean/test/0001.parquet",
+                 "other/test/0000.parquet", "clean/test/0000.parquet", "README.md"]
+        api = SimpleNamespace(list_repo_files=lambda *a, **k: files)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "split.parquet"
+            pq.write_table(pa.Table.from_pylist([{"id": "x", "text": "HELLO",
+                                                 "audio": {"bytes": b"audio", "path": "x.flac"}}]), path)
+            with patch("huggingface_hub.hf_hub_download", return_value=str(path)) as download:
+                rows, selected = local_parquet_rows("repo", "clean", "test", "fixed", api)
+            self.assertEqual(selected, ["clean/test/0000.parquet", "clean/test/0001.parquet"])
+            self.assertEqual([r["audio"]["bytes"] for r in rows], [b"audio", b"audio"])
+            self.assertEqual(download.call_count, 2)
+            self.assertTrue(all(c.kwargs["revision"] == "fixed" for c in download.call_args_list))
+
     def test_duration_quotas_filter_boundaries_and_interleave(self):
         from experiments.audio_drift.prepare import main
         from types import SimpleNamespace
@@ -109,15 +128,17 @@ class MetricTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "balanced.jsonl"
             argv = ["prepare", "--out", str(manifest), "--samples", "4", "--min-seconds", "10",
-                    "--duration-bins", "10:20:2", "20:30:2"]
+                    "--reader", "local-parquet", "--duration-bins", "10:20:2", "20:30:2"]
             with patch.object(sys, "argv", argv), patch.dict(sys.modules, {"datasets": datasets, "huggingface_hub": hub}), \
-                    patch.object(soundfile, "read", side_effect=read_audio):
+                    patch.object(soundfile, "read", side_effect=read_audio), \
+                    patch("experiments.audio_drift.prepare.local_parquet_rows", return_value=(rows, ["clean/test/x.parquet"])):
                 main()
             selected = read_manifest(manifest)
             self.assertEqual([r["audio_seconds"] for r in selected], [10, 20, 19, 30])
             self.assertEqual([r["duration_bin"] for r in selected], ["10-20", "20-30"] * 2)
             provenance = json.loads(manifest.with_suffix(".provenance.json").read_text())
             self.assertEqual([b["selected"] for b in provenance["duration_bins"]], [2, 2])
+            self.assertEqual(provenance["reader"], "local-parquet")
             for invalid in [["10:25:2", "20:30:2"], ["10:20:3"]]:
                 with patch.object(sys, "argv", ["prepare", "--out", str(manifest), "--samples", "4",
                                                 "--duration-bins", *invalid]):
@@ -365,8 +386,17 @@ class UpstreamTests(unittest.TestCase):
         tokenizer = SimpleNamespace(eos_token_id=30,
                                     decode=lambda ids, **kwargs: " ".join(map(str, ids)))
         with patch("torch.cuda.synchronize"):
+            persisted = []
             results = interventions(self.llm, self.prepared, baseline, states,
-                                     args, tokenizer, {"metric": "none"})
+                                     args, tokenizer, {"metric": "none"}, on_result=persisted.append)
+            args.cache_device = "model"
+            device_results = interventions(self.llm, self.prepared, baseline, states,
+                                            args, tokenizer, {"metric": "none"})
+        self.assertEqual(len(persisted), len(results))
+        for cpu, model in zip(results, device_results):
+            self.assertEqual(cpu["answer_ids"], model["answer_ids"])
+            self.assertEqual(cpu["immediate"], model["immediate"])
+            self.assertEqual(cpu["cache_events"], model["cache_events"])
         self.assertEqual(len(results), 6)
         for result in results:
             start = result["start_step"]
@@ -440,6 +470,13 @@ class UpstreamTests(unittest.TestCase):
         with patch("torch.cuda.synchronize"):
             results = interventions(self.llm, self.prepared, baseline, states,
                                      args, tokenizer, {"metric": "none"})
+            args.cache_device = "model"
+            device_results = interventions(self.llm, self.prepared, baseline, states,
+                                            args, tokenizer, {"metric": "none"})
+        for cpu, model in zip(results, device_results):
+            self.assertEqual(cpu["answer_ids"], model["answer_ids"])
+            self.assertEqual(cpu["immediate"], model["immediate"])
+            self.assertEqual(cpu["cache_events"], model["cache_events"])
         self.assertEqual(len(results), 11)
         for result in results:
             if result["condition"].endswith("_r1"):

@@ -64,7 +64,8 @@ def interventions(llm, prepared, baseline, states, args, tokenizer, row, on_resu
     for anchor in anchors:
         start = anchor + 1
         anchor_x = states[anchor].to(llm.device)
-        with AttentionProbe(llm, prepared.audio_positions, mode="capture") as capture:
+        cache_device = getattr(args, "cache_device", "cpu")
+        with AttentionProbe(llm, prepared.audio_positions, mode="capture", cache_device=cache_device) as capture:
             anchor_logits = forward_logits(llm, prepared, anchor_x)
         del anchor_logits, anchor_x
         start_x = states[start].to(llm.device)
@@ -95,10 +96,11 @@ def interventions(llm, prepared, baseline, states, args, tokenizer, row, on_resu
                         # The capture bank contains all audio positions. Select
                         # only this group's columns in the SAME position order.
                         indices = torch.tensor([p - prepared.insertion for p in positions])
-                        bank = {layer: tuple(t.index_select(-2, indices) for t in pair)
+                        bank = {layer: tuple(t.index_select(-2, indices.to(t.device)) for t in pair)
                                 for layer, pair in capture.frozen.items()}
                         probe = stack.enter_context(AttentionProbe(llm, positions, mode="freeze",
-                                      frozen=bank, refresh_every=schedule["refresh_every"], anchor_step=anchor))
+                                      frozen=bank, refresh_every=schedule["refresh_every"], anchor_step=anchor,
+                                      cache_device=cache_device))
                         probes.append((group, probe))
                     del bank
                 first = forward_logits(llm, branch_prepared, start_x)
@@ -132,7 +134,8 @@ def interventions(llm, prepared, baseline, states, args, tokenizer, row, on_resu
             results.append(result)
             if on_result is not None:
                 on_result(result)
-            print(f"    done: same_tokens={result['same_final_tokens']}; score={result['score']}", flush=True)
+            print(f"    done in {result['diagnostic_elapsed_seconds']:.1f}s: "
+                  f"same_tokens={result['same_final_tokens']}; score={result['score']}", flush=True)
             del first, final, probes
         del reference, capture, start_x
     return results
@@ -202,6 +205,8 @@ def parser():
     p.add_argument("--steps", type=int, default=128)
     p.add_argument("--layers", default="all", help="all or comma-separated 0-based layers")
     p.add_argument("--reference-device", choices=["cpu", "cuda"], default="cpu")
+    p.add_argument("--cache-device", choices=["cpu", "model"], default="model",
+                   help="Intervention KV storage: model keeps it on the model's GPU; independent of drift references")
     p.add_argument("--token-metrics", action="store_true",
                    help="Also save compressed scalar metrics per position (larger outputs)")
     p.add_argument("--snapshot-steps", type=int, nargs="*", default=[])
@@ -221,11 +226,16 @@ def parser():
     p.add_argument("--verify-samples", type=int, default=1,
                    help="Compare instrumented decoding with the official unmodified decoder")
     p.add_argument("--seed", type=int, default=1729)
+    p.add_argument("--cpu-threads", type=int, default=4,
+                   help="Limit CPU tensor math threads to avoid oversubscribing small diagnostic operations")
     return p
 
 
 def main():
     args = parser().parse_args()
+    if args.cpu_threads < 1:
+        raise ValueError("cpu-threads must be positive")
+    torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
     estimate = work_estimate(args.steps, args.branch_fractions, specifications)
@@ -290,6 +300,7 @@ def main():
         if work.exists():
             shutil.rmtree(work)
         work.mkdir()
+        sample_began = time.perf_counter()
         print(f"[{index + 1}/{len(rows)}] {row['id']} ({row['task']})", flush=True)
         audio, duration = load_audio(row["audio"])
         prepared = prepare(model, tokenizer, extractor, audio, row["prompt"], args.length)
@@ -360,6 +371,8 @@ def main():
                 branch_file.flush()
             result["interventions"] = interventions(llm, prepared, final, states, args, tokenizer, row,
                                                      on_result=save_branch)
+        result["sample_wall_seconds"] = time.perf_counter() - sample_began
+        print(f"  sample complete in {result['sample_wall_seconds'] / 60:.1f} minutes", flush=True)
         write_json(work / "result.json", result)
         if destination.exists():
             raise ValueError(f"Unexpected existing incomplete destination: {destination}")

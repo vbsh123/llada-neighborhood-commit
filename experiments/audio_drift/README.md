@@ -320,25 +320,60 @@ the Python CLI. They can be large. Layer selection: `LAYERS=0,7,15,23,31`.
 
 Use `long-pilot` for the next study rather than repeating the 76-branch smoke
 matrix. It prepares **20 distinct clips from LibriSpeech clean/test**, with
-10 clips in `[10, 20)` seconds and 10 in `[20, 30]` seconds. Seeded streaming
-selection limits each speaker to at most two clips across both bins, hence at
+10 clips in `[10, 20)` seconds and 10 in `[20, 30]` seconds. Seeded selection
+limits each speaker to at most two clips across both bins, hence at
 least ten speakers. Bins are interleaved in the manifest, so `SAMPLES=10` also
 gives a balanced first subset. Selection is duration-based, not quality-based;
 the immutable dataset revision, durations, speaker IDs and quotas are saved.
 It fails explicitly if the source cannot fill the quotas.
 
+V4 uses `--reader local-parquet`: it downloads/caches **only** the selected
+`clean/test/*.parquet` shards (not training data), reads the split fully using
+`ParquetFile.iter_batches(use_threads=False)`, and closes all files before
+selection. This avoids the partially consumed HF/Arrow streaming-scanner
+shutdown hang/abort reported in https://github.com/apache/arrow/issues/45214.
+It does not change installed dependencies or suppress preparation failures.
+V4 shuffles the local split with Python's seeded RNG, so its selected IDs may
+change relative to V3's HF streaming shuffle. The new manifest name preserves
+V3 inputs. Progress logs show shard reads, scanned rows, and every selected clip.
+
+Intervention KVs now default to `CACHE_DEVICE=model`: snapshots and refreshes
+remain on the model's GPU. `REFERENCE_DEVICE` controls drift references
+separately. Group banks and anchor banks own independent storage; CUDA storage
+avoids the old per-layer GPU/CPU round trips and CPU snapshot cloning. This
+changes diagnostic overhead, not the caching policy or the fact that fresh
+representations are still computed. `CACHE_DEVICE=cpu` remains available.
+`CPU_THREADS=4` limits small CPU diagnostic operations to four threads by default.
+Branch and complete-sample elapsed times are printed in the log.
+
+First validate two clips (one per duration range) before a longer run:
+
 ```bash
 cd /workspace/llada-audio-drift
 git pull --ff-only
-nohup env RUN_NAME=audio_libri20_v3 SKIP_INSTALL=1 \
+nohup env RUN_NAME=audio_libri2_v4 SAMPLES=2 SKIP_INSTALL=1 \
   REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
   bash scripts/vast_audio_drift.sh long-pilot \
-  > audio_libri20_v3.log 2>&1 &
-tail -f audio_libri20_v3.log
+  > audio_libri2_v4.log 2>&1 &
+tail -f audio_libri2_v4.log
+```
+
+This prepares the full 20-clip manifest but runs only its first two clips.
+Use the actual timings to estimate the rest; no new duration is promised before
+that GPU check. The next command runs all 20 under a separate run name.
+
+```bash
+cd /workspace/llada-audio-drift
+git pull --ff-only
+nohup env RUN_NAME=audio_libri20_v4 SKIP_INSTALL=1 \
+  REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
+  bash scripts/vast_audio_drift.sh long-pilot \
+  > audio_libri20_v4.log 2>&1 &
+tail -f audio_libri20_v4.log
 ```
 
 Use a fresh run name when changing sample count or code. To run only the first
-ten examples, add `SAMPLES=10` and use `RUN_NAME=audio_libri10_v3`. No reinstall
+ten examples, add `SAMPLES=10` and use `RUN_NAME=audio_libri10_v4`. No reinstall
 or model weight download is needed if the previous audio environment/cache
 still exists. Creating the new manifest does download real test-set audio.
 
@@ -404,15 +439,15 @@ python - <<'PY'
 from pathlib import Path
 import zipfile
 root = Path('/workspace/llada-audio-drift')
-run = root / 'runs/audio_libri20_v3'
+run = root / 'runs/audio_libri20_v4'
 assert (run / 'summary.json').is_file(), 'No completed-sample summary found'
-out = Path('/workspace/audio_libri20_v3.zip')
+out = Path('/workspace/audio_libri20_v4.zip')
 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
     for p in run.rglob('*'):
         if p.is_file():
             z.write(p, p.relative_to(root))
-    for p in (root / 'audio_libri20_v3.log',
-              root / 'data/audio_drift/librispeech_duration20_v3.provenance.json'):
+    for p in (root / 'audio_libri20_v4.log',
+              root / 'data/audio_drift/librispeech_duration20_v4.provenance.json'):
         if p.is_file():
             z.write(p, p.relative_to(root))
 print(out, out.stat().st_size)

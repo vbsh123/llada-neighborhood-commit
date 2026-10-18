@@ -21,10 +21,14 @@ class AttentionProbe(AbstractContextManager):
     queries, including indirect audio-to-text paths in later layers.
     """
     def __init__(self, llm, audio_positions, recorder=None, layers=None,
-                 mode="observe", frozen=None, refresh_every=0, anchor_step=0):
+                 mode="observe", frozen=None, refresh_every=0, anchor_step=0, cache_device="cpu"):
         if mode not in {"observe", "capture", "freeze", "remove"}:
             raise ValueError(f"Unknown attention mode: {mode}")
         self.blocks = blocks_of(llm)
+        if cache_device not in {"cpu", "model"}:
+            raise ValueError("cache_device must be cpu or model")
+        self.cache_device = cache_device
+        self.device_positions = {}
         self.positions = torch.as_tensor(audio_positions, dtype=torch.long)
         if len(set(self.positions.tolist())) != len(self.positions) or (self.positions < 0).any():
             raise ValueError("Audio positions must be unique and nonnegative")
@@ -68,20 +72,25 @@ class AttentionProbe(AbstractContextManager):
                             self.cache_events.append({"step": self.forward_step,
                                 "refreshed": refresh,
                                 "cache_age": self.forward_step - self.last_refresh_step})
-                    positions = self.positions.to(k.device)
+                    if k.device not in self.device_positions:
+                        self.device_positions[k.device] = self.positions.to(k.device)
+                    positions = self.device_positions[k.device]
+                    def store(t):
+                        # index_select owns its storage; retaining it never aliases
+                        # live attention tensors or mutates an anchor bank.
+                        selected = t.index_select(-2, positions).detach()
+                        return selected.cpu() if self.cache_device == "cpu" else selected
                     if self.recorder is not None and _layer in self.layers:
                         # [1, heads, sequence, head_dim] -> [sequence, heads*head_dim]
                         for name, tensor in (("key", k), ("value", v)):
                             self.recorder.observe(_layer, name, tensor[0].transpose(0, 1).flatten(1))
                     if self.mode == "capture":
-                        self.frozen[_layer] = tuple(t.index_select(-2, positions).detach().cpu().clone()
-                                                    for t in (k, v))
+                        self.frozen[_layer] = tuple(store(t) for t in (k, v))
                     elif self.mode == "freeze":
                         if self.cache_events[-1]["refreshed"]:
                             # Refresh from THIS branch's current state, never
                             # from an oracle baseline future representation.
-                            self.frozen[_layer] = tuple(t.index_select(-2, positions).detach().cpu().clone()
-                                                        for t in (k, v))
+                            self.frozen[_layer] = tuple(store(t) for t in (k, v))
                         else:
                             old_k, old_v = self.frozen[_layer]
                             k, v = k.clone(), v.clone()

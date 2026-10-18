@@ -5,6 +5,35 @@ from itertools import zip_longest
 import json
 import math
 from pathlib import Path
+import random
+
+
+def local_parquet_rows(repo, config, split, revision, api):
+    """Read only local split shards, without an abandoned Arrow Dataset scanner.
+
+    HF datasets/Arrow partially consumed streaming scanners can hang or abort
+    at interpreter finalization: https://github.com/apache/arrow/issues/45214.
+    This path downloads only the requested split, reads it completely using
+    ParquetFile, and closes each file before selection starts.
+    """
+    from huggingface_hub import hf_hub_download
+    import pyarrow.parquet as pq
+
+    prefix = f"{config}/{split}/"
+    files = sorted(p for p in api.list_repo_files(repo, repo_type="dataset", revision=revision)
+                   if p.startswith(prefix) and p.endswith(".parquet"))
+    if not files:
+        raise ValueError(f"No Parquet shards under {repo}/{prefix}; use the datasets reader for other layouts")
+    rows = []
+    for name in files:
+        print(f"Downloading/caching split shard: {name}", flush=True)
+        local = hf_hub_download(repo_id=repo, filename=name, repo_type="dataset", revision=revision)
+        with open(local, "rb") as source:
+            with pq.ParquetFile(source) as parquet:
+                for batch in parquet.iter_batches(batch_size=32, use_threads=False):
+                    rows.extend(batch.to_pylist())
+        print(f"Read {len(rows)} split rows; shard closed", flush=True)
+    return rows, files
 
 
 def main():
@@ -16,6 +45,7 @@ def main():
     p.add_argument("--split", default="validation")
     p.add_argument("--revision", default="main")
     p.add_argument("--streaming", action="store_true")
+    p.add_argument("--reader", choices=["datasets", "local-parquet"], default="datasets")
     p.add_argument("--shuffle-seed", type=int)
     p.add_argument("--shuffle-buffer", type=int, default=1000)
     p.add_argument("--max-per-speaker", type=int, default=0,
@@ -41,17 +71,27 @@ def main():
         raise ValueError("Duration bins must be disjoint and their counts must sum to --samples")
     if args.out.exists():
         raise ValueError("Use a fresh manifest path; existing inputs are never overwritten")
-    from datasets import Audio, load_dataset
+    if args.reader == "local-parquet" and args.streaming:
+        raise ValueError("local-parquet downloads only split shards and cannot be combined with --streaming")
     from huggingface_hub import HfApi
     import soundfile as sf
 
-    revision = HfApi().dataset_info(args.dataset, revision=args.revision).sha
-    dataset = load_dataset(args.dataset, args.config, split=args.split, revision=revision,
-                           streaming=args.streaming)
-    dataset = dataset.cast_column("audio", Audio(decode=False))
-    if args.shuffle_seed is not None:
-        options = {"buffer_size": args.shuffle_buffer} if args.streaming else {}
-        dataset = dataset.shuffle(seed=args.shuffle_seed, **options)
+    api = HfApi()
+    print(f"Resolving {args.dataset} / {args.config} / {args.split}", flush=True)
+    revision = api.dataset_info(args.dataset, revision=args.revision).sha
+    source_files = []
+    if args.reader == "local-parquet":
+        dataset, source_files = local_parquet_rows(args.dataset, args.config, args.split, revision, api)
+        if args.shuffle_seed is not None:
+            random.Random(args.shuffle_seed).shuffle(dataset)
+    else:
+        from datasets import Audio, load_dataset
+        dataset = load_dataset(args.dataset, args.config, split=args.split, revision=revision,
+                               streaming=args.streaming)
+        dataset = dataset.cast_column("audio", Audio(decode=False))
+        if args.shuffle_seed is not None:
+            options = {"buffer_size": args.shuffle_buffer} if args.streaming else {}
+            dataset = dataset.shuffle(seed=args.shuffle_seed, **options)
     if not args.streaming and args.samples > len(dataset):
         raise ValueError(f"Requested {args.samples} examples; dataset has {len(dataset)}")
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -60,7 +100,9 @@ def main():
     rows = []
     speaker_counts = {}
     skipped_duration = 0
-    for row in dataset:
+    for scanned, row in enumerate(dataset, 1):
+        if scanned == 1 or scanned % 100 == 0:
+            print(f"Scanned {scanned} rows; selected {len(rows)}/{args.samples}", flush=True)
         speaker = str(row.get("speaker_id", "unknown"))
         if args.max_per_speaker and speaker == "unknown":
             raise ValueError("Speaker cap requested, but the dataset has no speaker_id")
@@ -95,6 +137,8 @@ def main():
         if duration_bin:
             duration_bin["selected"] += 1
         speaker_counts[speaker] = speaker_counts.get(speaker, 0) + 1
+        print(f"Selected {len(rows)}/{args.samples}: {rows[-1]['id']} ({duration:.2f}s); "
+              f"quotas={[(b['selected'], b['requested']) for b in bins]}", flush=True)
         if len(rows) == args.samples:
             break
     if len(rows) != args.samples:
@@ -105,10 +149,13 @@ def main():
         buckets = [[r for r in rows if r["duration_bin"] == f"{b['min_seconds']:g}-{b['max_seconds']:g}"]
                    for b in bins]
         rows = [r for group in zip_longest(*buckets) for r in group if r is not None]
-    args.out.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    temporary = args.out.with_suffix(args.out.suffix + ".tmp")
+    temporary.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    temporary.replace(args.out)
     args.out.with_suffix(".provenance.json").write_text(json.dumps({
         "dataset": args.dataset, "config": args.config, "split": args.split,
         "revision": revision, "selection": "first eligible per quota after optional seeded shuffle; bins interleaved",
+        "reader": args.reader, "source_files": source_files,
         "streaming": args.streaming, "shuffle_seed": args.shuffle_seed,
         "shuffle_buffer": args.shuffle_buffer if args.streaming else None,
         "max_per_speaker": args.max_per_speaker, "speaker_counts": speaker_counts,

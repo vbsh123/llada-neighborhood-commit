@@ -36,10 +36,10 @@ export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 experiment_name="${RUN_NAME:-audio_drift_${mode}_$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ "$experiment_name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid RUN_NAME'; exit 2; }
 if [[ "$mode" == long-pilot ]]; then
-  manifest="${MANIFEST:-$PWD/data/audio_drift/librispeech_duration20_v3.jsonl}"
+  manifest="${MANIFEST:-$PWD/data/audio_drift/librispeech_duration20_v4.jsonl}"
   if [[ ! -f "$manifest" && -z "${MANIFEST:-}" ]]; then
     python -m experiments.audio_drift.prepare --out "$manifest" --samples 20 \
-      --dataset openslr/librispeech_asr --config clean --split test --streaming \
+      --dataset openslr/librispeech_asr --config clean --split test --reader local-parquet \
       --shuffle-seed "${SEED:-1729}" --max-per-speaker 2 \
       --min-seconds 10 --max-seconds 30 --duration-bins 10:20:10 20:30:10
   fi
@@ -89,6 +89,8 @@ python -u -m experiments.audio_drift.run \
   --diffa-root "$diffa_checkout" --manifest "$manifest" --out "runs/$experiment_name" \
   --samples "$count" --length "$length" --block-length "$block" --steps "${STEPS:-$default_steps}" \
   --layers "${LAYERS:-$default_layers}" --reference-device "${REFERENCE_DEVICE:-cpu}" \
+  --cache-device "${CACHE_DEVICE:-model}" \
+  --cpu-threads "${CPU_THREADS:-4}" \
   --verify-samples "${VERIFY_SAMPLES:-1}" --seed "${SEED:-1729}" \
   --progress-every "${PROGRESS_EVERY:-8}" --branch-fractions "${branch_fractions[@]}" "${extra[@]}"
 python -m experiments.audio_drift.analyze --run "runs/$experiment_name"
