@@ -57,7 +57,7 @@ class DriftRecorder:
     CPU by default. Only scalar per-position metrics are persisted to NPZ.
     """
     def __init__(self, output, labels, mask_id, reference_device="cpu",
-                 per_token=False, snapshot_steps=(), snapshot_layers=()):
+                 per_token=False, snapshot_steps=(), snapshot_layers=(), pairwise=None):
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=True)
         self.labels = list(labels)
@@ -66,6 +66,7 @@ class DriftRecorder:
         self.per_token = per_token
         self.snapshot_steps = set(snapshot_steps)
         self.snapshot_layers = set(snapshot_layers)
+        self.pairwise = pairwise
         self.banks = {name: {} for name in ("previous", "initial", "block_start")}
         self.stream = (self.output / "drift.jsonl").open("w")
         self.seen = set()
@@ -88,6 +89,8 @@ class DriftRecorder:
         if key in self.seen:
             raise ValueError(f"Layer observed twice in one forward: {key}")
         self.seen.add(key)
+        if self.pairwise is not None:
+            self.pairwise.observe(layer, kind, value, self.metadata)
         stored = value.detach().to(self.reference_device).clone()
         now = self.metadata["step"]
         for reference_name, bank in self.banks.items():
@@ -134,10 +137,14 @@ class DriftRecorder:
             torch.save({"metadata": self.metadata, "ids": self.ids, "labels": self.labels,
                         "tensors": self.snapshots}, path / f"{step:04d}.pt")
         self.stream.flush()
+        if self.pairwise is not None:
+            self.pairwise.flush()
         self.arrays.clear()
         self.snapshots.clear()
 
     def close(self):
         self.stream.close()
+        if self.pairwise is not None:
+            self.pairwise.close()
         for bank in self.banks.values():
             bank.clear()

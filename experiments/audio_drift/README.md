@@ -550,6 +550,71 @@ smaller than the diagnostic subset. The ordinary baseline profile previously
 showed mostly feed-forward/projection work, so skipping those token rows is
 necessary to test practical savings rather than only replacing their KVs.
 
+## Cosine drift and step-pair similarity figures (v6)
+
+`cosine-pilot` collects **baseline only** on the same two clips. It does not
+rerun caching policies or benchmarks. Scalar hidden/K/V drift is recorded at
+all 32 block-output layers. Additionally, it computes full step-pair hidden
+cosine matrices for the first 64 forwards at layers 7,15,23,31, separately for
+acoustic, semantic and fixed prompt tokens:
+
+```bash
+cd /workspace/llada-audio-drift
+git pull --ff-only
+nohup env RUN_NAME=audio_cosine2_v6 SAMPLES=2 SKIP_INSTALL=1 \
+  REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
+  bash scripts/vast_audio_drift.sh cosine-pilot \
+  > audio_cosine2_v6.log 2>&1 &
+tail -f audio_cosine2_v6.log
+```
+
+This reproduces the *type* of VidLaDA Figures 4–5, not a claim that our dataset,
+model, token pooling and layer aggregation are identical to theirs. Figure 4's
+exact pooling/aggregation protocol is not established from its caption.
+Our explicit definition is **mean cosine at corresponding token positions**,
+then equal weighting of selected layers for aggregate plots. Cosine of a mean
+embedding would be a different metric and is not substituted. Averages of
+per-token medians in earlier relative-L2 summaries are also a different
+statistic: do not compare them numerically to these mean cosine values.
+
+`PAIRWISE_COUNT=64`, `PAIRWISE_STRIDE=1`, `PAIRWISE_LAYERS=7,15,23,31`, and
+`PAIRWISE_DEVICE=cuda` are configurable. With 128 decoding forwards the default
+pairwise matrices cover forward indices 0–63, not 64 evenly spaced points.
+`PAIRWISE_COUNT=128` covers all pairs over all 128 forwards. Pairwise layers must
+be included in the observed `LAYERS` selection. `PAIRWISE_LAYERS=all` retains
+all observed layers and substantially increases memory. For the current
+28-second clip, four layers and 64 snapshots require about **1.95 GB extra**
+on the chosen device; full 32-layer pairwise retention is about eight times
+that. The memory estimate is printed before collection.
+
+Only selected fixed-prefix hidden vectors are normalized and retained **in
+memory**, in FP32. Matmul TF32 is disabled by the runner. Previously observed
+normalized vectors are dotted with each new snapshot, yielding exact token-mean
+cosine for our definition, subject to FP32 rounding. Both-zero tokens have
+similarity one. Vectors are released once the last selected step is processed.
+They are never written to disk. `pairwise_cosine.jsonl` is flushed every forward
+for partial inspection; `pairwise_cosine.json` holds scalar symmetric matrices,
+selected steps/layers and a completeness flag. No answer representations enter
+these matrices. No similarity between unmeasured steps is inferred from existing
+scalar summaries.
+
+The offline command also works on existing V4/V5 downloads:
+
+```bash
+python -m experiments.audio_drift.paper_plots --run runs/audio_controls2_v5
+```
+
+Existing runs can produce mean cosine-distance layer heatmaps and similarity
+curves against forward zero; they cannot recover missing all-pairs values.
+New runs additionally produce three-group similarity matrices on a shared
+color scale, plus fixed `[0.8, 1]` versions matching the published plot range.
+Individual layer matrices and numeric aggregate values remain available.
+Output is `analysis/cosine/`. Both full and active-answer-cropped figures are
+written. Completion refers to the **baseline's predicted** content, so truncated
+baselines remain visible as quality failures. Post-answer regions are marked;
+small drift after answer completion does not establish early cacheability.
+Layer zero is our first transformer block output, not the input embedding.
+
 ## Validation
 
 Without optional GPU packages, pure manifest/scoring tests run and tensor

@@ -90,6 +90,31 @@ class InputTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TORCH, "Optional CPU torch dependency is absent")
 class MetricTests(unittest.TestCase):
+    def test_pairwise_cosine_matches_token_mean_and_handles_zero_vectors(self):
+        from experiments.audio_drift.pairwise import PairwiseRecorder
+        labels = ["prompt", "audio_acoustic", "audio_semantic", "prompt"]
+        values = [torch.tensor([[1., 0.], [0., 0.], [1., 1.], [0., 1.]]),
+                  torch.tensor([[0., 1.], [1., 0.], [1., 0.], [0., 1.]]),
+                  torch.tensor([[-1., 0.], [0., 0.], [0., 1.], [1., 0.]])]
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = PairwiseRecorder(directory, labels, [0, 1, 2], [0], "cpu")
+            for step, value in enumerate(values):
+                recorder.observe(0, "key", value, {"step": step})  # ignored
+                recorder.observe(0, "hidden", value, {"step": step})
+            self.assertFalse(recorder.history)  # vectors released after last selected step
+            recorder.close()
+            data = json.loads((Path(directory) / "pairwise_cosine.json").read_text())
+            self.assertTrue(data["complete"])
+            matrices = {r["group"]: np.array(r["cosine_similarity"]) for r in data["records"]}
+            self.assertAlmostEqual(matrices["prompt"][0, 1], .5, places=6)
+            self.assertAlmostEqual(matrices["prompt"][0, 2], -.5, places=6)
+            self.assertEqual(matrices["audio_acoustic"][0, 1], 0.)
+            self.assertEqual(matrices["audio_acoustic"][0, 2], 1.)
+            for matrix in matrices.values():
+                np.testing.assert_allclose(matrix, matrix.T, rtol=0, atol=0)
+                np.testing.assert_allclose(np.diag(matrix), 1.)
+            self.assertNotIn("tensors", data)
+
     def test_local_parquet_reader_reads_only_selected_split_and_closes_files(self):
         from experiments.audio_drift.prepare import local_parquet_rows
         from types import SimpleNamespace
@@ -287,6 +312,25 @@ class UpstreamTests(unittest.TestCase):
         self.llm.model.transformer.ff_out = output
         self.prepared = Prepared(torch.tensor([[1, 2, 3]]),
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_pairwise_collection_preserves_baseline_and_writes_selected_layers(self):
+        from experiments.audio_drift.pairwise import PairwiseRecorder
+        baseline, _, _ = decode(self.llm, self.prepared, 4, 2, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            labels = self.prepared.labels(4)
+            pairwise = PairwiseRecorder(directory, labels, [0, 2], [0, 1], "cpu")
+            recorder = DriftRecorder(directory, labels, 31, pairwise=pairwise)
+            try:
+                with AttentionProbe(self.llm, self.prepared.audio_positions, recorder):
+                    measured, _, _ = decode(self.llm, self.prepared, 4, 2, 4, recorder, [0, 1])
+            finally:
+                recorder.close()
+            torch.testing.assert_close(baseline, measured, rtol=0, atol=0)
+            data = json.loads((Path(directory) / "pairwise_cosine.json").read_text())
+            self.assertEqual(len(data["records"]), 6)
+            self.assertEqual(data["steps"], [0, 2])
+            self.assertTrue(data["complete"])
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_compact_matches_dense_kv_reuse_and_skips_projection_rows(self):

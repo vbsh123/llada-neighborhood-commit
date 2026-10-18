@@ -249,6 +249,11 @@ def parser():
     p.add_argument("--seed", type=int, default=1729)
     p.add_argument("--cpu-threads", type=int, default=4,
                    help="Limit CPU tensor math threads to avoid oversubscribing small diagnostic operations")
+    p.add_argument("--pairwise-count", type=int, default=0,
+                   help="Collect all-pairs cosine on this many baseline hidden-state snapshots; 0 disables")
+    p.add_argument("--pairwise-stride", type=int, default=1)
+    p.add_argument("--pairwise-layers", default="7,15,23,31")
+    p.add_argument("--pairwise-device", choices=["cpu", "cuda"], default="cuda")
     return p
 
 
@@ -256,6 +261,8 @@ def main():
     args = parser().parse_args()
     if args.cpu_threads < 1:
         raise ValueError("cpu-threads must be positive")
+    if args.pairwise_count < 0 or args.pairwise_stride < 1:
+        raise ValueError("Invalid pairwise count/stride")
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
@@ -309,6 +316,9 @@ def main():
         raise ValueError("Invalid layer selection")
     if not set(args.snapshot_layers) <= set(layers) or any(s < 0 or s >= args.steps for s in args.snapshot_steps):
         raise ValueError("Snapshots must select observed layers and valid steps")
+    pairwise_layers = layers if args.pairwise_layers == "all" else sorted(set(map(int, args.pairwise_layers.split(","))))
+    if args.pairwise_count and not set(pairwise_layers) <= set(layers):
+        raise ValueError("Pairwise layers must also be selected for baseline observation")
     (args.out / "samples").mkdir(exist_ok=True)
     write_json(args.out / "device.json", {"name": torch.cuda.get_device_name(),
                "vram_bytes": torch.cuda.get_device_properties(0).total_memory})
@@ -331,9 +341,18 @@ def main():
         prepared = prepare(model, tokenizer, extractor, audio, row["prompt"], args.length)
         torch.cuda.synchronize()
         preparation_seconds = time.perf_counter() - preparation_began
+        pairwise = None
+        if args.pairwise_count:
+            from .pairwise import PairwiseRecorder
+            pair_steps = list(range(0, args.steps, args.pairwise_stride))[:args.pairwise_count]
+            pairwise = PairwiseRecorder(work, prepared.labels(args.length), pair_steps, pairwise_layers,
+                                        args.pairwise_device)
+            estimated = len(pair_steps) * len(pairwise_layers) * prepared.answer_start * llm.config.d_model * 4
+            print(f"  pairwise: {len(pair_steps)} snapshots, layers={pairwise_layers}; "
+                  f"normalized-vector memory about {estimated / 1e9:.2f} GB on {args.pairwise_device}", flush=True)
         recorder = DriftRecorder(work, prepared.labels(args.length), prepared.mask_id,
                                  args.reference_device, args.token_metrics,
-                                 args.snapshot_steps, args.snapshot_layers)
+                                 args.snapshot_steps, args.snapshot_layers, pairwise=pairwise)
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         began = time.perf_counter()
