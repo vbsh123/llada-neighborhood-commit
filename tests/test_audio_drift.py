@@ -93,6 +93,14 @@ class InputTests(unittest.TestCase):
         self.assertEqual(item["parse_failures"], 1)
         self.assertEqual(item["decode_speedup_ratio_of_sums"], 2)
         self.assertEqual(item["same_forward_count_samples"], 3)
+        paired = result(0, "#### Answer: 18", "#### 18")
+        paired["fixed_input_replay"] = {"forwards": 2, "baseline_median_seconds": 3,
+                                      "policies": [{"condition": "test", "median_seconds": 2}]}
+        rows, summary = summarize([paired])
+        self.assertFalse(rows[0]["baseline_strict_correct"])
+        self.assertTrue(rows[0]["baseline_correct"])
+        self.assertEqual(summary['test']['fixed_input_replay']['forward_speedup_ratio_of_sums'], 1.5)
+        self.assertEqual(summary['test']['fixed_input_replay']['forwards_total'], 2)
 
     @unittest.skipUnless(HAS_TORCH, "audio dependencies unavailable")
     def test_spoken_math_preparation_from_local_parquet(self):
@@ -123,6 +131,38 @@ class InputTests(unittest.TestCase):
             provenance = json.loads(manifest.with_suffix('.provenance.json').read_text())
             self.assertEqual(provenance['scanned'], 5)
             self.assertEqual(provenance['eligible'], 5)
+
+    def test_numeric_labels_preserve_strict_audit(self):
+        for text in ["#### Answer: 2", "#### <final numerical answer> 2"]:
+            value = score(text, "2", "numeric")
+            self.assertTrue(value["correct"])
+            self.assertTrue(value["format_normalized"])
+            self.assertFalse(value["strict_correct"])
+            self.assertIsNone(value["strict_prediction"])
+        for text in ["#### Answer: 2 or 6", "#### <final numerical answer> 2 apples",
+                     "Answer: 2", "Intermediate answer 2"]:
+            self.assertTrue(score(text, "2", "numeric")["parse_failed"])
+        value = score("#### 6", "2", "numeric")
+        self.assertFalse(value["correct"])
+        self.assertFalse(value["format_normalized"])
+
+    def test_acoustic_sweep_matrix(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.run import intervention_specs
+        args = SimpleNamespace(interventions=["freeze"], freeze_groups=["prefix"],
+                               refresh_intervals=[1, 8, 16], triple_refresh=["16:8:8", "32:8:8", "0:8:8", "16:8:16"],
+                               condition_names=["freeze_prefix_r1", "freeze_prefix_r8", "freeze_prefix_r16",
+                               "freeze_triple_a16_p8_s8", "freeze_triple_a32_p8_s8",
+                               "freeze_triple_a0_p8_s8", "freeze_triple_a16_p8_s16"])
+        specs = intervention_specs(args)
+        self.assertEqual(len(specs), 7)
+        permanent = next(s for s in specs if s["condition"] == "freeze_triple_a0_p8_s8")
+        self.assertEqual(permanent["schedule"][0], {"group": "acoustic", "refresh_every": 0})
+        from experiments.audio_drift.decode import schedule
+        plan = schedule(512, 32, 256)
+        self.assertEqual(len(plan), 256)
+        self.assertEqual(sum(c for _, _, c in plan), 512)
+        self.assertTrue(all(c == 2 for _, _, c in plan))
 
     def test_long_pilot_selects_only_named_conditions(self):
         from types import SimpleNamespace
@@ -531,6 +571,43 @@ class UpstreamTests(unittest.TestCase):
             self.assertTrue(identity["same_visible_tokens"])
             self.assertEqual(identity["accounting"][0]["skipped_token_update_fraction"], 0)
             self.assertTrue((Path(directory) / "cache_benchmark.json").is_file())
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_fixed_input_replay_keeps_inputs_and_forward_counts_equal(self):
+        from experiments.audio_drift.replay import benchmark_replay
+        from experiments.audio_drift.decode import forward_logits
+        from types import SimpleNamespace
+        self.llm.float()
+        _, states, _ = decode(self.llm, self.prepared, 4, 2, 4)
+        original = [s.clone() for s in states]
+        args = SimpleNamespace(interventions=["freeze"], freeze_groups=["prefix"],
+                               refresh_intervals=[1, 8], mixed_refresh=[], triple_refresh=["0:8:8"],
+                               condition_names=["freeze_prefix_r1", "freeze_prefix_r8", "freeze_triple_a0_p8_s8"],
+                               benchmark_conditions=[], replay_steps=3, replay_repeats=2)
+        seen = []
+        def observe(llm, prepared, x):
+            seen.append(x.clone())
+            return forward_logits(llm, prepared, x)
+        with tempfile.TemporaryDirectory() as directory, patch.object(torch.cuda, "synchronize"), \
+                patch.object(torch.cuda, "reset_peak_memory_stats"), \
+                patch.object(torch.cuda, "max_memory_allocated", return_value=0), \
+                patch("experiments.audio_drift.replay.forward_logits", side_effect=observe):
+            report = benchmark_replay(self.llm, self.prepared, states, 2, args, Path(directory))
+            self.assertEqual(report['forwards'], 2)  # cap at baseline EOS, not requested three
+            self.assertEqual(len(report['policies']), 3)
+            self.assertEqual(report['step_indices'], [0, 1])
+            self.assertTrue(report['policies'][0]['identity_last_step_top1_match'])
+            self.assertEqual(len(seen), (3 + 3*3)*2)
+            for i, x in enumerate(seen):
+                torch.testing.assert_close(x, original[i % 2], rtol=0, atol=0)
+            for p in report['policies']:
+                self.assertGreater(p['forward_replay_speedup'], 0)
+                self.assertTrue(all(c['forwards'] == 2 for c in p['accounting']))
+            self.assertTrue((Path(directory)/'fixed_input_replay.json').is_file())
+        for x,y in zip(states,original):
+            torch.testing.assert_close(x,y,rtol=0,atol=0)
+        with self.assertRaises(ValueError):
+            benchmark_replay(self.llm, self.prepared, [], 0, args, Path('/tmp'))
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_profiler_scopes_preserve_outputs_and_restore_on_exception(self):

@@ -58,6 +58,7 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
     report = {"stopping": args.benchmark_stopping, "timed_repeats_per_policy": args.benchmark_repeats,
               "shared_audio_preparation_seconds": preparation_seconds,
               "baseline_seconds": [before], "baseline_forwards": base_count["forwards"],
+              "baseline_visible_answer_tokens": len(expected) - int(tokenizer.eos_token_id in expected),
               "policies": [], "note": "Warmed, synchronized batch-one wall time including cache initialization, "
               "refreshes, gathers/scatters, ordinary decoder bookkeeping and full vocabulary head. "
               "Model loading, disk I/O, audio preparation, drift collection and task scoring are excluded. "
@@ -87,6 +88,7 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
                   "text": text, "visible_answer_ids": outputs[0], "same_visible_tokens": outputs[0] == expected,
                   "score": score(text, row.get("target"), row.get("metric", "none")),
                   "answer_has_no_eos": tokenizer.eos_token_id not in outputs[0],
+                  "visible_answer_tokens": len(outputs[0]) - int(tokenizer.eos_token_id in outputs[0]),
                   "selected_positions": {s["group"]: prepared.group_positions(s["group"]) for s in spec["schedule"]}}
         paired = next((b for b in diagnostics if b["condition"] == spec["condition"] and b["anchor_step"] == 0), None)
         if paired:

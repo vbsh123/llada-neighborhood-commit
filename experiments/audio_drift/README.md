@@ -6,6 +6,85 @@ The default checkpoint is **DIFFA-2**, with its original semantic/acoustic
 connectors, Whisper-large-v3, and LLaDA-8B-Instruct. This experiment does not
 change the existing neighborhood, sleep, or translation experiments.
 
+## Push audio refresh intervals beyond text (v8)
+
+The next controlled sweep reuses the existing 10-row GSM8K Speech manifest and
+its audio files. It is a development experiment, not fresh held-out validation.
+All baseline and cache outputs are regenerated at the new capacity.
+
+```bash
+cd /workspace/llada-audio-drift
+git pull --ff-only
+nohup env \
+  RUN_NAME=audio_gsm_sweep10_v8 \
+  SAMPLES=10 \
+  SKIP_INSTALL=1 \
+  REFERENCE_DEVICE=cuda \
+  VERIFY_SAMPLES=2 \
+  bash scripts/vast_audio_drift.sh gsm-sweep \
+  > audio_gsm_sweep10_v8.log 2>&1 &
+tail -f audio_gsm_sweep10_v8.log
+```
+
+| Policy | Acoustic interval | Prompt interval | Semantic interval |
+|---|---:|---:|---:|
+| Identity control | 1 | 1 | 1 |
+| Shared prefix | 8 | 8 | 8 |
+| Shared prefix, more aggressive | 16 | 16 | 16 |
+| Acoustic slower | 16 | 8 | 8 |
+| Acoustic slower | 32 | 8 | 8 |
+| Acoustic permanent reuse after first forward | 0 | 8 | 8 |
+| All audio slower | 16 | 8 | 16 |
+
+Zero means initialize on the first forward and never refresh that group. Every
+answer row still updates. Compare the audio-specific schedules against both
+shared-prefix controls at measured latency and task accuracy.
+
+**Answer capacity:** `LENGTH=512`, `BLOCK_LENGTH=32`, `STEPS=256` by default,
+versus 256/32/128 in v7. Both schedules commit two token positions per forward;
+the new budget permits up to 16 blocks. Autonomous benchmark decoding stops when
+EOS is revealed and preceding masks are filled. The instrumented baseline and
+its official verification still run the full fixed budget. Larger capacity adds
+masked rows to each forward and can change diffusion outputs; compare policies
+against the new baseline, not directly against v7 scores/timings. Longer capacity
+reduces budget exhaustion risk but does not guarantee EOS or correct answers.
+Missing EOS and visible answer-token counts are recorded.
+
+**Two performance measurements:** every example gets ordinary EOS-stopped
+baseline/policy decoding, including the actual generated explanation and final
+answer. The first two examples also get a separate `fixed_input_replay.json`:
+all seven policies receive the *same* preloaded baseline token states, in order,
+for `min(64, baseline EOS-stopped forwards)` forwards. Every timed pass starts
+with an empty cache. One warmup and two timed repeats per policy are bracketed
+by baseline timings. Replay calls the same full-vocabulary forward path but does
+not commit predictions or use the policy's generated answer length. Input device
+transfers, drift hooks and task scoring are outside replay timing. Replay is a
+forward-path timing measurement, **not** an autonomous generation or accuracy
+measurement; its predicted tokens are never used in the scored decodes.
+The identity's final replay-step top-1 predictions must match baseline; the
+small upstream CPU test also checks identical input ordering and immutability.
+
+`analysis/reasoning_report.md` and `reasoning_summary.json` show both speedup
+types separately. The CSV records visible answer lengths, forward counts,
+strict/normalized score outcomes and replay timing pairs. Override
+`REPLAY_SAMPLES=0` to disable replay, or `REPLAY_STEPS`/`REPLAY_REPEATS` to adjust
+its budget. A single-example run should also set `REPLAY_SAMPLES=1`.
+
+**Scorer correction:** `numeric-labels-v2` accepts the literal `Answer:` and
+`<final numerical answer>` labels after an explicit final marker, then applies
+the same exact numeric comparison. This handles the two formats seen in v7;
+it does not extract arbitrary numbers from reasoning. `strict_prediction`,
+`strict_correct`, and `format_normalized` preserve visibility into the old strict
+rule. Old downloaded results and runs are not overwritten.
+
+All 10 examples run seven cache policies with one warmup and two timed repeats.
+Only the first two have the extra equal-input replay. No dense intervention
+branches, pairwise vector collection or layer-specific refresh schedules are
+added. GPU runtime for this larger-capacity preset is not yet measured; use the
+first replay-free sample (example 3) for steady-state runtime estimates. This
+sweep should establish whether longer audio reuse helps before adding depth
+schedules. New run names are required after source/settings changes.
+
 ## Spoken GSM8K refresh pilot (v7)
 
 Uses `mistralai/gsm8k_speech`, synthetic spoken GSM8K test questions with final

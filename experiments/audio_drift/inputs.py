@@ -64,12 +64,14 @@ def canonical_number(value):
     return "0" if number == 0 else result
 
 
-def final_number(text):
+def final_number(text, normalize_labels=True):
     # An explicit final marker wins; malformed marked answers fail rather than
     # falling back to an earlier intermediate calculation. Never take last number
     # from arbitrary reasoning, where it may be an operand rather than an answer.
     markers = list(re.finditer(r"####|final\s+answer\s*:", text, re.I))
     answer = text[markers[-1].end():].strip() if markers else text.strip()
+    if markers and normalize_labels:
+        answer = re.sub(r"^(?:<final numerical answer>\s*|answer\s*:\s*)", "", answer, flags=re.I)
     answer = answer.rstrip(".").strip()
     return canonical_number(answer)
 
@@ -82,7 +84,10 @@ def score(text, target, metric):
         if reference is None:
             raise ValueError("Numeric targets must be a finite numeric scalar")
         prediction = final_number(text)
+        strict = final_number(text, normalize_labels=False)
         return {"metric": metric, "prediction": prediction, "reference": reference,
+                "scoring_version": "numeric-labels-v2", "strict_prediction": strict,
+                "strict_correct": strict == reference, "format_normalized": prediction != strict,
                 "parse_failed": prediction is None, "correct": prediction == reference}
     if metric == "exact":
         return {"metric": metric, "correct": normalized(text) == normalized(target)}

@@ -250,6 +250,11 @@ def parser():
     p.add_argument("--benchmark-samples", type=int, default=0)
     p.add_argument("--benchmark-repeats", type=int, default=2)
     p.add_argument("--benchmark-conditions", nargs="*", default=[])
+    p.add_argument("--replay-samples", type=int, default=0,
+                   help="Also time identical baseline input states on this many first benchmark samples")
+    p.add_argument("--replay-steps", type=int, default=64,
+                   help="Replay this many initial forwards, capped at baseline EOS stopping")
+    p.add_argument("--replay-repeats", type=int, default=2)
     p.add_argument("--benchmark-stopping", choices=["eos", "fixed"], default="eos")
     p.add_argument("--branch-fractions", type=float, nargs="+", default=[0., .25, .5, .75])
     p.add_argument("--verify-samples", type=int, default=1,
@@ -276,6 +281,11 @@ def main():
     specifications = intervention_specs(args)
     if args.benchmark_samples and set(args.benchmark_conditions) - {s["condition"] for s in specifications if s["mode"] == "freeze"}:
         raise ValueError("Benchmark conditions must select generated freeze conditions")
+    if (not 0 <= args.replay_samples <= args.benchmark_samples or args.replay_steps < 1
+            or args.replay_repeats < 1):
+        raise ValueError("Invalid replay settings; replay samples must be benchmark samples")
+    if args.replay_samples and args.benchmark_stopping != "eos":
+        raise ValueError("Replay requires EOS benchmarks so post-answer steps can be excluded")
     if args.skip_dense_interventions and not args.benchmark_samples:
         raise ValueError("--skip-dense-interventions requires --benchmark-samples > 0")
     estimate = work_estimate(args.steps, args.branch_fractions,
@@ -440,6 +450,10 @@ def main():
             from .benchmark import benchmark
             result["benchmark"] = benchmark(llm, prepared, final, args, tokenizer, row, work,
                                              result["interventions"], preparation_seconds)
+        if index < args.replay_samples:
+            from .replay import benchmark_replay
+            result["fixed_input_replay"] = benchmark_replay(
+                llm, prepared, states, result["benchmark"]["baseline_forwards"], args, work)
         result["sample_wall_seconds"] = time.perf_counter() - sample_began
         print(f"  sample complete in {result['sample_wall_seconds'] / 60:.1f} minutes", flush=True)
         write_json(work / "result.json", result)
