@@ -289,6 +289,101 @@ class UpstreamTests(unittest.TestCase):
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_compact_matches_dense_kv_reuse_and_skips_projection_rows(self):
+        from contextlib import ExitStack
+        from experiments.audio_drift.compact import PrefixCache
+        from experiments.audio_drift.decode import forward_logits
+        self.llm.float()
+        inputs = [torch.tensor([[1, 2, 3, 31, 31, 31, 31]]),
+                  torch.tensor([[1, 2, 3, 4, 31, 31, 31]]),
+                  torch.tensor([[1, 2, 3, 4, 5, 31, 31]]),
+                  torch.tensor([[1, 2, 3, 4, 5, 6, 31]]),
+                  torch.tensor([[1, 2, 3, 4, 5, 6, 7]])]
+        self.assertEqual(self.prepared.group_positions("prompt"), [0, 3, 4])
+        self.assertEqual(self.prepared.group_positions("audio_matched"), [1, 2])
+        schedules = [[{"group": g, "refresh_every": r}] for g in
+                     ["prompt", "both", "prefix", "audio_matched"] for r in [0, 1, 4]]
+        schedules.append([{"group": "acoustic", "refresh_every": 0},
+                          {"group": "semantic", "refresh_every": 2}])
+        for policy in schedules:
+            with self.subTest(policy=policy):
+                with AttentionProbe(self.llm, list(range(self.prepared.answer_start)), mode="capture") as capture:
+                    first = forward_logits(self.llm, self.prepared, inputs[0])
+                dense = [first]
+                with ExitStack() as stack:
+                    for spec in policy:
+                        positions = self.prepared.group_positions(spec["group"])
+                        indices = torch.tensor(positions)
+                        bank = {layer: tuple(t.index_select(-2, indices) for t in pair)
+                                for layer, pair in capture.frozen.items()}
+                        stack.enter_context(AttentionProbe(self.llm, positions, mode="freeze", frozen=bank,
+                                                           refresh_every=spec["refresh_every"]))
+                    dense.extend(forward_logits(self.llm, self.prepared, x) for x in inputs[1:])
+                rows = []
+                handle = self.llm.model.transformer.blocks[0].ff_proj.register_forward_pre_hook(
+                    lambda module, args: rows.append(args[0].shape[1]))
+                try:
+                    with PrefixCache(self.llm, self.prepared, policy) as cache:
+                        compact = [forward_logits(self.llm, self.prepared, x) for x in inputs]
+                    self.assertEqual(rows, [e["computed_rows"] for e in cache.events])
+                    self.assertEqual(rows[0], 9)
+                    self.assertTrue(all(n >= 4 for n in rows))  # every answer row stays active
+                    if any(s["refresh_every"] != 1 for s in policy):
+                        self.assertLess(min(rows), 9)
+                    for a, b in zip(dense, compact):
+                        torch.testing.assert_close(a, b, rtol=2e-5, atol=2e-6)
+                finally:
+                    handle.remove()
+                # Exception cleanup must restore the original model too.
+                with self.assertRaisesRegex(RuntimeError, "stop"):
+                    with PrefixCache(self.llm, self.prepared, policy):
+                        raise RuntimeError("stop")
+                torch.testing.assert_close(first, forward_logits(self.llm, self.prepared, inputs[0]), rtol=0, atol=0)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_eos_stopping_waits_for_preceding_masks(self):
+        from experiments.audio_drift.decode import forward_logits
+        # Force confidence order: EOS at position 1, then position 0, then tail.
+        logits = torch.full((1, 4, 32), -10.)
+        for pos, token, strength in [(0, 5, 8.), (1, 30, 12.), (2, 6, 4.), (3, 7, 2.)]:
+            logits[0, pos, token] = strength
+        with patch("experiments.audio_drift.decode.forward_logits", return_value=logits):
+            fixed, _, _ = decode(self.llm, self.prepared, 4, 4, 4, save_states=False)
+            early, _, events = decode(self.llm, self.prepared, 4, 4, 4, save_states=False, eos_id=30)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(early[0, 3:].tolist(), [5, 30, 31, 31])
+        self.assertEqual(fixed[0, 3:5].tolist(), early[0, 3:5].tolist())
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_cache_benchmark_writes_paired_quality_and_actual_timings(self):
+        from experiments.audio_drift.benchmark import benchmark
+        from types import SimpleNamespace
+        self.llm.float()
+        baseline, _, _ = decode(self.llm, self.prepared, 4, 2, 4)
+        args = SimpleNamespace(interventions=["freeze"], freeze_groups=["both", "prompt", "audio_matched"],
+                               refresh_intervals=[1, 4], mixed_refresh=[],
+                               condition_names=["freeze_both_r1", "freeze_prompt_r4", "freeze_audio_matched_r4"],
+                               benchmark_conditions=[], benchmark_stopping="eos", benchmark_repeats=2,
+                               length=4, block_length=2, steps=4)
+        tokenizer = SimpleNamespace(eos_token_id=30, decode=lambda ids, **kwargs: str(ids))
+        with tempfile.TemporaryDirectory() as directory, patch.object(torch.cuda, "synchronize"), \
+                patch.object(torch.cuda, "reset_peak_memory_stats"), \
+                patch.object(torch.cuda, "max_memory_allocated", return_value=0):
+            data = benchmark(self.llm, self.prepared, baseline, args, tokenizer,
+                             {"metric": "none"}, Path(directory))
+            self.assertEqual(len(data["policies"]), 3)
+            self.assertEqual(len(data["baseline_seconds"]), 2)
+            for p in data["policies"]:
+                self.assertGreater(p["decode_speedup"], 0)
+                self.assertEqual(len(p["seconds"]), 2)
+                self.assertEqual(len(p["accounting"]), 2)
+                self.assertEqual(p["accounting"][0]["forwards"], data["baseline_forwards"])
+            identity = data["policies"][0]
+            self.assertTrue(identity["same_visible_tokens"])
+            self.assertEqual(identity["accounting"][0]["skipped_token_update_fraction"], 0)
+            self.assertTrue((Path(directory) / "cache_benchmark.json").is_file())
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_profiler_scopes_preserve_outputs_and_restore_on_exception(self):
         from experiments.audio_drift.profile import decoder_scopes
         from experiments.audio_drift.decode import forward_logits

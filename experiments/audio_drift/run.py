@@ -65,7 +65,8 @@ def interventions(llm, prepared, baseline, states, args, tokenizer, row, on_resu
         start = anchor + 1
         anchor_x = states[anchor].to(llm.device)
         cache_device = getattr(args, "cache_device", "cpu")
-        with AttentionProbe(llm, prepared.audio_positions, mode="capture", cache_device=cache_device) as capture:
+        captured_positions = list(range(prepared.answer_start))
+        with AttentionProbe(llm, captured_positions, mode="capture", cache_device=cache_device) as capture:
             anchor_logits = forward_logits(llm, prepared, anchor_x)
         del anchor_logits, anchor_x
         start_x = states[start].to(llm.device)
@@ -93,9 +94,9 @@ def interventions(llm, prepared, baseline, states, args, tokenizer, row, on_resu
                         positions = prepared.group_positions(group)
                         if not positions:
                             raise ValueError(f"No tokens in requested group {group}")
-                        # The capture bank contains all audio positions. Select
+                        # The capture bank contains the whole fixed prefix. Select
                         # only this group's columns in the SAME position order.
-                        indices = torch.tensor([p - prepared.insertion for p in positions])
+                        indices = torch.tensor(positions)
                         bank = {layer: tuple(t.index_select(-2, indices.to(t.device)) for t in pair)
                                 for layer, pair in capture.frozen.items()}
                         probe = stack.enter_context(AttentionProbe(llm, positions, mode="freeze",
@@ -123,6 +124,7 @@ def interventions(llm, prepared, baseline, states, args, tokenizer, row, on_resu
                       "same_final_tokens": torch.equal(final, baseline),
                       "score": score(text, row.get("target"), row.get("metric", "none")),
                       "cache_events": {group: probe.cache_events for group, probe in probes},
+                      "cached_group_positions": {group: prepared.group_positions(group) for group, _ in probes},
                       "commit_events": [{"step": e["step"], "positions": e["committed_positions"]}
                                         for e in branch_events],
                       "diagnostic_elapsed_seconds": time.perf_counter() - began}
@@ -160,12 +162,17 @@ def summarize_pairs(entries):
 
 def aggregate(output):
     tasks = defaultdict(lambda: {"samples": 0, "conditions": defaultdict(list)})
+    benchmarks = defaultdict(list)
     for path in sorted((output / "samples").glob("*/result.json")):
         if path.parent.name.startswith("."):
             continue
         result = json.loads(path.read_text())
         task = tasks[result["task"]]
         task["samples"] += 1
+        bench = result.get("benchmark")
+        if bench and "baseline_median_seconds" in bench:
+            for policy in bench["policies"]:
+                benchmarks[result["task"], policy["condition"]].append((bench, policy, result["score"]))
         task["conditions"]["baseline"].append({"score": result["score"], "baseline_score": result["score"]})
         for branch in result["interventions"]:
             key = f"{branch.get('condition', branch['mode'])}@{branch['anchor_step_fraction']:.3f}"
@@ -181,8 +188,17 @@ def aggregate(output):
                 counts["already_revealed_samples"] = len(entries) - len(unfinished)
             conditions_summary[name2] = counts
         summary[name] = {"samples": task["samples"], "conditions": conditions_summary}
-    write_json(output / "summary.json", {"tasks": summary,
-               "timing_note": "Instrumented diagnostic runtime; no optimized-cache speedup claim.",
+    bench_summary = {}
+    for (task, condition), pairs in benchmarks.items():
+        quality = summarize_pairs([{"score": p["score"], "baseline_score": baseline} for _, p, baseline in pairs])
+        bench_summary.setdefault(task, {})[condition] = {**quality,
+            "decode_speedup_ratio_of_sums": sum(b["baseline_median_seconds"] for b, _, _ in pairs) /
+                                             sum(p["median_seconds"] for _, p, _ in pairs),
+            "same_visible_tokens_fraction": sum(p["same_visible_tokens"] for _, p, _ in pairs) / len(pairs),
+            "stopping": sorted({b["stopping"] for b, _, _ in pairs})}
+    write_json(output / "summary.json", {"tasks": summary, "cache_benchmarks": bench_summary,
+               "timing_note": "Diagnostic runtimes are instrumented. cache_benchmarks, when present, report "
+                              "separate warmed timings with real row skipping and an explicit stopping rule.",
                "quality_note": "Compare the with_content_remaining subset; completed answers can hide damage."})
 
 
@@ -212,7 +228,8 @@ def parser():
     p.add_argument("--snapshot-steps", type=int, nargs="*", default=[])
     p.add_argument("--snapshot-layers", type=int, nargs="*", default=[])
     p.add_argument("--interventions", nargs="*", choices=["freeze", "remove", "text_only"], default=[])
-    p.add_argument("--freeze-groups", nargs="+", choices=["acoustic", "semantic", "both"], default=["both"])
+    p.add_argument("--freeze-groups", nargs="+",
+                   choices=["acoustic", "semantic", "both", "prompt", "prefix", "audio_matched"], default=["both"])
     p.add_argument("--refresh-intervals", type=int, nargs="*", default=[],
                    help="Also test periodic refresh; 1 is an identity control, 0/permanent is automatic")
     p.add_argument("--mixed-refresh", nargs="*", default=[], metavar="ACOUSTIC:SEMANTIC",
@@ -222,6 +239,10 @@ def parser():
                    help="Run only these named conditions from the generated matrix")
     p.add_argument("--profile-samples", type=int, default=0,
                    help="Profile this many initial samples separately, without drift hooks")
+    p.add_argument("--benchmark-samples", type=int, default=0)
+    p.add_argument("--benchmark-repeats", type=int, default=2)
+    p.add_argument("--benchmark-conditions", nargs="*", default=[])
+    p.add_argument("--benchmark-stopping", choices=["eos", "fixed"], default="eos")
     p.add_argument("--branch-fractions", type=float, nargs="+", default=[0., .25, .5, .75])
     p.add_argument("--verify-samples", type=int, default=1,
                    help="Compare instrumented decoding with the official unmodified decoder")
@@ -238,11 +259,13 @@ def main():
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
+    if args.benchmark_samples and set(args.benchmark_conditions) - {s["condition"] for s in specifications if s["mode"] == "freeze"}:
+        raise ValueError("Benchmark conditions must select generated freeze conditions")
     estimate = work_estimate(args.steps, args.branch_fractions, specifications)
     print("Work per example:", json.dumps(estimate), flush=True)
     if args.progress_every < 0:
         raise ValueError("progress-every must be nonnegative")
-    if min(args.verify_samples, args.profile_samples) < 0 or not all(0 <= f < 1 for f in args.branch_fractions):
+    if min(args.verify_samples, args.profile_samples, args.benchmark_samples) < 0 or args.benchmark_repeats < 1 or not all(0 <= f < 1 for f in args.branch_fractions):
         raise ValueError("Invalid verification count or branch fractions")
     if bool(args.snapshot_steps) != bool(args.snapshot_layers):
         raise ValueError("Specify both snapshot steps and layers")
@@ -303,7 +326,11 @@ def main():
         sample_began = time.perf_counter()
         print(f"[{index + 1}/{len(rows)}] {row['id']} ({row['task']})", flush=True)
         audio, duration = load_audio(row["audio"])
+        torch.cuda.synchronize()
+        preparation_began = time.perf_counter()
         prepared = prepare(model, tokenizer, extractor, audio, row["prompt"], args.length)
+        torch.cuda.synchronize()
+        preparation_seconds = time.perf_counter() - preparation_began
         recorder = DriftRecorder(work, prepared.labels(args.length), prepared.mask_id,
                                  args.reference_device, args.token_metrics,
                                  args.snapshot_steps, args.snapshot_layers)
@@ -347,6 +374,7 @@ def main():
         write_json(work / "steps.json", events)
         result = {"id": row["id"], "task": row["task"], "prompt": row["prompt"],
                   "target": row.get("target"), "audio_seconds": duration,
+                  "audio_preparation_seconds": preparation_seconds,
                   "duration_bin": row.get("duration_bin"), "speaker_id": row.get("speaker_id"),
                   "audio_semantic_tokens": prepared.audio_count - prepared.acoustic_count,
                   "audio_acoustic_tokens": prepared.acoustic_count,
@@ -371,6 +399,10 @@ def main():
                 branch_file.flush()
             result["interventions"] = interventions(llm, prepared, final, states, args, tokenizer, row,
                                                      on_result=save_branch)
+        if index < args.benchmark_samples:
+            from .benchmark import benchmark
+            result["benchmark"] = benchmark(llm, prepared, final, args, tokenizer, row, work,
+                                             result["interventions"], preparation_seconds)
         result["sample_wall_seconds"] = time.perf_counter() - sample_began
         print(f"  sample complete in {result['sample_wall_seconds'] / 60:.1f} minutes", flush=True)
         write_json(work / "result.json", result)

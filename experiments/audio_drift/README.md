@@ -95,7 +95,7 @@ sample from the actual LibriSpeech test-clean split (not the dummy dataset):
 source .venv-audio/bin/activate
 python -m experiments.audio_drift.prepare \
   --dataset openslr/librispeech_asr --config clean --split test \
-  --streaming --shuffle-seed 1729 --shuffle-buffer 1000 --max-per-speaker 1 \
+  --reader local-parquet --shuffle-seed 1729 --max-per-speaker 1 \
   --samples 20 --out data/audio_drift/test_clean20.jsonl
 ```
 
@@ -453,6 +453,102 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
 print(out, out.stat().st_size)
 PY
 ```
+
+## Prompt controls and actual row-skipping benchmark (v5)
+
+Three questions are tested separately:
+
+1. **Audio versus fixed text prompt:** baseline hidden/K/V drift already records
+   prompt tokens on shared plot scales. V5 additionally freezes prompt KVs
+   permanently, refreshes them every four forwards, and includes a prompt
+   interval-one identity control. `prompt` means every fixed text token, before
+   and after the inserted audio; it never includes generated answer tokens.
+2. **Within audio:** retain the acoustic/semantic permanent and mixed schedules.
+3. **Actual acceleration:** time an adapter that skips cached prefix rows, not
+   the diagnostic KV substitution hooks. No answer row is skipped, masked or
+   decoded. Text queries can still attend to every cached audio/prompt KV.
+
+Start with the same two longer clips and reuse the existing V4 manifest:
+
+```bash
+cd /workspace/llada-audio-drift
+git pull --ff-only
+nohup env RUN_NAME=audio_controls2_v5 SAMPLES=2 SKIP_INSTALL=1 \
+  REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
+  bash scripts/vast_audio_drift.sh control-pilot \
+  > audio_controls2_v5.log 2>&1 &
+tail -f audio_controls2_v5.log
+```
+
+There are **13 diagnostic branches per sample**, all anchored at zero: the
+previous eight conditions plus `freeze_prompt`, `freeze_prompt_r1`,
+`freeze_prompt_r4`, `freeze_audio_matched_r4`, and `freeze_prefix_r4`.
+`audio_matched` selects a fixed, evenly spaced audio subset of the same size
+as the text prompt (or all audio if there are fewer audio tokens; inspect saved
+positions). This controls token count when comparing prompt and audio caching.
+It is an exploratory fixed subset, not a learned token importance method.
+`prefix` selects all fixed text and audio, providing a generic prefix cache
+comparison. Individual selected positions are saved in diagnostic results.
+
+After the dense sensitivity runs, the first two samples benchmark **seven**
+conditions: prompt-r4, matched-audio-r4, both-audio-r4, whole-prefix-r4,
+permanent acoustic reuse, mixed A8:S2, and both-r1 identity.
+`BENCHMARK_SAMPLES=0` disables these timings. `BENCHMARK_REPEATS=2` is the pilot
+setting; increase repeats on a later validation run. Default control-pilot
+sample count is two. No new full 20-sample run starts automatically.
+
+The adapter in `compact.py` is restricted to the pinned eval-mode, ungrouped
+LLaDALlamaBlock. It leaves the original upstream source untouched. On the first
+forward and complete refreshes it calls upstream's block implementation; on
+reuse forwards it gathers active rows, applies QKV, absolute-position RoPE,
+attention queries/output, and MLP only to those rows, updates their KV slots,
+and retains cached rows' prior block outputs. Keys/values still span the whole
+sequence. Mixed schedules refresh each group's own branch states independently.
+The full embedding, final normalization and vocabulary head are left identical
+in baseline and cached runs; they are not optimized specially for cached runs.
+
+**This changes execution, not the intended KV reuse policy.** CPU tests compare
+per-forward answer logits to dense KV substitution for noncontiguous prompt
+positions, audio, whole prefix, matched audio, permanent/periodic and mixed
+schedules. Hooks verify projection row counts decrease. CUDA GEMM shape changes
+can introduce numerical differences; timed results record whether visible
+answer IDs match the paired dense intervention as well as baseline. Interval
+one must match baseline visible tokens exactly. CUDA quality/speed remain to
+be measured; positive speedup is not assumed.
+
+`cache_benchmark.json` is flushed after each timed policy. It records:
+
+* One untimed warmup per baseline/policy; two synchronized wall-time repeats per
+  policy. Each repeat starts generation and its cache afresh, including initial
+  cache population, refresh work, gathers/scatters and decoder bookkeeping.
+  Task scoring is outside the timer. There are no drift or profiling hooks.
+* Warmed baseline timings before and after the policy sweep, their median, and
+  `decode_speedup = baseline_median / policy_median`. Values below one are
+  slowdowns and are retained. Individual repeats expose noise/clock drift.
+* WER, text, visible token IDs, forward counts, selected positions, peak GPU
+  allocation, and computed/skipped token-layer updates for every repeat.
+  Skipped-update fractions are **not** total FLOP or latency savings.
+* The sample's separately synchronized audio preparation time. The ratio with
+  that shared one-time cost added to both decode medians is saved separately;
+  model loading and disk audio I/O remain excluded. Preparation itself is not
+  accelerated by prefix caching.
+
+Timing defaults to **safe EOS stopping**: stop only after a revealed EOS has
+no unresolved answer positions before it. Fixed-budget diagnostic collection
+still runs all 128 forwards and is verified against upstream. The clean EOS
+baseline must have the same visible answer IDs as the fixed-budget official
+baseline. Baseline and cached timing runs use identical stopping and answer
+capacity. Different policies may finish at different forward counts; those
+counts are reported so fewer steps are not mistaken for cheaper forwards.
+Use `BENCHMARK_STOPPING=fixed` to benchmark all 128 forwards instead, under a
+fresh run name. Both settings retain all answer query rows during each forward.
+
+`summary.json` keeps dense intervention quality under `tasks` and aggregates
+actual timings/quality separately under `cache_benchmarks`, using the ratio of
+summed paired baseline and policy median times. The performance subset may be
+smaller than the diagnostic subset. The ordinary baseline profile previously
+showed mostly feed-forward/projection work, so skipping those token rows is
+necessary to test practical savings rather than only replacing their KVs.
 
 ## Validation
 

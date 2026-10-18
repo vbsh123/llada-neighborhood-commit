@@ -4,7 +4,7 @@
 def conditions(modes, groups=("both",), refresh_intervals=(), mixed_refresh=()):
     if len(set(modes)) != len(modes) or not set(modes) <= {"freeze", "remove", "text_only"}:
         raise ValueError("Intervention modes must be unique: freeze, remove, text_only")
-    if not groups or not set(groups) <= {"acoustic", "semantic", "both"}:
+    if not groups or not set(groups) <= {"acoustic", "semantic", "both", "prompt", "prefix", "audio_matched"}:
         raise ValueError("Invalid freeze groups")
     if any(r < 1 for r in refresh_intervals):
         raise ValueError("Refresh intervals must be positive (permanent freeze is always included)")

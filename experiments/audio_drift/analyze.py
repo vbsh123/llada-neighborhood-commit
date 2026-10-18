@@ -118,7 +118,8 @@ def main():
     for key in curves:
         figures[key[:3]].append(key)
     for (task, metric, subset), keys in figures.items():
-        fig, axes = plt.subplots(2, 3, figsize=(16, 9), squeeze=False, layout="constrained")
+        grid_rows = (len(keys) + 2) // 3
+        fig, axes = plt.subplots(grid_rows, 3, figsize=(16, 4.5 * grid_rows), squeeze=False, layout="constrained")
         for ax, key in zip(axes.flat, sorted(keys)):
             values = curves[key]
             for mode in sorted({k[0] for k in values}):

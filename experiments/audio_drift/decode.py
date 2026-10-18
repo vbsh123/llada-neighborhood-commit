@@ -27,6 +27,15 @@ class Prepared:
         return list(range(self.insertion, self.insertion + self.audio_count))
 
     def group_positions(self, group):
+        if group == "prompt":
+            return list(range(self.insertion)) + list(range(self.insertion + self.audio_count, self.answer_start))
+        if group == "prefix":
+            return list(range(self.answer_start))
+        if group == "audio_matched":
+            count = min(self.prompt.shape[1], self.audio_count)
+            # Fixed, reproducible, evenly spread subset. Match prompt token count
+            # when enough audio tokens exist; never include answer positions.
+            return [self.insertion + i * self.audio_count // count for i in range(count)]
         if group == "acoustic":
             return self.audio_positions[:self.acoustic_count]
         if group == "semantic":
@@ -87,7 +96,7 @@ def commit(x, logits, prepared, block, block_length, count):
 @torch.no_grad()
 def decode(llm, prepared, length, block_length, steps, recorder=None, layers=None,
            start_x=None, start_step=0, first_logits=None, save_states=True,
-           progress_every=0):
+           progress_every=0, eos_id=None):
     plan = schedule(length, block_length, steps)
     if start_x is None:
         x = prepared.prompt.new_full((1, prepared.prompt.shape[1] + length), prepared.mask_id)
@@ -96,6 +105,7 @@ def decode(llm, prepared, length, block_length, steps, recorder=None, layers=Non
         x = start_x.clone()
     states, events = [], []
     last_changes = 0
+    stopped_at_eos = False
     for step in range(start_step, len(plan)):
         block, local, count = plan[step]
         answer = x[:, prepared.prompt.shape[1]:]
@@ -119,10 +129,17 @@ def decode(llm, prepared, length, block_length, steps, recorder=None, layers=Non
         last_changes, positions = commit(x, logits, prepared, block, block_length, count)
         del logits
         events.append({**meta, "changed_tokens": last_changes, "committed_positions": positions})
+        if eos_id is not None:
+            eos_positions = (answer[0] == eos_id).nonzero().flatten()
+            if len(eos_positions):
+                first_eos = int(eos_positions[0])
+                if not (answer[0, :first_eos] == prepared.mask_id).any():
+                    stopped_at_eos = True
+                    break
         if progress_every and (step == start_step or (step + 1) % progress_every == 0 or step + 1 == len(plan)):
             print(f"  baseline forward {step + 1}/{len(plan)}; block {block + 1}; "
                   f"{remaining - last_changes} answer masks remain", flush=True)
-    if (x[:, prepared.prompt.shape[1]:] == prepared.mask_id).any():
+    if not stopped_at_eos and (x[:, prepared.prompt.shape[1]:] == prepared.mask_id).any():
         raise ValueError("Decoder finished with unresolved masks (upstream permits predicting MASK)")
     return x, states, events
 

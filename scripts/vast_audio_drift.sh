@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mode="${1:-smoke}"
 case "$mode" in
-  setup|smoke|pilot|long-pilot) ;;
-  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot]'; exit 2 ;;
+  setup|smoke|pilot|long-pilot|control-pilot) ;;
+  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot|control-pilot]'; exit 2 ;;
 esac
 audio_venv="${AUDIO_VENV:-$PWD/.venv-audio}"
 if [[ ! -x "$audio_venv/bin/python" ]]; then
@@ -35,7 +35,7 @@ PY
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 experiment_name="${RUN_NAME:-audio_drift_${mode}_$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ "$experiment_name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid RUN_NAME'; exit 2; }
-if [[ "$mode" == long-pilot ]]; then
+if [[ "$mode" == long-pilot || "$mode" == control-pilot ]]; then
   manifest="${MANIFEST:-$PWD/data/audio_drift/librispeech_duration20_v4.jsonl}"
   if [[ ! -f "$manifest" && -z "${MANIFEST:-}" ]]; then
     python -m experiments.audio_drift.prepare --out "$manifest" --samples 20 \
@@ -43,7 +43,9 @@ if [[ "$mode" == long-pilot ]]; then
       --shuffle-seed "${SEED:-1729}" --max-per-speaker 2 \
       --min-seconds 10 --max-seconds 30 --duration-bins 10:20:10 20:30:10
   fi
-  count="${SAMPLES:-20}"
+  default_count=20
+  if [[ "$mode" == control-pilot ]]; then default_count=2; fi
+  count="${SAMPLES:-$default_count}"
   length="${LENGTH:-256}"
   block="${BLOCK_LENGTH:-32}"
 elif [[ "$mode" == smoke ]]; then
@@ -62,7 +64,17 @@ else
   block="${BLOCK_LENGTH:-32}"
 fi
 extra=()
-if [[ "$mode" == long-pilot ]]; then
+if [[ "$mode" == control-pilot ]]; then
+  extra+=(--interventions freeze --freeze-groups acoustic semantic both prompt audio_matched prefix
+          --refresh-intervals 1 4 8 --mixed-refresh 8:2 2:8
+          --condition-names freeze_acoustic freeze_semantic freeze freeze_both_r1 freeze_both_r4
+          freeze_both_r8 freeze_mixed_a8_s2 freeze_mixed_a2_s8 freeze_prompt freeze_prompt_r1
+          freeze_prompt_r4 freeze_audio_matched_r4 freeze_prefix_r4
+          --benchmark-samples "${BENCHMARK_SAMPLES:-2}" --benchmark-repeats "${BENCHMARK_REPEATS:-2}"
+          --benchmark-stopping "${BENCHMARK_STOPPING:-eos}"
+          --benchmark-conditions freeze_both_r1 freeze_prompt_r4 freeze_audio_matched_r4
+          freeze_both_r4 freeze_prefix_r4 freeze_acoustic freeze_mixed_a8_s2)
+elif [[ "$mode" == long-pilot ]]; then
   extra+=(--interventions freeze --freeze-groups acoustic semantic both
           --refresh-intervals 1 4 8 --mixed-refresh 8:2 2:8
           --condition-names freeze_acoustic freeze_semantic freeze freeze_both_r1
@@ -79,9 +91,10 @@ default_fractions="0 .25 .5 .75"
 default_profiles=0
 default_layers=all
 default_steps="$length"
-if [[ "$mode" == long-pilot ]]; then
+if [[ "$mode" == long-pilot || "$mode" == control-pilot ]]; then
   default_fractions=0; default_profiles=2; default_layers=0,7,15,23,31; default_steps=128
 fi
+if [[ "$mode" == control-pilot ]]; then default_profiles=0; fi
 read -r -a branch_fractions <<< "${BRANCH_FRACTIONS:-$default_fractions}"
 extra+=(--profile-samples "${PROFILE_SAMPLES:-$default_profiles}")
 if [[ "${TOKEN_METRICS:-0}" == 1 ]]; then extra+=(--token-metrics); fi
