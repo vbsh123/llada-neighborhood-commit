@@ -9,6 +9,23 @@ import numpy as np
 GROUPS = ("audio_acoustic", "audio_semantic", "prompt")
 
 
+def depth_summary(matrices, layers, end):
+    """Keep layer 0, exclude step-zero self-comparison, never pool missing cells."""
+    if end is None or end < 1:
+        return None
+    report = {"layers": list(layers), "all_32_layers_observed": list(layers) == list(range(32)),
+              "pooling": "Mean token cosine distance, then equal forward and layer weights; layer 0 included",
+              "active_mean_all_measured_layers": {}, "active_mean_by_layer": {}}
+    for group in GROUPS:
+        values = matrices['previous', group][:, 1:end + 1]
+        if not np.isfinite(values).all():
+            raise ValueError("Missing active layer/step cells; refusing an incomplete depth average")
+        means = values.mean(axis=1)
+        report['active_mean_all_measured_layers'][group] = float(means.mean())
+        report['active_mean_by_layer'][group] = {str(layer): float(value) for layer, value in zip(layers, means)}
+    return report
+
+
 def analyze(run, output=None):
     import matplotlib
     matplotlib.use("Agg")
@@ -64,7 +81,9 @@ def analyze(run, output=None):
             fig.suptitle(f"{result['id']} / {scope}: consecutive forwards; dashed line = content completion")
             fig.savefig(output / f"{sample}_layer_drift_{scope}.png", dpi=160)
             plt.close(fig)
+        sample_report["depth_summary"] = depth_summary(matrices, layers, end)
         nonzero = [i for i, layer in enumerate(layers) if layer > 0] or list(range(len(layers)))
+        sample_report["legacy_active_mean_layers"] = [layers[i] for i in nonzero]
         fig, ax = plt.subplots(figsize=(9, 4))
         for group in GROUPS:
             initial = 1 - np.nanmean(matrices["initial", group][nonzero], axis=0)
@@ -110,6 +129,28 @@ def analyze(run, output=None):
             sample_report["pairwise_matrices_mean_across_layers"] = {
                 g: [[float(v) if np.isfinite(v) else None for v in row] for row in a] for g, a in pooled.items()}
         summary["samples"].append(sample_report)
+    depth = [s["depth_summary"] for s in summary["samples"] if s.get("depth_summary") is not None]
+    if depth:
+        layer_sets = {tuple(d["layers"]) for d in depth}
+        if len(layer_sets) != 1:
+            raise ValueError("Mixed layer coverage across samples; refusing an aggregate depth average")
+        summary["aggregate_depth_summary"] = {
+            "samples": len(depth), "layers": depth[0]["layers"],
+            "all_32_layers_observed": all(d["all_32_layers_observed"] for d in depth),
+            "pooling": "Equal example weights after per-example active-step and layer averages; includes layer 0",
+            "active_mean_all_measured_layers": {
+                g: float(np.mean([d["active_mean_all_measured_layers"][g] for d in depth])) for g in GROUPS},
+            "active_mean_by_layer": {
+                g: {str(layer): float(np.mean([d["active_mean_by_layer"][g][str(layer)] for d in depth]))
+                    for layer in depth[0]["layers"]} for g in GROUPS}}
+        fig, ax = plt.subplots(figsize=(9, 4))
+        for g in GROUPS:
+            ax.plot(depth[0]["layers"], [summary["aggregate_depth_summary"]["active_mean_by_layer"][g][str(l)]
+                                      for l in depth[0]["layers"]], marker=".", label=g)
+        ax.set(xlabel="Transformer block output (0 based)", ylabel="Mean consecutive-step cosine distance",
+               title=f"Baseline drift by layer; equal weights across {len(depth)} examples")
+        ax.legend(); ax.grid(alpha=.2); fig.tight_layout()
+        fig.savefig(output / "aggregate_drift_by_layer.png", dpi=160); plt.close(fig)
     (output / "measurements.json").write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
     print(f"Wrote cosine figures for {len(summary['samples'])} samples to {output}", flush=True)
     return summary

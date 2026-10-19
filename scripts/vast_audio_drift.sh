@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mode="${1:-smoke}"
 case "$mode" in
-  setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep) ;;
-  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep]'; exit 2 ;;
+  setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep|gsm-depth) ;;
+  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep|gsm-depth]'; exit 2 ;;
 esac
 audio_venv="${AUDIO_VENV:-$PWD/.venv-audio}"
 if [[ ! -x "$audio_venv/bin/python" ]]; then
@@ -35,14 +35,14 @@ PY
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 experiment_name="${RUN_NAME:-audio_drift_${mode}_$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ "$experiment_name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid RUN_NAME'; exit 2; }
-if [[ "$mode" == gsm-pilot || "$mode" == gsm-sweep ]]; then
+if [[ "$mode" == gsm-pilot || "$mode" == gsm-sweep || "$mode" == gsm-depth ]]; then
   manifest="${MANIFEST:-$PWD/data/audio_drift/gsm8k_speech10_v7.jsonl}"
   if [[ ! -f "$manifest" && -z "${MANIFEST:-}" ]]; then
     python -m experiments.audio_drift.prepare_gsm --out "$manifest" --samples 10 --seed "${SEED:-1729}"
   fi
   count="${SAMPLES:-10}"
   gsm_capacity=256
-  if [[ "$mode" == gsm-sweep ]]; then gsm_capacity=512; fi
+  if [[ "$mode" == gsm-sweep || "$mode" == gsm-depth ]]; then gsm_capacity=512; fi
   length="${LENGTH:-$gsm_capacity}"
   block="${BLOCK_LENGTH:-32}"
 elif [[ "$mode" == long-pilot || "$mode" == control-pilot || "$mode" == cosine-pilot ]]; then
@@ -74,7 +74,9 @@ else
   block="${BLOCK_LENGTH:-32}"
 fi
 extra=()
-if [[ "$mode" == gsm-sweep ]]; then
+if [[ "$mode" == gsm-depth ]]; then
+  : # Baseline only; no generation policies, benchmarks or pairwise vectors.
+elif [[ "$mode" == gsm-sweep ]]; then
   extra+=(--interventions freeze --freeze-groups prefix --refresh-intervals 1 8 16
           --triple-refresh 16:8:8 32:8:8 0:8:8 16:8:16
           --condition-names freeze_prefix_r1 freeze_prefix_r8 freeze_prefix_r16
@@ -128,10 +130,10 @@ if [[ "$mode" == long-pilot || "$mode" == control-pilot || "$mode" == cosine-pil
 fi
 if [[ "$mode" == control-pilot ]]; then default_profiles=0; fi
 if [[ "$mode" == gsm-pilot ]]; then
-  default_fractions=0; default_profiles=0; default_layers=0,7,15,23,31; default_steps=128
+  default_fractions=0; default_profiles=0; default_layers=all; default_steps=128
 fi
-if [[ "$mode" == gsm-sweep ]]; then
-  default_fractions=0; default_profiles=0; default_layers=0,7,15,23,31
+if [[ "$mode" == gsm-sweep || "$mode" == gsm-depth ]]; then
+  default_fractions=0; default_profiles=0; default_layers=all
   default_steps=$((length / 2))
 fi
 if [[ "$mode" == cosine-pilot ]]; then default_profiles=0; default_layers=all; fi
@@ -152,7 +154,7 @@ fi
 python -m experiments.audio_drift.analyze --run "runs/$experiment_name"
 python -m experiments.audio_drift.stability --run "runs/$experiment_name" --statistic median
 python -m experiments.audio_drift.stability --run "runs/$experiment_name" --statistic p90
-if [[ "$mode" == cosine-pilot ]]; then
+if [[ "$mode" == cosine-pilot || "$mode" == gsm-pilot || "$mode" == gsm-sweep || "$mode" == gsm-depth ]]; then
   python -m experiments.audio_drift.paper_plots --run "runs/$experiment_name"
 fi
 python -m pip freeze > "runs/$experiment_name/packages.txt"

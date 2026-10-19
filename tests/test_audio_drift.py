@@ -164,6 +164,23 @@ class InputTests(unittest.TestCase):
         self.assertEqual(sum(c for _, _, c in plan), 512)
         self.assertTrue(all(c == 2 for _, _, c in plan))
 
+    def test_depth_summary_includes_layer_zero_and_excludes_late_steps(self):
+        import numpy as np
+        from experiments.audio_drift.paper_plots import depth_summary, GROUPS
+        values = np.ones((32, 4))
+        values[:, 0] = 0; values[0, 1:3] = 0; values[:, 3] = 100
+        matrices = {('previous', g): values.copy() for g in GROUPS}
+        result = depth_summary(matrices, list(range(32)), 2)
+        self.assertTrue(result['all_32_layers_observed'])
+        for g in GROUPS:
+            self.assertAlmostEqual(result['active_mean_all_measured_layers'][g], 31/32)
+            self.assertEqual(result['active_mean_by_layer'][g]['0'], 0)
+        subset = {('previous', g): values[[7,15,23,31]] for g in GROUPS}
+        self.assertFalse(depth_summary(subset, [7,15,23,31], 2)['all_32_layers_observed'])
+        matrices['previous', GROUPS[0]][1,1] = np.nan
+        with self.assertRaises(ValueError):
+            depth_summary(matrices, list(range(32)), 2)
+
     def test_long_pilot_selects_only_named_conditions(self):
         from types import SimpleNamespace
         from experiments.audio_drift.run import intervention_specs

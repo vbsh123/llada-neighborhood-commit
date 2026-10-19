@@ -6,6 +6,45 @@ The default checkpoint is **DIFFA-2**, with its original semantic/acoustic
 connectors, Whisper-large-v3, and LLaDA-8B-Instruct. This experiment does not
 change the existing neighborhood, sleep, or translation experiments.
 
+## Full-depth measurement correction
+
+The initial GSM v7/v8 commands selected layers 0,7,15,23,31 to reduce diagnostic
+overhead, and the quoted averages pooled 7,15,23,31. That was insufficient for
+an all-depth claim. Updated `gsm-pilot` and `gsm-sweep` now default to **all 32
+block outputs**, including layer 0. Layer 0 is the first transformer block's
+output, not the input embedding. Existing running jobs keep their original
+arguments; finish them before pulling source changes. Their quality/latency
+results remain useful and their drift is valid for the measured layers.
+
+After the current sweep finishes, collect full-depth GSM drift without rerunning
+cache policies or latency benchmarks:
+
+```bash
+cd /workspace/llada-audio-drift
+git pull --ff-only
+nohup env RUN_NAME=audio_gsm_depth10_v9 SAMPLES=10 SKIP_INSTALL=1 \
+  REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
+  bash scripts/vast_audio_drift.sh gsm-depth > audio_gsm_depth10_v9.log 2>&1 &
+tail -f audio_gsm_depth10_v9.log
+```
+
+This reuses the same manifest and 512/32/256 decoding budget as v8. Every example
+has one instrumented baseline; the first two also have official verification.
+There are no policy decodes, dense branches, fixed-input replays or pairwise
+vector histories. All-layer hooks increase diagnostic overhead, so runtime is
+not inferred from ordinary decode latency. No GPU execution is performed locally.
+
+`analysis/cosine/measurements.json` includes per-example and aggregate
+`depth_summary` / `aggregate_depth_summary` fields. They explicitly report layer
+coverage, include layer 0, average only consecutive-forward comparisons up to
+predicted content completion, and weight examples equally. Per-layer means and
+`aggregate_drift_by_layer.png` prevent the global mean from hiding depth effects.
+The legacy `active_mean_cosine_distance` field remains for historical comparison;
+`legacy_active_mean_layers` identifies its layer-0-excluding pool. Use the new
+full-depth fields for all-32-layer claims. Missing cells fail rather than being
+silently omitted. Existing ASR v6 data already contains all 32 layers and can be
+reanalyzed offline; the unrecorded GSM layers require a new baseline run.
+
 ## Push audio refresh intervals beyond text (v8)
 
 The next controlled sweep reuses the existing 10-row GSM8K Speech manifest and
