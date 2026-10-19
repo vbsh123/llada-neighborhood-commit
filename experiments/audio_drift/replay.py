@@ -12,20 +12,18 @@ import torch
 
 from .compact import PrefixCache
 from .decode import forward_logits
+from .protocol import is_identity
 
 
 @torch.no_grad()
-def benchmark_replay(llm, prepared, states, baseline_forwards, args, work):
-    from .run import intervention_specs, write_json
+def benchmark_replay(llm, prepared, states, baseline_forwards, args, work, sample_id=None):
+    from .run import write_json
+    from .benchmark import policy_specs
     count = min(len(states), baseline_forwards, args.replay_steps)
     if count < 1:
         raise ValueError("Replay needs at least one active baseline input")
     inputs = [x.to(prepared.prompt.device) for x in states[:count]]
-    names = set(args.benchmark_conditions)
-    specs = [s for s in intervention_specs(args) if s['mode'] == 'freeze'
-             and (not names or s['condition'] in names)]
-    if not specs:
-        raise ValueError("Replay needs cache policies")
+    specs = policy_specs(args, sample_id)
 
     def measure(spec=None):
         torch.cuda.synchronize()
@@ -53,7 +51,7 @@ def benchmark_replay(llm, prepared, states, baseline_forwards, args, work):
     if not torch.equal(before.argmax(-1), expected_last):
         raise RuntimeError("Replay baseline warmup changed final-step predictions")
     del before
-    report = {'forwards': count, 'baseline_active_forwards': baseline_forwards,
+    report = {'policy_order': [s['condition'] for s in specs], 'forwards': count, 'baseline_active_forwards': baseline_forwards,
               'step_indices': list(range(count)), 'repeats': args.replay_repeats,
               'baseline_seconds': [before_seconds], 'policies': [],
               'protocol': 'same-baseline-inputs-v1',
@@ -66,7 +64,7 @@ def benchmark_replay(llm, prepared, states, baseline_forwards, args, work):
     write_json(path, report)
     for spec in specs:
         warm, _, _, _ = measure(spec)
-        identity = all(s['refresh_every'] == 1 for s in spec['schedule'])
+        identity = is_identity(spec)
         identity_match = torch.equal(warm.argmax(-1), expected_last) if identity else None
         del warm
         if identity and not identity_match:

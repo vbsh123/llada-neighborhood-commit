@@ -5,8 +5,9 @@ import json
 import math
 from pathlib import Path
 import random
+from itertools import zip_longest
 
-from .inputs import canonical_number
+from .inputs import canonical_number, read_manifest
 
 DATASET = "mistralai/gsm8k_speech"
 PROMPT = ("Solve the math problem spoken in the audio. Think step by step, then end your response "
@@ -14,7 +15,7 @@ PROMPT = ("Solve the math problem spoken in the audio. Think step by step, then 
           "Write only the number after ####, without units or additional text.")
 
 
-def select_rows(rows, samples, seed, min_seconds, max_seconds):
+def select_rows(rows, samples, seed, min_seconds, max_seconds, excluded_indices=()):
     """Uniform reservoir over eligible rows; retain only selected audio payloads.
 
     Consume the local Parquet reader completely and close it before WAV export.
@@ -23,8 +24,11 @@ def select_rows(rows, samples, seed, min_seconds, max_seconds):
     import soundfile as sf
     rng = random.Random(seed)
     selected, eligible, scanned = [], 0, 0
+    excluded_indices = set(excluded_indices)
     for index, (source_file, row_index, row) in enumerate(rows):
         scanned += 1
+        if index in excluded_indices:
+            continue
         payload = row["audio"]
         if payload.get("bytes") is None:
             raise ValueError("Expected embedded audio bytes in GSM8K Speech Parquet")
@@ -74,6 +78,7 @@ def main():
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--samples", type=int, default=10)
     p.add_argument("--revision", default="main")
+    p.add_argument("--base-manifest", type=Path, help="Keep these development examples and add disjoint fresh rows")
     p.add_argument("--seed", type=int, default=1729)
     p.add_argument("--min-seconds", type=float, default=0)
     p.add_argument("--max-seconds", type=float, default=30)
@@ -85,16 +90,31 @@ def main():
         raise ValueError("Use a fresh manifest path; existing inputs are never overwritten")
     from huggingface_hub import HfApi
     import soundfile as sf
+    base = read_manifest(args.base_manifest) if args.base_manifest else []
+    if base and args.samples <= len(base):
+        raise ValueError("Combined sample count must exceed the development manifest size")
+    revisions = {r.get('source_revision') for r in base}
+    if base and (len(revisions) != 1 or None in revisions or
+                 any(r.get('source_dataset') != DATASET for r in base)):
+        raise ValueError("Base manifest must identify a single pinned GSM8K Speech revision")
+    selected_revision = next(iter(revisions)) if base else args.revision
     api = HfApi()
-    revision = api.dataset_info(DATASET, revision=args.revision).sha
+    revision = api.dataset_info(DATASET, revision=selected_revision).sha
+    if base and args.revision != 'main' and args.revision != revision:
+        raise ValueError("Explicit revision differs from the development dataset revision")
+    excluded = {int(r['id'].removeprefix('gsm8k-speech-')) for r in base}
     files = sorted(f for f in api.list_repo_files(DATASET, repo_type="dataset", revision=revision)
                    if f.startswith("data/test-") and f.endswith(".parquet"))
     if not files:
         raise ValueError("No data/test-*.parquet files; inspect dataset layout")
-    selected, counts = select_rows(parquet_rows(DATASET, revision, files), args.samples,
-                                   args.seed, args.min_seconds, args.max_seconds)
+    selected, counts = select_rows(parquet_rows(DATASET, revision, files), args.samples - len(base),
+                                   args.seed, args.min_seconds, args.max_seconds, excluded)
     audio_dir.mkdir(parents=True)
     manifest = []
+    for row in base:
+        # read_manifest resolves and validates the existing audio paths. Keeping
+        # absolute paths avoids copying or altering the development WAV files.
+        manifest.append({**row, 'cohort': 'development'})
     for i, row in enumerate(selected):
         audio, rate = sf.read(io.BytesIO(row["payload"]), dtype="float32")
         path = audio_dir / f"{i:05}.wav"
@@ -102,17 +122,23 @@ def main():
         manifest.append({"id": f"gsm8k-speech-{row['source_index']:05}",
                          "audio": str(path.relative_to(args.out.parent)), "task": "gsm8k_speech",
                          "prompt": PROMPT, "metric": "numeric", "target": row["target"],
-                         "audio_seconds": row["audio_seconds"], "source_dataset": DATASET,
+                         "audio_seconds": row["audio_seconds"], "cohort": "fresh" if base else "unspecified",
+                         "source_dataset": DATASET,
                          "source_revision": revision, "source_file": row["source_file"],
                          "source_row": row["source_row"]})
         print(f"Selected {i+1}/{args.samples}: {manifest[-1]['id']} ({row['audio_seconds']:.2f}s)", flush=True)
+    if base:
+        development, fresh = manifest[:len(base)], manifest[len(base):]
+        manifest = [r for pair in zip_longest(development, fresh) for r in pair if r is not None]
     temp = args.out.with_suffix(args.out.suffix + ".tmp")
     temp.write_text("".join(json.dumps(row) + "\n" for row in manifest))
     temp.replace(args.out)
     args.out.with_suffix(".provenance.json").write_text(json.dumps({
         "dataset": DATASET, "revision": revision, "source_files": files, "seed": args.seed,
         "selection": "uniform reservoir over duration-eligible test rows; no correctness filtering",
-        "samples": args.samples, "min_seconds": args.min_seconds, "max_seconds": args.max_seconds,
+        "samples": args.samples, "development_samples": len(base), "fresh_samples": len(selected) if base else 0,
+        "base_manifest": str(args.base_manifest.resolve()) if args.base_manifest else None,
+        "excluded_source_indices": sorted(excluded), "min_seconds": args.min_seconds, "max_seconds": args.max_seconds,
         "prompt": PROMPT, "scoring": "exact canonical numerical match; explicit final marker or bare number",
         **counts}, indent=2) + "\n")
     print(args.out, flush=True)

@@ -64,3 +64,45 @@ def work_estimate(steps, fractions, specifications):
             "continuation_forwards": len(specifications) * sum(steps - a - 1 for a in anchors),
             "anchor_replay_forwards": 2 * len(anchors),
             "note": "Excludes official-decoder verification. All conditions run sequentially."}
+
+
+def with_depth_variants(specifications, multipliers):
+    """Pair every non-identity flat policy with the same depth-factor control."""
+    if not multipliers or any(not isinstance(m, int) or m < 1 for m in multipliers):
+        raise ValueError("Depth multipliers must be positive integers")
+    if any(a % b for a, b in zip(multipliers, multipliers[1:])):
+        raise ValueError("Shallow depth factors must be integer multiples of deeper factors")
+    result = []
+    suffix = "_depth" + "x".join(map(str, multipliers))
+    for spec in specifications:
+        result.append(spec)
+        if spec['mode'] != 'freeze' or is_identity(spec):
+            continue
+        result.append({**spec, 'condition': spec['condition'] + suffix,
+                       'flat_condition': spec['condition'], 'depth_multipliers': list(multipliers),
+                       'schedule': [{**s, 'refresh_by_layer_group': [s['refresh_every'] * m for m in multipliers]}
+                                    for s in spec['schedule']]})
+    return result
+
+
+def layer_intervals(specification, num_layers):
+    """Expand equal-sized layer groups into an explicit interval per block."""
+    grouped = specification.get('refresh_by_layer_group')
+    if grouped is None:
+        interval = specification['refresh_every']
+        if not isinstance(interval, int) or interval < 0:
+            raise ValueError("Refresh interval must be a nonnegative integer")
+        return (interval,) * num_layers
+    if (not grouped or num_layers % len(grouped) or
+            any(not isinstance(r, int) or r < 0 for r in grouped)):
+        raise ValueError("Layer groups must divide the model depth and have nonnegative integer intervals")
+    if any(a and (not b or a % b) for a, b in zip(grouped, grouped[1:])):
+        raise ValueError("Shallow refresh intervals must be integer multiples of deeper intervals")
+    width = num_layers // len(grouped)
+    return tuple(r for r in grouped for _ in range(width))
+
+
+def is_identity(specification):
+    return (specification['mode'] == 'freeze' and bool(specification['schedule']) and
+            all(all(r == 1 for r in s.get('refresh_by_layer_group', [s['refresh_every']]))
+                for s in specification['schedule']))

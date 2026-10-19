@@ -181,6 +181,88 @@ class InputTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             depth_summary(matrices, list(range(32)), 2)
 
+    def test_depth_variant_expansion_and_validation(self):
+        from experiments.audio_drift.protocol import with_depth_variants, layer_intervals, is_identity
+        base = conditions(['freeze'], ['prefix'], [1,8])
+        result = with_depth_variants(base, [8,4,2,1])
+        identity = next(r for r in result if r['condition']=='freeze_prefix_r1')
+        self.assertTrue(is_identity(identity))
+        self.assertFalse(any(r['condition'].startswith('freeze_prefix_r1_depth') for r in result))
+        depth = next(r for r in result if r['condition']=='freeze_prefix_r8_depth8x4x2x1')
+        self.assertEqual(layer_intervals(depth['schedule'][0],32), (64,)*8+(32,)*8+(16,)*8+(8,)*8)
+        self.assertEqual(depth['flat_condition'],'freeze_prefix_r8')
+        with self.assertRaises(ValueError): with_depth_variants(base,[3,2,1])
+        with self.assertRaises(ValueError): layer_intervals(depth['schedule'][0],3)
+        with self.assertRaises(ValueError): layer_intervals({'refresh_every':2,'refresh_by_layer_group':[2,4]},32)
+        self.assertFalse(is_identity({'mode':'freeze','schedule':[{'group':'prefix','refresh_every':1,
+                                                                  'refresh_by_layer_group':[4,1]}]}))
+
+    def test_night_policy_matrix_has_six_pairs_and_identity(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.run import intervention_specs
+        args = SimpleNamespace(interventions=['freeze'], freeze_groups=['prefix'], refresh_intervals=[1,8],
+            triple_refresh=['16:8:16','16:8:8','16:8:4','8:8:4','16:16:4'],depth_multipliers=[8,4,2,1],
+            condition_names=['freeze_prefix_r1','freeze_prefix_r8','freeze_triple_a16_p8_s16',
+                             'freeze_triple_a16_p8_s8','freeze_triple_a16_p8_s4',
+                             'freeze_triple_a8_p8_s4','freeze_triple_a16_p16_s4'])
+        policies=intervention_specs(args)
+        self.assertEqual(len(policies),13)
+        self.assertEqual(len({p['condition'] for p in policies}),13)
+        self.assertEqual(sum('flat_condition' in p for p in policies),6)
+        from experiments.audio_drift.benchmark import policy_specs
+        args.shuffle_policy_order=True;args.seed=1729;args.benchmark_conditions=[]
+        order=policy_specs(args,'sample-one')
+        self.assertEqual([p['condition'] for p in order],[p['condition'] for p in policy_specs(args,'sample-one')])
+        self.assertEqual(order[0]['condition'],'freeze_prefix_r1')
+        self.assertEqual({p['condition'] for p in order},{p['condition'] for p in policies})
+        with self.assertRaises(ValueError):policy_specs(args)
+        for p in policies:
+            if 'flat_condition' in p:
+                self.assertTrue(any(q['condition']==p['flat_condition'] for q in policies))
+
+    def test_marker_comma_scoring_preserves_strict_grade(self):
+        for text in ['####,120','####, 120','#### Answer: ,120']:
+            value=score(text,'120','numeric')
+            self.assertTrue(value['correct']);self.assertFalse(value['strict_correct'])
+        for text in ['####,','####,120 or 20','Reasoning says 120','####, profit is 120']:
+            self.assertTrue(score(text,'120','numeric')['parse_failed'])
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_combined_manifest_keeps_development_and_excludes_it_from_fresh(self):
+        import io
+        import soundfile as sf
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from unittest.mock import Mock
+        from experiments.audio_drift.prepare_gsm import main, DATASET
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory);buffer=io.BytesIO()
+            sf.write(buffer,np.zeros(1600),1600,format='WAV')
+            wave=directory/'base.wav';wave.write_bytes(buffer.getvalue())
+            base=directory/'base.jsonl'
+            base.write_text(''.join(json.dumps({'id':f'gsm8k-speech-{i:05}', 'audio':'base.wav',
+                'task':'gsm8k_speech','prompt':'original instruction','target':str(i),'metric':'numeric',
+                'source_dataset':DATASET,'source_revision':'pinned','source_file':'data/test-0.parquet','source_row':i})+'\n' for i in [1,3]))
+            shard=directory/'test.parquet'
+            pq.write_table(pa.Table.from_pylist([{'audio':{'bytes':buffer.getvalue(),'path':'audio.wav'},
+                                                  'answer':str(i)} for i in range(12)]),shard)
+            api=Mock();api.dataset_info.return_value.sha='pinned'
+            api.list_repo_files.return_value=['data/test-0.parquet']
+            manifest=directory/'combined.jsonl'
+            with patch('sys.argv',['prepare_gsm','--out',str(manifest),'--samples','6','--base-manifest',str(base)]), \
+                 patch('huggingface_hub.HfApi',return_value=api), \
+                 patch('huggingface_hub.hf_hub_download',return_value=str(shard)):
+                main()
+            rows=read_manifest(manifest);dev=[r for r in rows if r['cohort']=='development'];fresh=[r for r in rows if r['cohort']=='fresh']
+            self.assertEqual(len(dev),2);self.assertEqual(len(fresh),4)
+            self.assertFalse({r['id'] for r in dev}&{r['id'] for r in fresh})
+            self.assertEqual([r['cohort'] for r in rows[:4]],['development','fresh','development','fresh'])
+            self.assertTrue(all(r['prompt']=='original instruction' for r in dev))
+            api.dataset_info.assert_called_once_with(DATASET,revision='pinned')
+            provenance=json.loads(manifest.with_suffix('.provenance.json').read_text())
+            self.assertEqual(provenance['excluded_source_indices'],[1,3])
+            self.assertEqual(provenance['eligible'],10)
+
     def test_long_pilot_selects_only_named_conditions(self):
         from types import SimpleNamespace
         from experiments.audio_drift.run import intervention_specs
@@ -547,6 +629,79 @@ class UpstreamTests(unittest.TestCase):
                 torch.testing.assert_close(first, forward_logits(self.llm, self.prepared, inputs[0]), rtol=0, atol=0)
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_depth_cache_matches_dense_state_and_kv_freezing(self):
+        from contextlib import contextmanager
+        from experiments.audio_drift.compact import PrefixCache
+        from experiments.audio_drift.decode import forward_logits
+        self.llm.float()
+        inputs=[torch.tensor([[1,2,3,4+i%5,10+(i//3)%4,31,31]]) for i in range(17)]
+        cases=[
+            [{'group':'prefix','refresh_every':1,'refresh_by_layer_group':[4,1]}],
+            [{'group':'acoustic','refresh_every':2,'refresh_by_layer_group':[8,2]},
+             {'group':'prompt','refresh_every':2,'refresh_by_layer_group':[8,2]},
+             {'group':'semantic','refresh_every':1,'refresh_by_layer_group':[4,1]}],
+            [{'group':'acoustic','refresh_every':0,'refresh_by_layer_group':[0,0]},
+             {'group':'prompt','refresh_every':2,'refresh_by_layer_group':[8,2]},
+             {'group':'semantic','refresh_every':1,'refresh_by_layer_group':[4,1]}]]
+
+        @contextmanager
+        def dense_reference(policy):
+            # Independent oracle computes ALL rows, substitutes inactive K/V,
+            # then freezes inactive block outputs. Unlike KV-only substitution,
+            # this correctly models a deep refresh fed by a cached shallow state.
+            originals=[];banks={};clock=[-1]
+            for layer,block in enumerate(self.llm.model.transformer.blocks):
+                original=block.forward;originals.append((block,original))
+                def forward(x,*a,_l=layer,_b=block,_orig=original,**kw):
+                    if _l==0:clock[0]+=1
+                    inactive=[]
+                    for item in policy:
+                        interval=item['refresh_by_layer_group'][_l]
+                        if clock[0] and (not interval or clock[0]%interval):
+                            inactive.extend(self.prepared.group_positions(item['group']))
+                    active=torch.tensor([i for i in range(x.shape[1]) if i not in inactive])
+                    attention=_b._scaled_dot_product_attention
+                    def substitute(q,k,v,**kwargs):
+                        if _l not in banks:
+                            banks[_l]=[k.clone(),v.clone(),None]
+                        else:
+                            banks[_l][0].index_copy_(-2,active,k.index_select(-2,active))
+                            banks[_l][1].index_copy_(-2,active,v.index_select(-2,active))
+                        return attention(q,banks[_l][0],banks[_l][1],**kwargs)
+                    _b._scaled_dot_product_attention=substitute
+                    try:output=_orig(x,*a,**kw)
+                    finally:_b._scaled_dot_product_attention=attention
+                    if banks[_l][2] is None:banks[_l][2]=output[0].clone()
+                    else:banks[_l][2].index_copy_(1,active,output[0].index_select(1,active))
+                    return (banks[_l][2],*output[1:])
+                block.forward=forward
+            try:yield
+            finally:
+                for block,original in originals:block.forward=original
+
+        for policy in cases:
+            with self.subTest(policy=policy):
+                with dense_reference(policy):
+                    expected=[forward_logits(self.llm,self.prepared,x) for x in inputs]
+                with PrefixCache(self.llm,self.prepared,policy) as cache:
+                    actual=[forward_logits(self.llm,self.prepared,x) for x in inputs]
+                for a,b in zip(expected,actual):torch.testing.assert_close(a,b,rtol=2e-5,atol=2e-6)
+                counts=cache.accounting()
+                self.assertEqual(counts['forwards'],17)
+                self.assertEqual(counts['computed_token_layers'],sum(sum(e['layer_computed_rows']) for e in cache.events))
+                self.assertEqual(counts['dense_token_layers_at_same_forward_count'],17*9*2)
+                self.assertTrue(all(all(n>=4 for n in e['layer_computed_rows']) for e in cache.events))
+                self.assertLess(counts['computed_rows_by_layer'][0],counts['computed_rows_by_layer'][1])
+                # Every shallow refresh for a token group also refreshes deeper layers.
+                for e in cache.events:
+                    for shallow,deep in zip(e['layer_refresh'][0],e['layer_refresh'][1]):
+                        if shallow:self.assertTrue(deep)
+                with self.assertRaisesRegex(RuntimeError,'cleanup'):
+                    with PrefixCache(self.llm,self.prepared,policy):raise RuntimeError('cleanup')
+                baseline=forward_logits(self.llm,self.prepared,inputs[0])
+                torch.testing.assert_close(baseline,actual[0],rtol=0,atol=0)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_eos_stopping_waits_for_preceding_masks(self):
         from experiments.audio_drift.decode import forward_logits
         # Force confidence order: EOS at position 1, then position 0, then tail.
@@ -625,6 +780,80 @@ class UpstreamTests(unittest.TestCase):
             torch.testing.assert_close(x,y,rtol=0,atol=0)
         with self.assertRaises(ValueError):
             benchmark_replay(self.llm, self.prepared, [], 0, args, Path('/tmp'))
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_depth_generation_replay_and_cohort_report_together(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.benchmark import benchmark
+        from experiments.audio_drift.replay import benchmark_replay
+        from experiments.audio_drift.reasoning_report import summarize, compare_depth, main
+        self.llm.float();baseline,states,_=decode(self.llm,self.prepared,4,2,4)
+        args=SimpleNamespace(interventions=['freeze'],freeze_groups=['prefix'],refresh_intervals=[1,2],
+            mixed_refresh=[],triple_refresh=[],condition_names=['freeze_prefix_r1','freeze_prefix_r2'],
+            depth_multipliers=[2,1],benchmark_conditions=[],benchmark_stopping='eos',benchmark_repeats=2,
+            replay_steps=3,replay_repeats=2,length=4,block_length=2,steps=4)
+        tokenizer=SimpleNamespace(eos_token_id=30,decode=lambda ids,**kw:'#### 18')
+        with tempfile.TemporaryDirectory() as directory, patch.object(torch.cuda,'synchronize'), \
+             patch.object(torch.cuda,'reset_peak_memory_stats'), \
+             patch.object(torch.cuda,'max_memory_allocated',return_value=0):
+            directory=Path(directory)
+            bench=benchmark(self.llm,self.prepared,baseline,args,tokenizer,{'metric':'numeric','target':'18'},directory)
+            replay=benchmark_replay(self.llm,self.prepared,states,bench['baseline_forwards'],args,directory)
+            self.assertEqual(len(bench['policies']),3)
+            results=[]
+            for i,cohort in enumerate(['development','fresh']):
+                result={'id':str(i),'cohort':cohort,'target':'18','score':score('#### 18','18','numeric'),
+                        'answer_has_no_eos':False,'benchmark':bench,'fixed_input_replay':replay}
+                results.append(result)
+                folder=directory/'samples'/f'{i:05}';folder.mkdir(parents=True)
+                (folder/'result.json').write_text(json.dumps(result))
+            rows,summary=summarize(results)
+            depth='freeze_prefix_r2_depth2x1'
+            self.assertEqual(summary[depth]['cohorts']['fresh']['samples'],1)
+            self.assertEqual(summary[depth]['cohorts']['development']['samples'],1)
+            comparisons=compare_depth(rows)
+            self.assertEqual(comparisons['all'][depth]['samples'],2)
+            self.assertEqual(comparisons['fresh'][depth]['depth_correct'],1)
+            self.assertGreater(comparisons['fresh'][depth]['replay_depth_speedup_over_flat'],0)
+            with patch('sys.argv',['reasoning_report','--run',str(directory)]):main()
+            self.assertIn('Flat versus depth-aware: fresh',(directory/'analysis/reasoning_report.md').read_text())
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_no_drift_runner_never_constructs_measurement_hooks(self):
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        from experiments.audio_drift import run
+        self.llm.float()
+        tokenizer=SimpleNamespace(eos_token_id=30,all_special_ids=[30,31],decode=lambda ids,**kw:str(ids))
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            directory=Path(directory);audio=directory/'fake.wav';audio.write_bytes(b'fixture')
+            manifest=directory/'input.jsonl'
+            manifest.write_text(json.dumps({'id':'fixture','audio':'fake.wav','task':'fixture','prompt':'test',
+                                            'cohort':'fresh'})+'\n')
+            out=directory/'run'
+            argv=['audio_drift','--manifest',str(manifest),'--out',str(out),
+                  '--diffa-root',os.environ['DIFFA_ROOT'],'--length','4','--block-length','2','--steps','4',
+                  '--no-drift','--verify-samples','0']
+            stack.enter_context(patch('sys.argv',argv))
+            for name in ['synchronize','reset_peak_memory_stats','manual_seed_all']:
+                stack.enter_context(patch.object(torch.cuda,name))
+            for name,value in [('is_bf16_supported',True),('max_memory_allocated',0),
+                               ('get_device_name','CPU fixture'),('get_device_properties',SimpleNamespace(total_memory=0))]:
+                stack.enter_context(patch.object(torch.cuda,name,return_value=value))
+            # Pass the runner's hardware gate once; CUDA stays unavailable to CPU TorchDynamo.
+            stack.enter_context(patch.object(torch.cuda,'is_available',side_effect=[True]+[False]*10000))
+            stack.enter_context(patch.object(run.importlib.metadata,'version',return_value='fixture'))
+            stack.enter_context(patch.object(run,'resolve_revision',return_value='fixture'))
+            stack.enter_context(patch.object(run,'load_model',return_value=(SimpleNamespace(llm_model=self.llm),tokenizer,None,{})))
+            stack.enter_context(patch.object(run,'load_audio',return_value=(np.zeros(16),.001)))
+            stack.enter_context(patch.object(run,'prepare',return_value=self.prepared))
+            stack.enter_context(patch.object(run,'DriftRecorder',side_effect=AssertionError('drift disabled')))
+            stack.enter_context(patch.object(run,'AttentionProbe',side_effect=AssertionError('drift disabled')))
+            run.main()
+            result=json.loads((out/'samples/00000/result.json').read_text())
+            self.assertFalse(result['drift_recorded'])
+            self.assertEqual(result['cohort'],'fresh')
+            self.assertFalse((out/'samples/00000/drift.jsonl').exists())
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_profiler_scopes_preserve_outputs_and_restore_on_exception(self):

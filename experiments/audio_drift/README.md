@@ -6,6 +6,93 @@ The default checkpoint is **DIFFA-2**, with its original semantic/acoustic
 connectors, Whisper-large-v3, and LLaDA-8B-Instruct. This experiment does not
 change the existing neighborhood, sleep, or translation experiments.
 
+## Overnight paired flat/depth experiment (v10)
+
+```bash
+cd /workspace/llada-audio-drift
+git pull --ff-only
+nohup env \
+  RUN_NAME=audio_gsm_night30_v10 \
+  SAMPLES=30 \
+  SKIP_INSTALL=1 \
+  REFERENCE_DEVICE=cuda \
+  VERIFY_SAMPLES=2 \
+  bash scripts/vast_audio_drift.sh gsm-night \
+  > audio_gsm_night30_v10.log 2>&1 &
+tail -f audio_gsm_night30_v10.log
+```
+
+This prepares a reusable 30-row manifest: **10 existing development questions
+plus 20 fresh questions**, selected without consulting model correctness. Fresh
+source IDs exclude every development ID, and use the development dataset's pinned
+revision. Development/fresh examples are interleaved so the first 10 replay
+samples cover five of each cohort. Reports separate both cohorts; the combined
+result is not presented as independent held-out validation. Existing manifest
+and WAV files are preserved. Cached test shards are reused. `BASE_MANIFEST` and
+`MANIFEST` override these paths; `DATA_SEED=20261020` controls fresh selection.
+
+The six policies are evaluated **both flat and depth-aware**:
+
+| Flat base policy | Acoustic | Prompt | Semantic |
+|---|---:|---:|---:|
+| Shared prefix | 8 | 8 | 8 |
+| Audio slower | 16 | 8 | 16 |
+| Acoustic slower | 16 | 8 | 8 |
+| Semantic fresher | 16 | 8 | 4 |
+| Semantic fresher, acoustic control | 8 | 8 | 4 |
+| Prompt slower | 16 | 16 | 4 |
+
+Each depth variant multiplies its base intervals by **8,4,2,1**, respectively,
+over the four eight-layer groups from shallow to deep. Thus shared8 becomes
+64/32/16/8 across depth; the deepest group's interval stays equal to the flat
+policy. This provides a generic depth-aware shared-prefix control with the same
+depth factors as the audio-specific variants. The depth suffix in condition names
+is `_depth8x4x2x1`. A refresh-every-forward identity control adds one condition:
+**13 cache conditions total**, plus the ordinary uncached baseline. No separate
+depth variant is generated for the identity control.
+
+The budget stays at 512 answer slots / 32-slot blocks / 256 maximum forwards.
+Every policy gets one untimed warmup and two timed autonomous decodes with safe
+EOS stopping on all 30 questions. Cache conditions are shuffled reproducibly per
+question, keeping the identity first, and their order is recorded. Baseline
+accuracy, all policy accuracies, answer lengths, parse failures and timings are
+saved. Both missing and wrong answers remain incorrect in the main results.
+Scorer `numeric-labels-comma-v3` additionally accepts a comma immediately after an
+explicit final marker (e.g. `####, 120`); strict grades are retained, and no number
+is extracted from arbitrary reasoning text.
+
+Equal-input forward replay runs on the first **10 examples**, not just two:
+up to 64 identical baseline pre-EOS states, one warmup and two timed repeats for
+each condition. Every timed pass starts with a fresh cache. Only model forward
+work is timed in replay; autonomous generation is measured separately.
+
+**Drift collection is disabled** for this preset because full-depth drift has
+already been measured. The ordinary full-budget baseline still generates states
+for replay, but no drift hooks, dense continuation branches, pairwise histories
+or operator profiles run. This reduces redundant overnight work and output size.
+`--no-drift` is also available in the Python runner. Other presets keep their
+existing drift behavior.
+
+Output `analysis/reasoning_report.md` includes all/development/fresh accuracy and
+latency, direct flat-versus-depth pairs, and equal-input replay. Machine-readable
+`reasoning_summary.json`, `depth_comparisons.json` and `reasoning_pairs.csv`
+retain paired counts, baseline-correct secondary subsets and per-cohort results.
+Partial per-example benchmark files are flushed after each completed condition.
+Completed examples are skipped on an unchanged rerun; interrupted examples
+restart. Source/settings changes require a new run name.
+
+This is a full-night run. Based on the previous A40 timings, budget roughly
+**6-9 hours**, with substantial uncertainty for new questions and unmeasured
+layer schedules. This is an extrapolation, not a measured duration guarantee.
+`REPLAY_SAMPLES=0` disables the extra replay work; `REPLAY_SAMPLES`, `REPLAY_STEPS`
+and `BENCHMARK_REPEATS` otherwise override their defaults. For a two-example GPU
+check use a fresh run name plus `SAMPLES=2 REPLAY_SAMPLES=2`; the prepared manifest
+still contains the same 30 examples.
+
+For a code walkthrough, see [CACHE_GUIDE.md](CACHE_GUIDE.md). Full-size GPU timing
+and quality validation occurs on Vast; local verification uses CPU tests of the
+pinned upstream transformer and a launcher check with the real argument parser.
+
 ## Full-depth measurement correction
 
 The initial GSM v7/v8 commands selected layers 0,7,15,23,31 to reduce diagnostic

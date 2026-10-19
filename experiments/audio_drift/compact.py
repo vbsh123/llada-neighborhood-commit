@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager
 import torch
 
 from .hooks import blocks_of
+from .protocol import layer_intervals
 
 
 class PrefixCache(AbstractContextManager):
@@ -24,7 +25,7 @@ class PrefixCache(AbstractContextManager):
             if not positions or claimed.intersection(positions) or spec["refresh_every"] < 0:
                 raise ValueError("Cache schedules must select nonempty disjoint fixed-prefix groups")
             claimed.update(positions)
-            self.schedules.append((positions, spec["refresh_every"]))
+            self.schedules.append((positions, layer_intervals(spec, len(self.blocks))))
         self.step = -1
         self.patterns = {}
         self.banks = {}
@@ -49,18 +50,26 @@ class PrefixCache(AbstractContextManager):
                         raise ValueError("Compact path requires batch one, bidirectional no-past attention")
                     if _layer == 0:
                         self.step += 1
-                        due = tuple(self.step == 0 or bool(interval and self.step % interval == 0)
-                                    for _, interval in self.schedules)
-                        key = (x.shape[1], x.device, due)
-                        if key not in self.patterns:
-                            inactive = {p for (positions, _), refresh in zip(self.schedules, due)
-                                        if not refresh for p in positions}
-                            selected = [p for p in range(x.shape[1]) if p not in inactive]
-                            self.patterns[key] = torch.tensor(selected, dtype=torch.long, device=x.device)
-                        self.active = self.patterns[key]
-                        self.events.append({"step": self.step, "computed_rows": len(self.active),
-                                            "total_rows": x.shape[1], "refresh": list(due)})
-                    active = self.active
+                        self.events.append({"step": self.step, "total_rows": x.shape[1],
+                                            "layer_computed_rows": [], "layer_refresh": []})
+                    # Each layer has its own clock and banks. Flat schedules
+                    # expand to identical intervals at every layer.
+                    due = tuple(self.step == 0 or bool(intervals[_layer] and
+                                self.step % intervals[_layer] == 0) for _, intervals in self.schedules)
+                    key = (x.shape[1], x.device, due)
+                    if key not in self.patterns:
+                        inactive = {p for (positions, _), refresh in zip(self.schedules, due)
+                                    if not refresh for p in positions}
+                        selected = [p for p in range(x.shape[1]) if p not in inactive]
+                        self.patterns[key] = torch.tensor(selected, dtype=torch.long, device=x.device)
+                    active = self.patterns[key]
+                    event = self.events[-1]
+                    if _layer == 0:
+                        # Historical fields describe layer zero; aggregate
+                        # accounting below uses the full per-layer counts.
+                        event.update(computed_rows=len(active), refresh=list(due))
+                    event['layer_computed_rows'].append(len(active))
+                    event['layer_refresh'].append(list(due))
                     if len(active) == x.shape[1]:
                         # Use upstream verbatim for full refresh and identity controls.
                         attention = _block._scaled_dot_product_attention
@@ -122,10 +131,16 @@ class PrefixCache(AbstractContextManager):
         self.originals.clear()
 
     def accounting(self):
-        full = sum(e["total_rows"] for e in self.events)
-        used = sum(e["computed_rows"] for e in self.events)
-        return {"forwards": len(self.events), "computed_token_layers": used * len(self.blocks),
-                "dense_token_layers_at_same_forward_count": full * len(self.blocks),
+        if any(len(e['layer_computed_rows']) != len(self.blocks) for e in self.events):
+            raise RuntimeError("Incomplete transformer forwards in cache accounting")
+        full = sum(e["total_rows"] * len(self.blocks) for e in self.events)
+        used = sum(sum(e['layer_computed_rows']) for e in self.events)
+        return {"forwards": len(self.events), "computed_token_layers": used,
+                "dense_token_layers_at_same_forward_count": full,
+                "computed_rows_by_layer": [sum(e['layer_computed_rows'][i] for e in self.events)
+                                           for i in range(len(self.blocks))],
+                "effective_schedules": [{"positions": len(positions), "refresh_by_layer": list(intervals)}
+                                        for positions, intervals in self.schedules],
                 "skipped_token_update_fraction": 1 - used / max(1, full),
                 "note": "Counts skipped QKV, attention query/output and MLP rows; not total FLOPs or measured speedup. "
                         "All answer rows and all KV columns remain present. Embedding, final norm and vocabulary "

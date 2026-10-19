@@ -72,6 +72,8 @@ def final_number(text, normalize_labels=True):
     answer = text[markers[-1].end():].strip() if markers else text.strip()
     if markers and normalize_labels:
         answer = re.sub(r"^(?:<final numerical answer>\s*|answer\s*:\s*)", "", answer, flags=re.I)
+        if answer.startswith(','):
+            answer = answer[1:].strip()
     answer = answer.rstrip(".").strip()
     return canonical_number(answer)
 
@@ -86,7 +88,7 @@ def score(text, target, metric):
         prediction = final_number(text)
         strict = final_number(text, normalize_labels=False)
         return {"metric": metric, "prediction": prediction, "reference": reference,
-                "scoring_version": "numeric-labels-v2", "strict_prediction": strict,
+                "scoring_version": "numeric-labels-comma-v3", "strict_prediction": strict,
                 "strict_correct": strict == reference, "format_normalized": prediction != strict,
                 "parse_failed": prediction is None, "correct": prediction == reference}
     if metric == "exact":

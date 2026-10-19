@@ -1,5 +1,7 @@
 """Warmed batch-one decoding timings with actual fixed-prefix row skipping."""
 from contextlib import nullcontext
+import hashlib
+import random
 import statistics
 import time
 
@@ -8,6 +10,7 @@ import torch
 from .compact import PrefixCache
 from .decode import decode
 from .inputs import score
+from .protocol import is_identity
 
 
 def visible_ids(final, prepared, eos_id):
@@ -15,10 +18,8 @@ def visible_ids(final, prepared, eos_id):
     return ids[:ids.index(eos_id) + 1] if eos_id in ids else ids
 
 
-@torch.no_grad()
-def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diagnostics=(), preparation_seconds=None):
-    from .run import display_text, intervention_specs, write_json
-
+def policy_specs(args, sample_id=None):
+    from .run import intervention_specs
     specs = [s for s in intervention_specs(args) if s["mode"] == "freeze"]
     names = getattr(args, "benchmark_conditions", [])
     if names:
@@ -28,6 +29,21 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
         specs = [s for s in specs if s["condition"] in names]
     if not specs:
         raise ValueError("Benchmark needs at least one freeze policy")
+    if getattr(args, 'shuffle_policy_order', False):
+        if sample_id is None:
+            raise ValueError("Shuffled timing order requires a sample ID")
+        seed = int.from_bytes(hashlib.sha256(f"{args.seed}:{sample_id}".encode()).digest()[:8], 'big')
+        identities = [s for s in specs if is_identity(s)]
+        rest = [s for s in specs if not is_identity(s)]
+        random.Random(seed).shuffle(rest)
+        specs = identities + rest
+    return specs
+
+
+@torch.no_grad()
+def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diagnostics=(), preparation_seconds=None):
+    from .run import display_text, write_json
+    specs = policy_specs(args, row.get('id'))
     eos = tokenizer.eos_token_id if args.benchmark_stopping == "eos" else None
 
     def measure(spec=None):
@@ -55,7 +71,8 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
     # gross GPU clock drift. Report individual repeats, never select the fastest.
     baseline_before, before, _, base_count = measure()
     del baseline_before
-    report = {"stopping": args.benchmark_stopping, "timed_repeats_per_policy": args.benchmark_repeats,
+    report = {"policy_order": [s["condition"] for s in specs],
+              "stopping": args.benchmark_stopping, "timed_repeats_per_policy": args.benchmark_repeats,
               "shared_audio_preparation_seconds": preparation_seconds,
               "baseline_seconds": [before], "baseline_forwards": base_count["forwards"],
               "baseline_visible_answer_tokens": len(expected) - int(tokenizer.eos_token_id in expected),
@@ -81,7 +98,7 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
         reproducible = all(x == outputs[0] for x in outputs)
         if not reproducible:
             raise RuntimeError(f"Timed repeats changed answer tokens: {spec['condition']}")
-        if all(s["refresh_every"] == 1 for s in spec["schedule"]) and outputs[0] != expected:
+        if is_identity(spec) and outputs[0] != expected:
             raise RuntimeError("Optimized refresh-every-forward identity differs from baseline")
         result = {**spec, "seconds": durations, "median_seconds": statistics.median(durations),
                   "peak_allocated_bytes": max(peaks), "accounting": accounting,

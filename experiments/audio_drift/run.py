@@ -1,7 +1,7 @@
 """Collect DIFFA audio drift on a local JSONL manifest; run inference on Vast."""
 import argparse
 from collections import defaultdict
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import hashlib
 import importlib.metadata
 import json
@@ -17,7 +17,7 @@ from .decode import Prepared, decode, distribution_change, forward_logits, sched
 from .hooks import AttentionProbe, blocks_of
 from .inputs import load_audio, read_manifest, score
 from .metrics import DriftRecorder
-from .protocol import anchors_for, conditions, work_estimate
+from .protocol import anchors_for, conditions, work_estimate, with_depth_variants
 from .model import (DIFFA_REPO, DIFFA_REVISION, LLM_REPO, LLM_REVISION,
                     load_model, prepare, resolve_revision)
 
@@ -47,7 +47,8 @@ def intervention_specs(args):
         if unknown:
             raise ValueError(f"Requested conditions not in generated matrix: {sorted(unknown)}")
         specs = [s for s in specs if s["condition"] in names]
-    return specs
+    factors = getattr(args, 'depth_multipliers', [])
+    return with_depth_variants(specs, factors) if factors else specs
 
 
 @torch.no_grad()
@@ -242,6 +243,10 @@ def parser():
                    help="Independent fixed-prefix schedules for all three groups")
     p.add_argument("--skip-dense-interventions", action="store_true",
                    help="Run generated policies only in the compact benchmark, without dense branches")
+    p.add_argument("--depth-multipliers", type=int, nargs="*", default=[],
+                   help="Add depth-aware variants of selected non-identity policies, e.g. 8 4 2 1")
+    p.add_argument("--no-drift", action="store_true",
+                   help="Skip drift hooks for a quality/latency experiment after baseline drift collection")
     p.add_argument("--progress-every", type=int, default=8)
     p.add_argument("--condition-names", nargs="*", default=[],
                    help="Run only these named conditions from the generated matrix")
@@ -250,6 +255,8 @@ def parser():
     p.add_argument("--benchmark-samples", type=int, default=0)
     p.add_argument("--benchmark-repeats", type=int, default=2)
     p.add_argument("--benchmark-conditions", nargs="*", default=[])
+    p.add_argument("--shuffle-policy-order", action="store_true",
+                   help="Shuffle policy timing order reproducibly per sample; identity controls stay first")
     p.add_argument("--replay-samples", type=int, default=0,
                    help="Also time identical baseline input states on this many first benchmark samples")
     p.add_argument("--replay-steps", type=int, default=64,
@@ -279,6 +286,10 @@ def main():
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
+    if args.depth_multipliers and not args.skip_dense_interventions:
+        raise ValueError("Depth variants require --skip-dense-interventions; use compact benchmarks/replay")
+    if args.no_drift and (args.pairwise_count or args.token_metrics or args.snapshot_steps):
+        raise ValueError("--no-drift cannot be combined with drift snapshots, token metrics or pairwise collection")
     if args.benchmark_samples and set(args.benchmark_conditions) - {s["condition"] for s in specifications if s["mode"] == "freeze"}:
         raise ValueError("Benchmark conditions must select generated freeze conditions")
     if (not 0 <= args.replay_samples <= args.benchmark_samples or args.replay_steps < 1
@@ -378,18 +389,20 @@ def main():
             estimated = len(pair_steps) * len(pairwise_layers) * prepared.answer_start * llm.config.d_model * 4
             print(f"  pairwise: {len(pair_steps)} snapshots, layers={pairwise_layers}; "
                   f"normalized-vector memory about {estimated / 1e9:.2f} GB on {args.pairwise_device}", flush=True)
-        recorder = DriftRecorder(work, prepared.labels(args.length), prepared.mask_id,
-                                 args.reference_device, args.token_metrics,
-                                 args.snapshot_steps, args.snapshot_layers, pairwise=pairwise)
+        recorder = None if args.no_drift else DriftRecorder(
+            work, prepared.labels(args.length), prepared.mask_id, args.reference_device, args.token_metrics,
+            args.snapshot_steps, args.snapshot_layers, pairwise=pairwise)
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         began = time.perf_counter()
         try:
-            with AttentionProbe(llm, prepared.audio_positions, recorder, layers):
+            with (AttentionProbe(llm, prepared.audio_positions, recorder, layers)
+                  if recorder is not None else nullcontext()):
                 final, states, events = decode(llm, prepared, args.length, args.block_length,
                                                args.steps, recorder, layers, progress_every=args.progress_every)
         finally:
-            recorder.close()
+            if recorder is not None:
+                recorder.close()
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - began
         peak_memory = torch.cuda.max_memory_allocated()
@@ -401,7 +414,7 @@ def main():
                         temperature=0., cfg_scale=0., mask_id=prepared.mask_id)
             verified = torch.equal(final, official)
             if not verified:
-                raise RuntimeError("Instrumented output differs from the official decoder; stopping")
+                raise RuntimeError("Baseline output differs from the official decoder; stopping")
             del official
         text = display_text(tokenizer, final, prepared.prompt.shape[1])
         answer_ids = final[0, prepared.prompt.shape[1]:].tolist()
@@ -420,6 +433,7 @@ def main():
         print(f"  baseline: official_match={verified}; score={baseline_score}; text={text!r}", flush=True)
         write_json(work / "steps.json", events)
         result = {"id": row["id"], "task": row["task"], "prompt": row["prompt"],
+                  "cohort": row.get("cohort", "unspecified"), "drift_recorded": recorder is not None,
                   "target": row.get("target"), "audio_seconds": duration,
                   "audio_preparation_seconds": preparation_seconds,
                   "duration_bin": row.get("duration_bin"), "speaker_id": row.get("speaker_id"),
@@ -453,7 +467,7 @@ def main():
         if index < args.replay_samples:
             from .replay import benchmark_replay
             result["fixed_input_replay"] = benchmark_replay(
-                llm, prepared, states, result["benchmark"]["baseline_forwards"], args, work)
+                llm, prepared, states, result["benchmark"]["baseline_forwards"], args, work, sample_id=row["id"])
         result["sample_wall_seconds"] = time.perf_counter() - sample_began
         print(f"  sample complete in {result['sample_wall_seconds'] / 60:.1f} minutes", flush=True)
         write_json(work / "result.json", result)
