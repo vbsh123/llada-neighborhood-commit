@@ -69,6 +69,22 @@ class InputTests(unittest.TestCase):
         self.assertEqual(row['reactivated_episodes'], 0)
 
     @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_high_to_low_has_separate_direction_and_requires_peak_to_fall(self):
+        from experiments.audio_drift.attention_recurrence import reactivation_records
+        mean = np.full((8, 1), 3.); mean[6] = .1
+        rows = reactivation_records(mean, mean, history=2, horizons=(6, 8), direction='high_to_low')
+        selected = {r['horizon']: r for r in rows if r['anchor_decode_quarter'] == -1}
+        self.assertEqual(selected[6]['transitioned_episodes'], 1)
+        self.assertEqual(selected[6]['first_target_delay_histogram'], {'5': 1})
+        self.assertIsNone(selected[6]['reactivated_episodes'])
+        self.assertEqual(selected[8]['right_censored_episodes'], 1)
+        # Mean can fall while a head still attends strongly: peak-to-low must NOT fire.
+        peak = np.full((8, 1), 3.)
+        row = reactivation_records(mean, peak, history=2, horizons=(6,),
+                                   high_metric='peak', direction='high_to_low')[0]
+        self.assertEqual(row['transitioned_episodes'], 0)
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
     def test_diagnostic_js_correlations_and_refresh_phases(self):
         from experiments.audio_drift.attention_dynamics import js_distance, correlations, eos_forward_count
         from experiments.audio_drift.refresh_profile import phase_name

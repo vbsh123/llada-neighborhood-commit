@@ -160,7 +160,7 @@ Directory and ZIP analysis agree on a synthetic replay fixture. A shell fixture
 checks the launcher through the real runner argument parser. Full-size CUDA
 profiling and BF16 execution still require the first Vast run.
 
-## Does low audio attention return later?
+## Does attention transition from low to high, or high to low?
 
 The updated recorder (attention schema 2) saves mean and maximum attention over
 all heads and the SAME fixed answer-probe positions on every forward, including
@@ -183,10 +183,15 @@ and semantic token positions separately, per layer and per example. Defaults:
   complete future observations; insufficient remaining steps are right-censored,
   not treated as evidence of safety.
 
-Outputs: `attention_recurrence_per_sample.csv` (numerators, denominators, censored
-counts and first-high delay histograms), `attention_recurrence_by_layer.csv`,
+Both directions are reported. High-to-low requires consecutive high forwards
+and measures the first subsequent low observation. For the peak-based version,
+the peak itself must fall below the low threshold. A first low observation is
+not evidence that attention stays low; inspect low-to-high recurrence separately.
+
+Outputs: `attention_recurrence_per_sample.csv` (direction, numerators, denominators, censored
+counts and first-target delay histograms), `attention_recurrence_by_layer.csv`,
 `attention_recurrence_summary.json`, a notes report, and a layer-wise probability
-plot. Results include pooled episode probabilities and equal-sample means, plus
+plot for low-to-high plus `attention_high_to_low.png`. Results include pooled episode probabilities and equal-sample means, plus
 stratification by the anchor's quarter of baseline decoding. Repeated episodes
 and layers are dependent; episode counts are not independent sample counts.
 
@@ -206,3 +211,57 @@ The attention distribution can change after removal. This is a baseline risk
 measurement that should precede a causal pruning intervention. Use the updated
 recorder in a new run (for example `RUN_NAME=audio_gsm_diagnose6_v12`); avoid
 changing source files during an active run.
+
+
+## Retention inventory: what can be analyzed after the GPU run?
+
+Defaults below refer specifically to `gsm-diagnose`, not older experiment modes.
+All six examples receive quality benchmarks, matched-input replay and separate
+attention diagnostics; only the first two receive synchronized refresh profiling
+and representative operator traces. Attention diagnostics cover all 32 layers
+and baseline states through safe EOS. Continuous speed replay uses at most the
+first 128 pre-EOS baseline states. Attention collection is untimed and separate
+from clean speed measurements.
+
+| Saved data | Granularity | Further CPU analyses |
+|---|---|---|
+| Input IDs, source/revisions, audio hashes, prompt, target, cohort, duration, group counts/positions and run settings | Example/run | Length/cohort stratification; reproducibility checks |
+| Baseline `steps.json`: block, masks, committed positions, commitment counts | Every full-baseline forward | Actual forward counts, block phases, unmasking curves, baseline token commit order |
+| Final baseline/policy text, token IDs, strict/normalized scores, parse failures and EOS flags | Example/policy/repeat | Alternative answer parsing, paired correctness, output lengths and tokens/second |
+| Clean decode and matched-state replay times, peak allocated memory, row accounting | Example/policy/repeat | Quality/latency comparisons, repeat variability, exact refresh counts |
+| Synchronized wall/CUDA forward timings and refresh phases | First two examples, policy/forward/repeat | Initialization versus cache-hit/refresh costs |
+| Representative CPU/CUDA operator traces with shapes and labeled scopes | Selected states on first two examples | Kernel/MLP/projection/attention/vocabulary attribution; avoid nested-scope double counting |
+| Hidden cosine distance and relative L2; key/value cosine distance | Example/layer/prefix group/consecutive-forward pair | Drift versus progress, depth, task/example characteristics |
+| Attention mass, mass change, raw L1 change, conditional JS divergence, value-contribution cosine/L2 change, query cosine drift | Same, for unchanged-input probe queries | Weight versus value changes; drift/attention/progress correlations |
+| Original prefix positions and fixed-probe mean/peak attention | Every prefix token, layer and observed forward, including zero | New low/high thresholds, histories/horizons, token rankings and recurrence analyses |
+| Per-token hidden cosine distance, attention absolute change and conditional mean | Consecutive forwards with unchanged-input probe queries | Within-group token drift/attention correlations and candidate ranking |
+
+The prefix groups are acoustic audio, semantic audio and fixed prompt text.
+Answer-row hidden drift is not collected here. Fixed-probe scalar arrays include
+prompt positions, although the current recurrence report selects acoustic and
+semantic positions only; prompt recurrence can be added offline from the same
+arrays. Per-token relative L2 and per-token key/value drift are not retained in
+this mode; their group summaries are available as described above.
+
+The fixed-probe arrays average over all measured queries and heads and also save
+the maximum across that population. They do NOT retain individual head/query
+weights, full hidden/Q/K/V vectors, logits, or full attention matrices. Therefore
+head-specific analyses, unsampled-query coverage, hidden-vector PCA/SVD or
+cross-modal subspace overlap require new collection. Testing a new pruning or
+cache policy's correctness also requires actual model execution. Existing final
+answers can be rescored without generation; intermediate policy reasoning and
+per-policy commitment trajectories are not archived. The full baseline commit
+history is archived and, because this decoder does not remask committed tokens,
+its token states can be reconstructed using the final baseline token IDs.
+
+Raw audio is referenced by path/source/hash, not copied into the run directory.
+Preserve the manifest and audio files as well as the whole run and console log
+if a self-contained input archive is needed. Dataset/model provenance helps
+re-download inputs but is not a substitute for the original bytes.
+
+`DIAGNOSTIC_QUERIES=16` is an optional broader answer-query sample before a new
+run; it increases diagnostic work and is still not exhaustive. Query selection
+and layer coverage must be chosen before collection. Thresholds, horizons,
+histories, progress bins, layer groupings and final-answer parsing can be changed
+afterward. The added high-to-low report uses the same schema-2 recordings and
+requires no additional GPU forwards.

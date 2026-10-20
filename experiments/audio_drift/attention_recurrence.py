@@ -1,4 +1,4 @@
-"""Can a low-attention audio position become highly attended later?
+"""Audio attention transitions from low to high and from high to low.
 
 Offline baseline analysis, not a pruning policy or proof of causal irrelevance.
 Uses the same fixed answer-probe population at every forward (schema version 2).
@@ -37,23 +37,27 @@ def low_episode_anchors(low, high, history):
 
 
 def reactivation_records(mean, peak, history=4, low_threshold=.5, high_threshold=2.,
-                         horizons=(4, 8, 16, 32), high_metric='mean'):
+                         horizons=(4, 8, 16, 32), high_metric='mean', direction='low_to_high'):
     """Inputs are attention weights divided by uniform attention 1/Nkeys."""
     mean, peak = np.asarray(mean, dtype=float), np.asarray(peak, dtype=float)
     if (mean.shape != peak.shape or mean.ndim != 2 or not mean.size or
             not np.isfinite(mean).all() or not np.isfinite(peak).all() or
             np.any(mean < 0) or np.any(peak + 1e-6 * np.maximum(1., peak) < mean) or
             not 0 <= low_threshold < high_threshold or high_metric not in {'mean', 'peak'} or
+            direction not in {'low_to_high', 'high_to_low'} or
             not horizons or any(h < 1 for h in horizons)):
         raise ValueError('Invalid attention series, metrics, thresholds or horizons')
-    high = (mean if high_metric == 'mean' else peak) >= high_threshold
-    times, tokens = low_episode_anchors(mean <= low_threshold, high, history)
+    high_values = mean if high_metric == 'mean' else peak
+    high = high_values >= high_threshold
+    low = (mean if direction == 'low_to_high' else high_values) <= low_threshold
+    source, target = (low, high) if direction == 'low_to_high' else (high, low)
+    times, tokens = low_episode_anchors(source, target, history)
     n, m = mean.shape
     next_high = np.full((n, m), n, dtype=np.int32)
     last = np.full(m, n, dtype=np.int32)
     for t in range(n - 1, -1, -1):
         next_high[t] = last
-        last = np.where(high[t], t, last)
+        last = np.where(target[t], t, last)
     future = next_high[times, tokens]
     delays = future - times
     has_future_high = future < n
@@ -68,14 +72,20 @@ def reactivation_records(mean, peak, history=4, low_threshold=.5, high_threshold
                 hit &= delays <= horizon
             selected_delays = delays[hit].tolist()
             count, hits = int(eligible.sum()), int(hit.sum())
-            rows.append({'history': history, 'high_metric': high_metric, 'horizon': horizon,
+            histogram = {str(k): v for k, v in sorted(Counter(selected_delays).items())}
+            rows.append({'direction': direction, 'history': history, 'high_metric': high_metric, 'horizon': horizon,
                          'anchor_decode_quarter': quarter, 'low_threshold_uniform_units': low_threshold,
                          'high_threshold_uniform_units': high_threshold,
-                         'low_episodes': int(chosen.sum()), 'eligible_episodes': count,
+                         'source_episodes': int(chosen.sum()),
+                         'low_episodes': int(chosen.sum()) if direction == 'low_to_high' else None,
+                         'eligible_episodes': count,
                          'right_censored_episodes': int(chosen.sum()) - count,
-                         'reactivated_episodes': hits, 'probability': hits / count if count else None,
+                         'transitioned_episodes': hits,
+                         'reactivated_episodes': hits if direction == 'low_to_high' else None,
+                         'probability': hits / count if count else None,
                          'distinct_eligible_tokens': int(len(np.unique(tokens[eligible]))),
-                         'first_high_delay_histogram': {str(k): v for k, v in sorted(Counter(selected_delays).items())}})
+                         'first_target_delay_histogram': histogram,
+                         'first_high_delay_histogram': histogram if direction == 'low_to_high' else {}})
     return rows
 
 
@@ -132,31 +142,36 @@ def analyze(run, out=None, histories=(1, 4, 8), horizons=(4, 8, 16, 32),
                 mean, peak = np.stack([v[2] for v in values]), np.stack([v[3] for v in values])
                 for history in histories:
                     for metric in ['mean', 'peak']:
-                        for record in reactivation_records(mean, peak, history, low, high, horizons, metric):
-                            rows.append({'id': result['id'], 'cohort': result.get('cohort'),
-                                         'layer': layer, 'group': group, 'observed_forwards': len(values), **record})
+                        for direction in ['low_to_high', 'high_to_low']:
+                            for record in reactivation_records(mean, peak, history, low, high, horizons, metric, direction):
+                                rows.append({'id': result['id'], 'cohort': result.get('cohort'),
+                                             'layer': layer, 'group': group, 'observed_forwards': len(values), **record})
         aggregate = []
         grouping = defaultdict(list)
         for row in rows:
-            key = (row['group'], row['layer'], row['history'], row['high_metric'],
+            key = (row['direction'], row['group'], row['layer'], row['history'], row['high_metric'],
                    row['horizon'], row['anchor_decode_quarter'])
             grouping[key].append(row)
-        for (group, layer, history, metric, horizon, quarter), values in grouping.items():
+        for (direction, group, layer, history, metric, horizon, quarter), values in grouping.items():
             eligible = sum(v['eligible_episodes'] for v in values)
-            hits = sum(v['reactivated_episodes'] for v in values)
+            hits = sum(v['transitioned_episodes'] for v in values)
             probabilities = [v['probability'] for v in values if v['probability'] is not None]
-            aggregate.append({'group': group, 'layer': layer, 'history': history,
+            aggregate.append({'direction': direction, 'group': group, 'layer': layer, 'history': history,
                               'high_metric': metric, 'horizon': horizon, 'anchor_decode_quarter': quarter,
                               'eligible_samples': len(probabilities), 'eligible_episodes': eligible,
-                              'reactivated_episodes': hits,
+                              'transitioned_episodes': hits,
+                              'reactivated_episodes': hits if direction == 'low_to_high' else None,
                               'right_censored_episodes': sum(v['right_censored_episodes'] for v in values),
                               'pooled_probability': hits / eligible if eligible else None,
                               'equal_sample_mean_probability': statistics.mean(probabilities) if probabilities else None})
         notes = [
             'Low = mean attention across the SAME fixed probe queries and all heads <= low/Nkeys. '
-            'Future high is either mean or maximum across those probes/heads >= high/Nkeys.',
+            'Future high is either mean or maximum across those probes/heads >= high/Nkeys. '
+            'For high-to-low, low uses that SAME metric, so peak-to-low requires the peak itself to fall.',
             'Thresholds are descriptive choices, not calibrated pruning guarantees. Rerun this CPU analysis with other thresholds.',
-            'One trigger per contiguous low-attention episode per token, history and high metric; current-high positions are excluded.',
+            'Both low-to-high and high-to-low directions are analyzed. One trigger per contiguous source-state '
+            'episode per token/history/high metric; positions already in the target state are excluded.',
+            'Reaching low attention once after a high episode does not mean it remains low; use low-to-high risk separately.',
             'A fixed horizon requires the entire future window. Near-end episodes are reported as censored, not counted as safe.',
             'remaining_decode covers only the observed remaining baseline decode; exposure lengths differ.',
             'Separate sample/layer/group results; multiple token episodes and layers are dependent. No independent-token confidence claim.',
@@ -166,24 +181,26 @@ def analyze(run, out=None, histories=(1, 4, 8), horizons=(4, 8, 16, 32),
             'Schema-1 conditional-query means are unsupported: query selection changed across forwards. They require recollection, not relabeling.'
         ]
         write_csv(out/'attention_recurrence_per_sample.csv', [
-            {**r, 'first_high_delay_histogram': json.dumps(r['first_high_delay_histogram'])} for r in rows])
+            {**r, 'first_high_delay_histogram': json.dumps(r['first_high_delay_histogram']),
+             'first_target_delay_histogram': json.dumps(r['first_target_delay_histogram'])} for r in rows])
         write_csv(out/'attention_recurrence_by_layer.csv', aggregate)
         report = {'samples': sample_count, 'unsupported_samples': sorted(set(unsupported)),
                   'low_threshold_uniform_units': low, 'high_threshold_uniform_units': high,
                   'histories': list(histories), 'horizons': list(horizons), 'notes': notes, 'records': aggregate}
         (out/'attention_recurrence_summary.json').write_text(json.dumps(report, indent=2, allow_nan=False)+'\n')
-        (out/'attention_recurrence_report.md').write_text('# Future attention after low-attention episodes\n\n'
+        (out/'attention_recurrence_report.md').write_text('# Future attention transitions in both directions\n\n'
             +f'Analyzed examples: {sample_count}. Unsupported older examples: {len(set(unsupported))}.\n\n'
             +'\n\n'.join(notes)+'\n')
         if plots and aggregate:
-            plot(out, aggregate, low, high)
+            for direction in ['low_to_high', 'high_to_low']:
+                plot(out, [r for r in aggregate if r['direction'] == direction], low, high, direction)
         print(f'Wrote audio attention recurrence analysis: {sample_count} examples, {len(aggregate)} layer conditions', flush=True)
         return report
     finally:
         archive.close()
 
 
-def plot(out, records, low, high):
+def plot(out, records, low, high, direction='low_to_high'):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -200,12 +217,14 @@ def plot(out, records, low, high):
                     and r['equal_sample_mean_probability'] is not None], key=lambda r:r['layer'])
                 ax.plot([r['layer'] for r in selected], [r['equal_sample_mean_probability'] for r in selected],
                         label=f'next {horizon} forwards')
-            ax.set_title(f'{group}: low mean → high {metric}')
-            ax.set_xlabel('Transformer layer'); ax.set_ylabel('Probability of future high attention')
+            label = f'low mean → high {metric}' if direction == 'low_to_high' else f'high {metric} → low {metric}'
+            ax.set_title(f'{group}: {label}')
+            ax.set_xlabel('Transformer layer'); ax.set_ylabel('Probability of reaching target attention state')
             ax.set_ylim(0, 1); ax.legend(fontsize=8)
-    fig.suptitle(f'{history} consecutive low forwards; low ≤ {low}×uniform, high ≥ {high}×uniform\n'
+    fig.suptitle(f'{history} consecutive source-state forwards; low ≤ {low}×uniform, high ≥ {high}×uniform\n'
                  'Equal sample means; full future windows only; sampled answer queries')
-    fig.tight_layout(); fig.savefig(out/'attention_recurrence.png', dpi=160); plt.close(fig)
+    filename = 'attention_recurrence.png' if direction == 'low_to_high' else 'attention_high_to_low.png'
+    fig.tight_layout(); fig.savefig(out/filename, dpi=160); plt.close(fig)
 
 
 if __name__ == '__main__':
