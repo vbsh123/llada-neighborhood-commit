@@ -193,6 +193,7 @@ if [[ "$mode" == gsm-pilot || "$mode" == gsm-sweep || "$mode" == gsm-night || "$
 fi
 if [[ "$mode" == gsm-diagnose ]]; then
   python -m experiments.audio_drift.diagnostic_report --run "runs/$experiment_name"
+  python -m experiments.audio_drift.attention_recurrence --run "runs/$experiment_name"
 fi
 if [[ "$mode" != gsm-night && "$mode" != gsm-diagnose ]]; then
 python -m experiments.audio_drift.analyze --run "runs/$experiment_name"

@@ -159,3 +159,50 @@ the analytical budget, and profiler scope restoration preserves cached outputs.
 Directory and ZIP analysis agree on a synthetic replay fixture. A shell fixture
 checks the launcher through the real runner argument parser. Full-size CUDA
 profiling and BF16 execution still require the first Vast run.
+
+## Does low audio attention return later?
+
+The updated recorder (attention schema 2) saves mean and maximum attention over
+all heads and the SAME fixed answer-probe positions on every forward, including
+forward zero and steps where probe token identities change. The pairwise drift
+correlation still uses only unchanged query identities; those conditional means
+must not be used as a fixed-population time series. Older schema-1 runs are marked
+unsupported for recurrence rather than silently mixing query populations.
+
+`gsm-diagnose` now automatically runs `attention_recurrence`. It tracks acoustic
+and semantic token positions separately, per layer and per example. Defaults:
+
+- Low: mean attention <= 0.5 times uniform attention (uniform = 1/Nkeys).
+- Future high: attention >= 2 times uniform, measured both as a mean and as a
+  maximum over any measured head/query to expose spikes hidden by averaging.
+- Require 1, 4, or 8 consecutive low-attention forwards. Trigger once per
+  contiguous low episode for a token, at the first eligible point that is not
+  already high under the chosen high metric.
+- Measure return to high attention within 4, 8, 16, or 32 subsequent forwards,
+  plus any time during the observed remaining decode. Fixed horizons require
+  complete future observations; insufficient remaining steps are right-censored,
+  not treated as evidence of safety.
+
+Outputs: `attention_recurrence_per_sample.csv` (numerators, denominators, censored
+counts and first-high delay histograms), `attention_recurrence_by_layer.csv`,
+`attention_recurrence_summary.json`, a notes report, and a layer-wise probability
+plot. Results include pooled episode probabilities and equal-sample means, plus
+stratification by the anchor's quarter of baseline decoding. Repeated episodes
+and layers are dependent; episode counts are not independent sample counts.
+
+The thresholds are descriptive starting points, not calibrated pruning rules.
+They can be changed after collection without additional model forwards:
+
+```bash
+python -m experiments.audio_drift.attention_recurrence \
+  --run runs/audio_gsm_diagnose6_v12 \
+  --out runs/audio_gsm_diagnose6_v12/analysis/recurrence_low025_high4 \
+  --low 0.25 --high 4 --histories 1 4 8 --horizons 4 8 16 32
+```
+
+Only sampled answer queries are covered. Low weights here do not prove that all
+answer queries ignore the token, or that token removal preserves predictions.
+The attention distribution can change after removal. This is a baseline risk
+measurement that should precede a causal pruning intervention. Use the updated
+recorder in a new run (for example `RUN_NAME=audio_gsm_diagnose6_v12`); avoid
+changing source files during an active run.

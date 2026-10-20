@@ -93,6 +93,18 @@ class AttentionDynamics(AbstractContextManager):
         packet = self.pending.pop(layer)
         packet['hidden'] = hidden.detach().clone()
         packet['ids'] = self.ids.clone()
+        if self.save_tokens:
+            self.arrays['attention_schema_version'] = np.asarray(2, dtype=np.int32)
+            self.arrays['sequence_length'] = np.asarray(packet['probabilities'].shape[-1], dtype=np.int32)
+            # Recurrence needs the SAME query population on every forward,
+            # including step zero and forwards where query identities change.
+            # The unchanged-query subset below is only for pairwise drift correlations.
+            for group, pos in self.positions.items():
+                prefix = f'l{layer:02d}_{group}'
+                p = packet['probabilities'][..., pos]
+                self.arrays[prefix + '_positions'] = np.asarray(pos, dtype=np.int32)
+                self.arrays[prefix + '_attention_all_probe_mean'] = p.mean((0, 1)).cpu().numpy()
+                self.arrays[prefix + '_attention_all_probe_peak'] = p.amax((0, 1)).cpu().numpy()
         old = self.previous.get(layer)
         if old is not None:
             common = self.ids == old['ids']
@@ -172,8 +184,10 @@ def collect_dynamics(llm, prepared, states, events, baseline_ids, eos_id, args, 
     layers = list(range(llm.config.n_layers)) if args.diagnostic_layers == 'all' else [int(v) for v in args.diagnostic_layers.split(',')]
     write_json(work / 'attention_dynamics_config.json', {
         'layers': layers, 'query_offsets': query_offsets, 'forwards': stop,
+        'attention_schema_version': 2,
         'note': 'Separate untimed replay of uncached baseline states. All heads, fixed sampled answer queries. '
                 'Only queries whose input identity is unchanged are compared. FP32 attention reconstruction; '
+                'Recurrence arrays instead use the full fixed probe set at EVERY forward, including step zero. '
                 'group contribution is before output projection. Not a causal importance measurement. '
                 'Masked future answer slots are not included in the text/prompt group.'})
     print(f'  attention dynamics: {stop} baseline forwards; {len(layers)} layers; {len(queries)} fixed queries', flush=True)

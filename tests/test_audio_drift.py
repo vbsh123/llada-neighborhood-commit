@@ -37,6 +37,38 @@ class InputTests(unittest.TestCase):
         self.assertEqual(budget['dense_token_layers'], 1280)
 
     @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_low_attention_episodes_and_future_reactivation_are_not_conflated(self):
+        from experiments.audio_drift.attention_recurrence import low_episode_anchors, reactivation_records
+        low = np.asarray([[1], [1], [1], [0], [1], [1]], dtype=bool)
+        times, tokens = low_episode_anchors(low, np.zeros_like(low), 2)
+        self.assertEqual(times.tolist(), [1, 5])
+        self.assertEqual(tokens.tolist(), [0, 0])
+        mean = np.full((8, 1), .1); mean[6] = 3.
+        rows = reactivation_records(mean, mean, history=2, horizons=(2, 4, 6, 8))
+        lookup = {r['horizon']: r for r in rows if r['anchor_decode_quarter'] == -1}
+        self.assertEqual(lookup[4]['eligible_episodes'], 1)
+        self.assertEqual(lookup[4]['reactivated_episodes'], 0)
+        self.assertEqual(lookup[6]['reactivated_episodes'], 1)
+        self.assertEqual(lookup[6]['first_high_delay_histogram'], {'5': 1})
+        self.assertEqual(lookup[8]['eligible_episodes'], 0)
+        self.assertEqual(lookup[8]['right_censored_episodes'], 1)
+        self.assertIsNone(lookup[8]['probability'])
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_mean_attention_can_hide_future_head_spikes(self):
+        from experiments.audio_drift.attention_recurrence import reactivation_records
+        mean = np.full((8, 1), .1); peak = mean.copy(); peak[4] = 3.
+        average = reactivation_records(mean, peak, history=1, horizons=(4,), high_metric='mean')[0]
+        spike = reactivation_records(mean, peak, history=1, horizons=(4,), high_metric='peak')[0]
+        self.assertEqual(average['reactivated_episodes'], 0)
+        self.assertEqual(spike['reactivated_episodes'], 1)
+        # A spike on ANOTHER token must not reactivate the low-attention token.
+        mean = np.full((8, 2), .1); mean[:, 1] = 3.
+        row = reactivation_records(mean, mean, history=1, horizons=(4,))[0]
+        self.assertEqual(row['eligible_episodes'], 1)
+        self.assertEqual(row['reactivated_episodes'], 0)
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
     def test_diagnostic_js_correlations_and_refresh_phases(self):
         from experiments.audio_drift.attention_dynamics import js_distance, correlations, eos_forward_count
         from experiments.audio_drift.refresh_profile import phase_name
@@ -608,6 +640,11 @@ class UpstreamTests(unittest.TestCase):
             self.assertTrue(all(r['unchanged_query_count'] == 1 for r in changed))
             self.assertTrue(all(r['count'] == (3 if r['group'] == 'prompt' else 1) for r in changed))
             self.assertTrue((Path(directory)/'attention_token_metrics/0002.npz').exists())
+            with np.load(Path(directory)/'attention_token_metrics/0000.npz') as first:
+                self.assertEqual(int(first['attention_schema_version']), 2)
+                self.assertEqual(int(first['sequence_length']), 9)
+                self.assertIn('l00_acoustic_attention_all_probe_mean', first)
+                self.assertIn('l00_acoustic_attention_all_probe_peak', first)
             self.assertTrue(all(not b._forward_hooks for b in observer.blocks))
             torch.testing.assert_close(forward_logits(self.llm, self.prepared, inputs[0]), expected[0], rtol=0, atol=0)
 
@@ -644,6 +681,7 @@ class UpstreamTests(unittest.TestCase):
         import zipfile
         from experiments.audio_drift.attention_dynamics import collect_dynamics
         from experiments.audio_drift.diagnostic_report import analyze
+        from experiments.audio_drift.attention_recurrence import analyze as recurrence
         self.llm.float()
         final, states, events = decode(self.llm, self.prepared, 4, 2, 4)
         args = SimpleNamespace(diagnostic_queries=2, diagnostic_layers='all', diagnostic_tokens=True)
@@ -656,6 +694,9 @@ class UpstreamTests(unittest.TestCase):
                       'audio_semantic_tokens':1, 'baseline_content_revealed_step':3}
             (work/'result.json').write_text(json.dumps(result))
             direct = analyze(root, Path(directory)/'direct', plots=False)
+            direct_risk = recurrence(root, Path(directory)/'direct', plots=False)
+            self.assertEqual(direct_risk['samples'], 1)
+            self.assertEqual(direct_risk['unsupported_samples'], [])
             self.assertGreater(direct['attention_rows'], 0)
             self.assertTrue((Path(directory)/'direct/diagnostic_correlations.csv').exists())
             archive = Path(directory)/'run.zip'
@@ -664,6 +705,7 @@ class UpstreamTests(unittest.TestCase):
                     if p.is_file(): z.write(p, 'run/'+str(p.relative_to(root)))
             zipped = analyze(archive, Path(directory)/'zipped', plots=False)
             self.assertEqual(direct, zipped)
+            self.assertEqual(direct_risk, recurrence(archive, Path(directory)/'zipped', plots=False))
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_profiler_scopes_restore_compact_cache_methods(self):
