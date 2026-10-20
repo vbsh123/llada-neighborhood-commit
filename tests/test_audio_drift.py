@@ -22,6 +22,37 @@ if HAS_TORCH:
 
 
 class InputTests(unittest.TestCase):
+    def test_refresh_math_includes_initialization_and_short_runs(self):
+        from experiments.audio_drift.budget import refresh_count, row_budget
+        from types import SimpleNamespace
+        self.assertEqual([refresh_count(64, r) for r in [8, 16, 32, 0]], [8, 4, 2, 1])
+        self.assertEqual(refresh_count(16, 16), 1)
+        self.assertEqual(refresh_count(17, 16), 2)
+        prepared = SimpleNamespace(answer_start=6, group_positions=lambda g: {'acoustic': [1, 2],
+            'prompt': [0, 5], 'semantic': [3, 4], 'prefix': list(range(6))}[g])
+        spec = conditions(['freeze'], triple_refresh=['16:8:16'])[-1]
+        budget = row_budget(prepared, 4, 64, spec, 2)
+        # Four answer rows every step, prompt eight times, each audio group four times.
+        self.assertEqual(budget['computed_rows_by_layer'], [288, 288])
+        self.assertEqual(budget['dense_token_layers'], 1280)
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_diagnostic_js_correlations_and_refresh_phases(self):
+        from experiments.audio_drift.attention_dynamics import js_distance, correlations, eos_forward_count
+        from experiments.audio_drift.refresh_profile import phase_name
+        p = torch.tensor([[1., 0.], [.5, .5]])
+        torch.testing.assert_close(js_distance(p, p), torch.zeros(2))
+        self.assertAlmostEqual(float(js_distance(p[:1], p[:1].flip(-1))), __import__('math').log(2), places=6)
+        self.assertIsNone(correlations([1, 1, 1], [1, 2, 3])['spearman'])
+        self.assertAlmostEqual(correlations([1, 2, 3], [6, 4, 2])['spearman'], -1)
+        spec = conditions(['freeze'], triple_refresh=['32:8:32'])[-1]
+        self.assertEqual(phase_name(0, spec), 'initialization')
+        self.assertEqual(phase_name(8, spec), 'prompt')
+        self.assertEqual(phase_name(32, spec), 'acoustic+prompt+semantic')
+        self.assertEqual(phase_name(1, spec), 'cache_hit')
+        events = [{'committed_positions': [1]}, {'committed_positions': [0]}, {'committed_positions': [2]}]
+        self.assertEqual(eos_forward_count(events, [4, 30, 9], 30), 2)
+
     def test_final_numeric_answer_scoring(self):
         for text, target in [("3 + 15 = 18.\n#### 18", "18"),
                              ("Final answer: $1,200.00", "1200"),
@@ -553,6 +584,102 @@ class UpstreamTests(unittest.TestCase):
         self.llm.model.transformer.ff_out = output
         self.prepared = Prepared(torch.tensor([[1, 2, 3]]),
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_attention_diagnostics_preserve_logits_and_skip_changed_queries(self):
+        from experiments.audio_drift.attention_dynamics import AttentionDynamics
+        from experiments.audio_drift.decode import forward_logits
+        self.llm.float()
+        inputs = [torch.tensor([[1, 2, 3, 31, 31, 31, 31]]) for _ in range(3)]
+        inputs[-1][0, 3] = 5
+        expected = [forward_logits(self.llm, self.prepared, x) for x in inputs]
+        with tempfile.TemporaryDirectory() as directory:
+            with AttentionDynamics(self.llm, self.prepared, [0, 1], [5, 6], Path(directory), True) as observer:
+                for step, x in enumerate(inputs):
+                    observer.begin({'step': step}, x)
+                    actual = forward_logits(self.llm, self.prepared, x)
+                    torch.testing.assert_close(actual, expected[step], rtol=0, atol=0)
+                    observer.end()
+            rows = [json.loads(s) for s in (Path(directory)/'attention_dynamics.jsonl').read_text().splitlines()]
+            self.assertEqual(len(rows), 12)
+            same = [r for r in rows if r['step'] == 1]
+            self.assertTrue(all(r['hidden_cosine_distance'] < 1e-6 and r['attention_l1_change'] == 0 for r in same))
+            changed = [r for r in rows if r['step'] == 2]
+            self.assertTrue(all(r['unchanged_query_count'] == 1 for r in changed))
+            self.assertTrue(all(r['count'] == (3 if r['group'] == 'prompt' else 1) for r in changed))
+            self.assertTrue((Path(directory)/'attention_token_metrics/0002.npz').exists())
+            self.assertTrue(all(not b._forward_hooks for b in observer.blocks))
+            torch.testing.assert_close(forward_logits(self.llm, self.prepared, inputs[0]), expected[0], rtol=0, atol=0)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_refresh_profile_row_budget_against_actual_execution(self):
+        from types import SimpleNamespace
+        import time
+        from experiments.audio_drift.refresh_profile import profile_refresh
+        self.llm.float()
+        _, states, _ = decode(self.llm, self.prepared, 4, 2, 4)
+        args = SimpleNamespace(interventions=['freeze'], freeze_groups=['prefix'], refresh_intervals=[1, 2],
+            mixed_refresh=[], triple_refresh=['0:2:0'], condition_names=['freeze_prefix_r1', 'freeze_prefix_r2',
+            'freeze_triple_a0_p2_s0'], benchmark_conditions=[], length=4,
+            refresh_profile_steps=4, refresh_profile_repeats=2, refresh_trace=False)
+        class Event:
+            def __init__(self, **kw): pass
+            def record(self): self.t = time.perf_counter()
+            def synchronize(self): pass
+            def elapsed_time(self, other): return (other.t - self.t)*1000
+        with tempfile.TemporaryDirectory() as directory, patch.object(torch.cuda, 'synchronize'), \
+                patch.object(torch.cuda, 'Event', Event):
+            report = profile_refresh(self.llm, self.prepared, states, 4, args, Path(directory), 'tiny')
+            self.assertEqual(len(report['conditions']), 4)
+            for item in report['conditions']:
+                self.assertEqual(len(item['records']), 8)
+                self.assertGreater(item['flop_estimate']['total_estimated_flops'], 0)
+            permanent = report['conditions'][-1]
+            self.assertEqual(permanent['row_budget']['refreshes_by_group']['acoustic'], [1, 1])
+            self.assertIn('prompt', permanent['phases'])
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_attention_replay_report_directory_and_zip_match(self):
+        from types import SimpleNamespace
+        import zipfile
+        from experiments.audio_drift.attention_dynamics import collect_dynamics
+        from experiments.audio_drift.diagnostic_report import analyze
+        self.llm.float()
+        final, states, events = decode(self.llm, self.prepared, 4, 2, 4)
+        args = SimpleNamespace(diagnostic_queries=2, diagnostic_layers='all', diagnostic_tokens=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'run'; work = root/'samples/00000'; work.mkdir(parents=True)
+            (root/'config.json').write_text('{}')
+            collect_dynamics(self.llm, self.prepared, states, events, final[0, 3:].tolist(), 30, args, work)
+            result = {'id':'tiny', 'cohort':'test', 'forwards':4, 'answer_ids':final[0, 3:].tolist(),
+                      'labels':self.prepared.labels(4), 'prompt_tokens':3, 'audio_acoustic_tokens':1,
+                      'audio_semantic_tokens':1, 'baseline_content_revealed_step':3}
+            (work/'result.json').write_text(json.dumps(result))
+            direct = analyze(root, Path(directory)/'direct', plots=False)
+            self.assertGreater(direct['attention_rows'], 0)
+            self.assertTrue((Path(directory)/'direct/diagnostic_correlations.csv').exists())
+            archive = Path(directory)/'run.zip'
+            with zipfile.ZipFile(archive, 'w') as z:
+                for p in root.rglob('*'):
+                    if p.is_file(): z.write(p, 'run/'+str(p.relative_to(root)))
+            zipped = analyze(archive, Path(directory)/'zipped', plots=False)
+            self.assertEqual(direct, zipped)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_profiler_scopes_restore_compact_cache_methods(self):
+        from experiments.audio_drift.compact import PrefixCache
+        from experiments.audio_drift.profile import decoder_scopes
+        from experiments.audio_drift.decode import forward_logits
+        self.llm.float()
+        _, states, _ = decode(self.llm, self.prepared, 4, 2, 4)
+        policy = conditions(['freeze'], triple_refresh=['0:2:0'])[-1]
+        expected = []
+        with PrefixCache(self.llm, self.prepared, policy['schedule']):
+            for x in states: expected.append(forward_logits(self.llm, self.prepared, x).clone())
+        with PrefixCache(self.llm, self.prepared, policy['schedule']):
+            for x, reference in zip(states, expected):
+                with decoder_scopes(self.llm): actual = forward_logits(self.llm, self.prepared, x)
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_pairwise_collection_preserves_baseline_and_writes_selected_layers(self):

@@ -262,6 +262,17 @@ def parser():
     p.add_argument("--replay-steps", type=int, default=64,
                    help="Replay this many initial forwards, capped at baseline EOS stopping")
     p.add_argument("--replay-repeats", type=int, default=2)
+    p.add_argument("--diagnostic-samples", type=int, default=0,
+                   help="Separate untimed attention/drift replay on this many samples")
+    p.add_argument("--diagnostic-layers", default="all")
+    p.add_argument("--diagnostic-queries", type=int, default=4)
+    p.add_argument("--diagnostic-tokens", action="store_true",
+                   help="Save scalar per-position drift/attention arrays, never full representations")
+    p.add_argument("--refresh-profile-samples", type=int, default=0)
+    p.add_argument("--refresh-profile-steps", type=int, default=128)
+    p.add_argument("--refresh-profile-repeats", type=int, default=3)
+    p.add_argument("--refresh-trace", action="store_true",
+                   help="Capture representative operator traces in separate diagnostic passes")
     p.add_argument("--benchmark-stopping", choices=["eos", "fixed"], default="eos")
     p.add_argument("--branch-fractions", type=float, nargs="+", default=[0., .25, .5, .75])
     p.add_argument("--verify-samples", type=int, default=1,
@@ -297,11 +308,23 @@ def main():
         raise ValueError("Invalid replay settings; replay samples must be benchmark samples")
     if args.replay_samples and args.benchmark_stopping != "eos":
         raise ValueError("Replay requires EOS benchmarks so post-answer steps can be excluded")
+    if (args.diagnostic_samples < 0 or
+            (args.samples is not None and args.diagnostic_samples > args.samples) or args.diagnostic_queries < 1 or
+            not 0 <= args.refresh_profile_samples <= args.replay_samples or
+            args.refresh_profile_steps < 1 or args.refresh_profile_repeats < 1):
+        raise ValueError("Invalid attention/refresh diagnostic settings")
+    if args.refresh_profile_samples and args.depth_multipliers:
+        raise ValueError("Per-forward phase profiling currently requires flat refresh schedules")
     if args.skip_dense_interventions and not args.benchmark_samples:
         raise ValueError("--skip-dense-interventions requires --benchmark-samples > 0")
     estimate = work_estimate(args.steps, args.branch_fractions,
                              [] if args.skip_dense_interventions else specifications)
     print("Work per example:", json.dumps(estimate), flush=True)
+    if args.diagnostic_samples or args.refresh_profile_samples:
+        print(f"Additional diagnostics: attention replay on first {args.diagnostic_samples} samples; "
+              f"per-forward refresh profiling on first {args.refresh_profile_samples}, "
+              f"up to {args.refresh_profile_steps} baseline pre-EOS states. "
+              "These are separate from clean decode/replay timing.", flush=True)
     if args.benchmark_samples:
         names = set(args.benchmark_conditions)
         number = sum(s["mode"] == "freeze" and (not names or s["condition"] in names)
@@ -468,6 +491,14 @@ def main():
             from .replay import benchmark_replay
             result["fixed_input_replay"] = benchmark_replay(
                 llm, prepared, states, result["benchmark"]["baseline_forwards"], args, work, sample_id=row["id"])
+        if index < args.diagnostic_samples:
+            from .attention_dynamics import collect_dynamics
+            collect_dynamics(llm, prepared, states, events, answer_ids,
+                             tokenizer.eos_token_id, args, work)
+        if index < args.refresh_profile_samples:
+            from .refresh_profile import profile_refresh
+            profile_refresh(llm, prepared, states, result["benchmark"]["baseline_forwards"],
+                            args, work, row["id"])
         result["sample_wall_seconds"] = time.perf_counter() - sample_began
         print(f"  sample complete in {result['sample_wall_seconds'] / 60:.1f} minutes", flush=True)
         write_json(work / "result.json", result)
