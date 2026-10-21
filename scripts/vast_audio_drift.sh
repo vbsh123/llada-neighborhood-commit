@@ -47,7 +47,6 @@ if [[ "$mode" == gsm-night || "$mode" == gsm-diagnose || "$mode" == gsm-prune ||
   fi
   default_count=30
   if [[ "$mode" == gsm-diagnose ]]; then default_count=6; fi
-  if [[ "$mode" == gsm-prune || "$mode" == gsm-cache ]]; then default_count=20; fi
   count="${SAMPLES:-$default_count}"
   length="${LENGTH:-512}"
   block="${BLOCK_LENGTH:-32}"
@@ -101,7 +100,7 @@ if [[ "$mode" == gsm-cache || "$mode" == gsm-prune ]]; then
             --condition-names freeze_prefix_r32 freeze_prefix_r50
             freeze_triple_a32_p8_s32 freeze_triple_a50_p8_s50)
   else
-    read -r -a prune_starts <<< "${PRUNE_STARTS:-16 32}"
+    read -r -a prune_starts <<< "${PRUNE_STARTS:-1 16 32}"
     read -r -a prune_fractions <<< "${PRUNE_FRACTIONS:-0.25}"
     # No cache-only or mixed cache+pruning policies. All retained rows refresh every forward.
     extra+=(--interventions --late-prune --prune-starts "${prune_starts[@]}" --prune-fractions "${prune_fractions[@]}"

@@ -246,7 +246,7 @@ def parser():
     p.add_argument("--triple-refresh", nargs="*", default=[], metavar="ACOUSTIC:PROMPT:SEMANTIC",
                    help="Independent fixed-prefix schedules for all three groups")
     p.add_argument('--late-prune', action='store_true', help='Add delayed audio and matched-budget pruning controls')
-    p.add_argument('--prune-starts', type=int, nargs='+', default=[16, 32], help='Zero-based forward indices; no future-answer dependence')
+    p.add_argument('--prune-starts', type=int, nargs='+', default=[1, 16, 32], help='Zero-based forward indices; no future-answer dependence')
     p.add_argument('--prune-fractions', type=float, nargs='+', default=[.25], help='Drop quota as a fraction of audio positions')
     p.add_argument('--prune-layer-start', type=int, default=24, help='Prune from this layer through the last layer')
     p.add_argument('--prune-queries', type=int, default=16, help='Fixed online answer-canvas probes, including masks')

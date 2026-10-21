@@ -27,8 +27,8 @@ class InputTests(unittest.TestCase):
         from experiments.audio_drift.pruning import pruning_conditions
         from experiments.audio_drift.protocol import is_identity
         specs = pruning_conditions()
-        self.assertEqual(len(specs), 9)
-        self.assertEqual(len({s['condition'] for s in specs}), 9)
+        self.assertEqual(len(specs), 20)
+        self.assertEqual(len({s['condition'] for s in specs}), 20)
         groups = {}
         for spec in specs:
             p = spec['pruning']
@@ -36,7 +36,7 @@ class InputTests(unittest.TestCase):
             groups.setdefault(key, set()).add(p['scope'])
             self.assertFalse(is_identity(spec))
             self.assertEqual(spec['schedule'][0]['refresh_every'], 1)
-        self.assertTrue(all(g == {'audio', 'prompt', 'prefix'} for g in groups.values()))
+        self.assertTrue(all(g == {'acoustic', 'semantic', 'audio', 'prompt', 'prefix'} for g in groups.values()))
         for kw in [dict(starts=[0]), dict(fractions=[1.]), dict(fractions=[float('nan')]), dict(layer_start=-1)]:
             with self.assertRaises(ValueError): pruning_conditions(**kw)
 
@@ -656,13 +656,14 @@ class UpstreamTests(unittest.TestCase):
         from experiments.audio_drift.compact import PrefixCache
         from experiments.audio_drift.decode import forward_logits
         from experiments.audio_drift.hooks import blocks_of
+        self.prepared = Prepared(self.prepared.prompt, torch.randn(1,4,16).to(torch.bfloat16),1,2,31)
         self.llm.float()
         inputs = [torch.tensor([[1, 2, 3, 31, 31, 31, 31]]) for _ in range(4)]
         inputs[2][0, 3] = 5; inputs[3][0, 4] = 6
         for dtype in [torch.float32, torch.bfloat16]:
             self.llm.to(dtype)
             for scope, selection, interval in [('audio','attention',1), ('prompt','attention',1),
-                    ('prefix','attention',1), ('audio','random',2)]:
+                    ('prefix','attention',1), ('acoustic','attention',1), ('semantic','attention',1), ('audio','random',2)]:
                 policy = dict(start=1, fraction=.5, layer_start=0, queries=3,
                               seed=1729, scope=scope, selection=selection)
                 schedule = [dict(group='prefix', refresh_every=interval)]
@@ -673,14 +674,14 @@ class UpstreamTests(unittest.TestCase):
                     self.assertEqual(cache.pruning.dropped[1], dropped)
                     self.assertEqual(len(dropped), 1)
                     self.assertTrue(set(dropped) <= set(self.prepared.group_positions('both' if scope=='audio' else scope)))
-                    self.assertEqual([e['layer_kv_columns'] for e in cache.events], [[9,9], [8,8], [8,8], [8,8]])
+                    self.assertEqual([e['layer_kv_columns'] for e in cache.events], [[11,11], [10,10], [10,10], [10,10]])
                     self.assertEqual(counts['pruning']['activated_layers'], 2)
                     self.assertEqual(len(counts['pruning']['selections']), 1)
                     self.assertTrue(all(p >= self.prepared.answer_start for p in counts['pruning']['selections'][0]['probe_positions']))
                 # Independent reference: compute every row, remove exactly the same
                 # absolute KV columns in SDPA, leave upstream RoPE and MLP intact.
                 step = [-1]; originals = []
-                kept = torch.tensor([p for p in range(9) if p not in dropped])
+                kept = torch.tensor([p for p in range(11) if p not in dropped])
                 try:
                     for block in blocks_of(self.llm):
                         original = block._scaled_dot_product_attention
@@ -711,6 +712,7 @@ class UpstreamTests(unittest.TestCase):
         from experiments.audio_drift.benchmark import benchmark
         from experiments.audio_drift.replay import benchmark_replay
         from experiments.audio_drift.pruning_report import analyze
+        self.prepared = Prepared(self.prepared.prompt, torch.randn(1,4,16).to(torch.bfloat16),1,2,31)
         self.llm.float()
         args=parser().parse_args(['--manifest','unused','--out','unused', '--interventions','freeze',
             '--freeze-groups','prefix','--refresh-intervals','1','8', '--condition-names','freeze_prefix_r1','freeze_prefix_r8',
@@ -723,8 +725,8 @@ class UpstreamTests(unittest.TestCase):
             root=Path(directory);work=root/'samples/00000';work.mkdir(parents=True)
             bench=benchmark(self.llm,self.prepared,final,args,tokenizer,{'id':'tiny','metric':'numeric','target':'1'},work)
             replay=benchmark_replay(self.llm,self.prepared,states,bench['baseline_forwards'],args,work,sample_id='tiny')
-            self.assertEqual(len(bench['policies']),8)
-            self.assertEqual(len(replay['policies']),8)
+            self.assertEqual(len(bench['policies']),12)
+            self.assertEqual(len(replay['policies']),12)
             for policy in bench['policies']:
                 if policy.get('pruning'):
                     selection=policy['accounting'][0]['pruning']['selections'][0]
@@ -733,8 +735,8 @@ class UpstreamTests(unittest.TestCase):
                     self.assertEqual(sum(selection['dropped_by_group'].values()),1)
             write_json(work/'result.json',{'id':'tiny','score':{'correct':True},'benchmark':bench})
             rows=analyze(root)
-            self.assertEqual(len(rows),6)
-            self.assertEqual({r['scope'] for r in rows},{'audio','prompt','prefix'})
+            self.assertEqual(len(rows),10)
+            self.assertEqual({r['scope'] for r in rows},{'acoustic','semantic','audio','prompt','prefix'})
             self.assertTrue(all(r['activated'] and r['replay_activated'] for r in rows))
             self.assertTrue((root/'analysis/pruning_report.md').exists())
 
@@ -742,21 +744,22 @@ class UpstreamTests(unittest.TestCase):
     def test_pruning_waits_for_anchor_respects_layer_and_zero_budget(self):
         from experiments.audio_drift.compact import PrefixCache
         from experiments.audio_drift.decode import forward_logits
+        self.prepared = Prepared(self.prepared.prompt, torch.randn(1,4,16).to(torch.bfloat16),1,2,31)
         self.llm.float()
         x=torch.tensor([[1,2,3,31,31,31,31]])
         schedule=[dict(group='prefix',refresh_every=1)]
         expected=forward_logits(self.llm,self.prepared,x)
-        for fraction,start in [(.25,1),(.5,5)]:
+        for fraction,start in [(.1,1),(.5,5)]:
             p=dict(start=start,fraction=fraction,layer_start=1,queries=2,seed=1729,scope='audio',selection='attention')
             with PrefixCache(self.llm,self.prepared,schedule,pruning=p) as cache:
                 for _ in range(3):
                     torch.testing.assert_close(forward_logits(self.llm,self.prepared,x),expected,rtol=0,atol=0)
-                self.assertTrue(all(e['layer_kv_columns']==[9,9] for e in cache.events))
+                self.assertTrue(all(e['layer_kv_columns']==[11,11] for e in cache.events))
         p.update(fraction=.5,start=1)
         with PrefixCache(self.llm,self.prepared,schedule,pruning=p) as cache:
             for _ in range(3): forward_logits(self.llm,self.prepared,x)
-            self.assertEqual([e['layer_computed_rows'] for e in cache.events],[[9,9],[9,9],[9,8]])
-            self.assertEqual([e['layer_kv_columns'] for e in cache.events],[[9,9],[9,8],[9,8]])
+            self.assertEqual([e['layer_computed_rows'] for e in cache.events],[[11,11],[11,11],[11,10]])
+            self.assertEqual([e['layer_kv_columns'] for e in cache.events],[[11,11],[11,10],[11,10]])
         with self.assertRaisesRegex(ValueError,'layer'):
             PrefixCache(self.llm,self.prepared,schedule,pruning={**p,'layer_start':2})
 

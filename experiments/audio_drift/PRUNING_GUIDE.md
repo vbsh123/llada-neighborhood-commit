@@ -1,7 +1,7 @@
 # Separate cache and delayed-pruning experiments
 
 Test each idea independently before combining them. Both modes reuse the first
-20 rows of the existing spoken-GSM manifest, retain baseline failures, save final
+30 rows of the existing spoken-GSM manifest, retain baseline failures, save final
 answers/scores/forward counts, and measure autonomous decoding plus identical-input
 replay. They omit repeated large drift/attention collection and operator traces.
 These are exploratory examples, not held-out validation.
@@ -23,23 +23,25 @@ examples ending within 50 forwards only initialize that cache.
 
 ## Pruning only: gsm-prune
 
-Nine policies; no cache reuse for surviving positions:
+Twenty policies; no cache reuse for surviving positions:
 
 | Selection | After how many forwards? | Eligible pools |
 |---|---:|---|
-| Lowest mean attention | 16 | Audio; fixed prompt text; complete audio+text prefix |
-| Lowest mean attention | 32 | Audio; fixed prompt text; complete audio+text prefix |
-| Random, matched budget | 32 | Audio; fixed prompt text; complete audio+text prefix |
+| Lowest mean attention | 1 (early control) | Acoustic; semantic; combined audio; text; full prefix |
+| Lowest mean attention | 16 | Same five pools |
+| Lowest mean attention | 32 | Same five pools |
+| Random, matched budget | 32 | Same five pools |
 
-Within each trio, timing/layers and absolute removal counts match. Count is
-floor(0.25 * audio positions), capped to leave at least one position in each of
-the audio and text groups. This matches counts, not fractions: the short text
+Across the five pools, timing/layers and absolute removal counts match. Count
+is floor(0.25 * audio positions), capped to leave at least one position in each
+of the acoustic, semantic and text groups. With 64 acoustic positions the common
+budget can therefore be at most 63. This matches counts, not fractions: the short text
 prompt may lose a large fraction of its positions, including structural tokens.
 Actual counts, fractions and acoustic/semantic/prompt composition are recorded.
 
 Anchors use only observed forward number. With 512 answer slots and two commits
-per forward, the defaults correspond to 32/64 revealed slots (6.25%/12.5% of the
-full canvas). These are NOT fractions of the unknown final answer length.
+per forward, the defaults correspond to 2/32/64 revealed slots
+(0.39%/6.25%/12.5% of the full canvas). These are NOT fractions of the unknown final answer length.
 Autonomous selection records the actual remaining masks, revealed fraction,
 block and block progress. Forward index and global canvas unmasking are coupled
 under the fixed-quota decoder; they are not independent triggers here.
@@ -71,12 +73,12 @@ first (the setup steps from the previous instructions remain valid).
 ```bash
 cd /workspace/llada-audio-drift
 git pull --ff-only
-nohup env SAMPLES=20 SKIP_INSTALL=1 REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
+nohup env SAMPLES=30 SKIP_INSTALL=1 REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
   WHISPER_REVISION=06f233fe06e710322aca913c1bc4249a0d71fce1 \
   bash -c '
-    RUN_NAME=audio_gsm_cache20_v15 bash scripts/vast_audio_drift.sh gsm-cache > audio_gsm_cache20_v15.log 2>&1 &&
-    RUN_NAME=audio_gsm_prune20_v15 bash scripts/vast_audio_drift.sh gsm-prune > audio_gsm_prune20_v15.log 2>&1
-  ' > audio_followup_v15.log 2>&1 &
+    RUN_NAME=audio_gsm_cache30_v16 bash scripts/vast_audio_drift.sh gsm-cache > audio_gsm_cache30_v16.log 2>&1 &&
+    RUN_NAME=audio_gsm_prune30_v16 bash scripts/vast_audio_drift.sh gsm-prune > audio_gsm_prune30_v16.log 2>&1
+  ' > audio_followup_v16.log 2>&1 &
 ```
 
 The pruning stage starts only if the cache stage succeeds. Download BOTH run
@@ -101,13 +103,17 @@ The pruning stage additionally writes `pruning_report.md` and `pruning_pairs.csv
 including activation and actual budgets. Examples ending before their pruning
 anchor remain in primary scores; inspect activation separately.
 
-`PRUNE_STARTS="16 32"`, `PRUNE_FRACTIONS="0.25"`, `PRUNE_LAYER_START=24`,
+`PRUNE_STARTS="1 16 32"`, `PRUNE_FRACTIONS="0.25"`, `PRUNE_LAYER_START=24`,
 `PRUNE_QUERIES=16`, `BENCHMARK_REPEATS`, `REPLAY_REPEATS`, `REPLAY_SAMPLES`,
 `REPLAY_STEPS` and `SAMPLES` are configurable. Random controls are added at the
-largest requested anchor; every strategy is paired across all three pools.
+largest requested anchor; every strategy is paired across all five pools.
 
 For reproducibility, the previous dataset revision is
 `e94caa2154433a54cd430702666c454977df3083`: prepare 10 development examples
 with seed 1729, then the 30-row combined manifest with that base and seed
-20261020; run its first 20 rows. The LLaDA and DIFFA adapter revisions are
+20261020; run all 30 rows. The LLaDA and DIFFA adapter revisions are
 already pinned; the command above pins the previous Whisper revision too.
+
+The cache and pruning runs now default to 30 examples. The early pruning
+control, atomic-group removal and matched budgets are intentional additions;
+use a new run name when changing these settings.

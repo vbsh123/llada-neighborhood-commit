@@ -9,7 +9,10 @@ import math
 import torch
 
 
-def pruning_conditions(starts=(16, 32), fractions=(.25,), layer_start=24, queries=16, seed=1729):
+SCOPES = ("acoustic", "semantic", "audio", "prompt", "prefix")
+
+
+def pruning_conditions(starts=(1, 16, 32), fractions=(.25,), layer_start=24, queries=16, seed=1729):
     if (not starts or len(set(starts)) != len(starts) or any(s < 1 for s in starts)
             or not fractions or len(set(fractions)) != len(fractions)
             or any(not math.isfinite(f) or not 0 < f < 1 for f in fractions)
@@ -18,9 +21,9 @@ def pruning_conditions(starts=(16, 32), fractions=(.25,), layer_start=24, querie
     specs = []
     for fraction in fractions:
         for start in starts:
-            variants = [(scope, 'attention', 1) for scope in ('audio', 'prompt', 'prefix')]
+            variants = [(scope, 'attention', 1) for scope in SCOPES]
             if start == max(starts):
-                variants += [(scope, 'random', 1) for scope in ('audio', 'prompt', 'prefix')]
+                variants += [(scope, 'random', 1) for scope in SCOPES]
             for scope, selection, interval in variants:
                 tag = format(fraction * 100, '.8g').replace('.', 'p')
                 plan = dict(start=start, fraction=fraction, layer_start=layer_start,
@@ -37,7 +40,7 @@ class LatePruning:
         if specification is not None:
             p = specification
             pruning_conditions([p['start']], [p['fraction']], p['layer_start'], p['queries'], p['seed'])
-            if p['layer_start'] >= layers or p['scope'] not in {'audio', 'prompt', 'prefix'} or p['selection'] not in {'attention', 'random'}:
+            if p['layer_start'] >= layers or p['scope'] not in SCOPES or p['selection'] not in {'attention', 'random'}:
                 raise ValueError('Invalid pruning layer, scope or selection')
         self.layers = layers
         self.dropped, self.kept, self.records = {}, {}, []
@@ -55,10 +58,15 @@ class LatePruning:
         if layer not in self.dropped:
             audio = sorted(self.prepared.group_positions('both'))
             prompt = self.prepared.group_positions('prompt')
-            pool = audio if p['scope'] == 'audio' else prompt if p['scope'] == 'prompt' else list(range(self.prepared.answer_start))
-            # A common absolute token budget for all scopes, capped by the short
-            # text group so audio/text/full-prefix comparisons are genuinely paired.
-            count = max(0, min(len(audio) - 1, len(prompt) - 1, int(len(audio) * p['fraction'])))
+            acoustic = self.prepared.group_positions('acoustic')
+            semantic = self.prepared.group_positions('semantic')
+            pools = dict(audio=audio, acoustic=acoustic, semantic=semantic, prompt=prompt,
+                         prefix=list(range(self.prepared.answer_start)))
+            pool = pools[p['scope']]
+            # One count across all five scopes, constrained by the smallest
+            # atomic group. Never silently compare different removal budgets.
+            count = max(0, min(len(acoustic) - 1, len(semantic) - 1, len(prompt) - 1,
+                               int(len(audio) * p['fraction'])))
             positions = torch.tensor(pool, dtype=torch.long, device=k.device)
             # Same fixed absolute answer-canvas query positions in every layer;
             # no baseline trajectory, EOS, or final answer span is consulted.
