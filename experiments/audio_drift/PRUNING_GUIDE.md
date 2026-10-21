@@ -116,3 +116,9 @@ independent reference that computes every row and explicitly removes the same
 KV columns, delayed onset, retained RoPE positions, downstream mask persistence,
 identity controls, scope pairing, measured row/KV counts, repeat reproducibility
 and report integration. Full-size CUDA speed and quality require the GPU run.
+
+For a fresh machine reproducing v13, set `WHISPER_REVISION=06f233fe06e710322aca913c1bc4249a0d71fce1`.
+Recreate the development manifest with seed 1729 at GSM8K-Speech revision
+`e94caa2154433a54cd430702666c454977df3083`, then recreate the 30-row combined
+manifest using seed 20261020 and that base manifest. The first 20 rows reproduce
+the preceding diagnostic cohort; these remain exploratory rather than held out.

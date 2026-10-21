@@ -200,6 +200,7 @@ python -u -m experiments.audio_drift.run \
   --diffa-root "$diffa_checkout" --manifest "$manifest" --out "runs/$experiment_name" \
   --samples "$count" --length "$length" --block-length "$block" --steps "${STEPS:-$default_steps}" \
   --layers "${LAYERS:-$default_layers}" --reference-device "${REFERENCE_DEVICE:-cpu}" \
+  --whisper-revision "${WHISPER_REVISION:-main}" \
   --cache-device "${CACHE_DEVICE:-model}" \
   --cpu-threads "${CPU_THREADS:-4}" \
   --verify-samples "${VERIFY_SAMPLES:-1}" --seed "${SEED:-1729}" \
