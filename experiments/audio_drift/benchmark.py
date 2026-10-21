@@ -29,6 +29,10 @@ def policy_specs(args, sample_id=None):
         specs = [s for s in specs if s["condition"] in names]
     if not specs:
         raise ValueError("Benchmark needs at least one freeze policy")
+    if sample_id is not None and any(s.get('pruning') for s in specs):
+        # Paired scope variants share a sample-specific seed; repeats are exact.
+        prune_seed = int.from_bytes(hashlib.sha256(f"{args.seed}:{sample_id}:pruning".encode()).digest()[:8], 'big') % (2**63)
+        specs = [{**s, 'pruning': {**s['pruning'], 'seed': prune_seed}} if s.get('pruning') else s for s in specs]
     if getattr(args, 'shuffle_policy_order', False):
         if sample_id is None:
             raise ValueError("Shuffled timing order requires a sample ID")
@@ -50,7 +54,7 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         start = time.perf_counter()
-        context = PrefixCache(llm, prepared, spec["schedule"]) if spec else nullcontext()
+        context = PrefixCache(llm, prepared, spec["schedule"], pruning=spec.get("pruning")) if spec else nullcontext()
         with context as cache:
             final, _, events = decode(llm, prepared, args.length, args.block_length, args.steps,
                                      save_states=False, eos_id=eos)
@@ -96,6 +100,8 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
             text = display_text(tokenizer, final, prepared.prompt.shape[1])
             del final
         reproducible = all(x == outputs[0] for x in outputs)
+        if spec.get('pruning') and any(a['pruning'] != accounting[0]['pruning'] for a in accounting):
+            raise RuntimeError(f"Timed repeats changed pruning selections: {spec['condition']}")
         if not reproducible:
             raise RuntimeError(f"Timed repeats changed answer tokens: {spec['condition']}")
         if is_identity(spec) and outputs[0] != expected:

@@ -29,7 +29,7 @@ def benchmark_replay(llm, prepared, states, baseline_forwards, args, work, sampl
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         began = time.perf_counter()
-        context = PrefixCache(llm, prepared, spec['schedule']) if spec else nullcontext()
+        context = PrefixCache(llm, prepared, spec['schedule'], pruning=spec.get('pruning')) if spec else nullcontext()
         with context as cache:
             last = None
             for x in inputs:

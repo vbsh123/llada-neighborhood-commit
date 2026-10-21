@@ -103,6 +103,6 @@ def layer_intervals(specification, num_layers):
 
 
 def is_identity(specification):
-    return (specification['mode'] == 'freeze' and bool(specification['schedule']) and
+    return (not specification.get('pruning') and specification['mode'] == 'freeze' and bool(specification['schedule']) and
             all(all(r == 1 for r in s.get('refresh_by_layer_group', [s['refresh_every']]))
                 for s in specification['schedule']))

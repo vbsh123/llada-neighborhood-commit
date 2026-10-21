@@ -22,6 +22,23 @@ if HAS_TORCH:
 
 
 class InputTests(unittest.TestCase):
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_delayed_pruning_matrix_pairs_every_strategy_across_scopes(self):
+        from experiments.audio_drift.pruning import pruning_conditions
+        from experiments.audio_drift.protocol import is_identity
+        specs = pruning_conditions()
+        self.assertEqual(len(specs), 12)
+        self.assertEqual(len({s['condition'] for s in specs}), 12)
+        groups = {}
+        for spec in specs:
+            p = spec['pruning']
+            key = (p['start'], p['selection'], spec['schedule'][0]['refresh_every'])
+            groups.setdefault(key, set()).add(p['scope'])
+            self.assertFalse(is_identity(spec))
+        self.assertTrue(all(g == {'audio', 'prompt', 'prefix'} for g in groups.values()))
+        for kw in [dict(starts=[0]), dict(fractions=[1.]), dict(fractions=[float('nan')]), dict(layer_start=-1)]:
+            with self.assertRaises(ValueError): pruning_conditions(**kw)
+
     def test_refresh_math_includes_initialization_and_short_runs(self):
         from experiments.audio_drift.budget import refresh_count, row_budget
         from types import SimpleNamespace
@@ -632,6 +649,114 @@ class UpstreamTests(unittest.TestCase):
         self.llm.model.transformer.ff_out = output
         self.prepared = Prepared(torch.tensor([[1, 2, 3]]),
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_delayed_pruning_matches_explicit_dense_kv_removal(self):
+        from experiments.audio_drift.compact import PrefixCache
+        from experiments.audio_drift.decode import forward_logits
+        from experiments.audio_drift.hooks import blocks_of
+        self.llm.float()
+        inputs = [torch.tensor([[1, 2, 3, 31, 31, 31, 31]]) for _ in range(4)]
+        inputs[2][0, 3] = 5; inputs[3][0, 4] = 6
+        for dtype in [torch.float32, torch.bfloat16]:
+            self.llm.to(dtype)
+            for scope, selection, interval in [('audio','attention',1), ('prompt','attention',1),
+                    ('prefix','attention',1), ('audio','random',2)]:
+                policy = dict(start=1, fraction=.5, layer_start=0, queries=3,
+                              seed=1729, scope=scope, selection=selection)
+                schedule = [dict(group='prefix', refresh_every=interval)]
+                with PrefixCache(self.llm, self.prepared, schedule, pruning=policy) as cache:
+                    actual = [forward_logits(self.llm, self.prepared, x) for x in inputs]
+                    counts = cache.accounting()
+                    dropped = cache.pruning.dropped[0]
+                    self.assertEqual(cache.pruning.dropped[1], dropped)
+                    self.assertEqual(len(dropped), 1)
+                    self.assertTrue(set(dropped) <= set(self.prepared.group_positions('both' if scope=='audio' else scope)))
+                    self.assertEqual([e['layer_kv_columns'] for e in cache.events], [[9,9], [8,8], [8,8], [8,8]])
+                    self.assertEqual(counts['pruning']['activated_layers'], 2)
+                    self.assertEqual(len(counts['pruning']['selections']), 1)
+                    self.assertTrue(all(p >= self.prepared.answer_start for p in counts['pruning']['selections'][0]['probe_positions']))
+                # Independent reference: compute every row, remove exactly the same
+                # absolute KV columns in SDPA, leave upstream RoPE and MLP intact.
+                step = [-1]; originals = []
+                kept = torch.tensor([p for p in range(9) if p not in dropped])
+                try:
+                    for block in blocks_of(self.llm):
+                        original = block._scaled_dot_product_attention
+                        existed = '_scaled_dot_product_attention' in block.__dict__
+                        originals.append((block, original, existed))
+                        def masked(q,k,v,_original=original,**kw):
+                            if step[0]>=1:
+                                k,v=k.index_select(-2,kept),v.index_select(-2,kept)
+                            return _original(q,k,v,**kw)
+                        block._scaled_dot_product_attention=masked
+                    with PrefixCache(self.llm,self.prepared,schedule):
+                        reference=[]
+                        for i,x in enumerate(inputs):
+                            step[0]=i
+                            reference.append(forward_logits(self.llm,self.prepared,x))
+                finally:
+                    for block,original,existed in originals:
+                        if existed: block._scaled_dot_product_attention=original
+                        else: delattr(block,'_scaled_dot_product_attention')
+                for a,b in zip(actual,reference):
+                    torch.testing.assert_close(a,b,rtol=0.03 if dtype==torch.bfloat16 else 1e-5,
+                                               atol=0.03 if dtype==torch.bfloat16 else 1e-5)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_pruning_benchmark_replay_and_report_retain_scope_pairs(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.run import parser, write_json
+        from experiments.audio_drift.benchmark import benchmark
+        from experiments.audio_drift.replay import benchmark_replay
+        from experiments.audio_drift.pruning_report import analyze
+        self.llm.float()
+        args=parser().parse_args(['--manifest','unused','--out','unused', '--interventions','freeze',
+            '--freeze-groups','prefix','--refresh-intervals','1','8', '--condition-names','freeze_prefix_r1','freeze_prefix_r8',
+            '--late-prune','--prune-starts','1','--prune-fractions','0.5','--prune-layer-start','0',
+            '--length','4','--block-length','2','--steps','4','--benchmark-repeats','1','--replay-repeats','1'])
+        final,states,_=decode(self.llm,self.prepared,4,2,4)
+        tokenizer=SimpleNamespace(eos_token_id=30,decode=lambda ids,**kw:'#### 1')
+        with tempfile.TemporaryDirectory() as directory, patch.object(torch.cuda,'synchronize'), \
+                patch.object(torch.cuda,'reset_peak_memory_stats'),patch.object(torch.cuda,'max_memory_allocated',return_value=0):
+            root=Path(directory);work=root/'samples/00000';work.mkdir(parents=True)
+            bench=benchmark(self.llm,self.prepared,final,args,tokenizer,{'id':'tiny','metric':'numeric','target':'1'},work)
+            replay=benchmark_replay(self.llm,self.prepared,states,bench['baseline_forwards'],args,work,sample_id='tiny')
+            self.assertEqual(len(bench['policies']),11)
+            self.assertEqual(len(replay['policies']),11)
+            for policy in bench['policies']:
+                if policy.get('pruning'):
+                    selection=policy['accounting'][0]['pruning']['selections'][0]
+                    self.assertEqual(selection['drop_budget'],1)
+                    self.assertEqual(sum(selection['dropped_by_group'].values()),1)
+            write_json(work/'result.json',{'id':'tiny','score':{'correct':True},'benchmark':bench})
+            rows=analyze(root)
+            self.assertEqual(len(rows),9)
+            self.assertEqual({r['scope'] for r in rows},{'audio','prompt','prefix'})
+            self.assertTrue(all(r['activated'] and r['replay_activated'] for r in rows))
+            self.assertTrue((root/'analysis/pruning_report.md').exists())
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_pruning_waits_for_anchor_respects_layer_and_zero_budget(self):
+        from experiments.audio_drift.compact import PrefixCache
+        from experiments.audio_drift.decode import forward_logits
+        self.llm.float()
+        x=torch.tensor([[1,2,3,31,31,31,31]])
+        schedule=[dict(group='prefix',refresh_every=1)]
+        expected=forward_logits(self.llm,self.prepared,x)
+        for fraction,start in [(.25,1),(.5,5)]:
+            p=dict(start=start,fraction=fraction,layer_start=1,queries=2,seed=1729,scope='audio',selection='attention')
+            with PrefixCache(self.llm,self.prepared,schedule,pruning=p) as cache:
+                for _ in range(3):
+                    torch.testing.assert_close(forward_logits(self.llm,self.prepared,x),expected,rtol=0,atol=0)
+                self.assertTrue(all(e['layer_kv_columns']==[9,9] for e in cache.events))
+        p.update(fraction=.5,start=1)
+        with PrefixCache(self.llm,self.prepared,schedule,pruning=p) as cache:
+            for _ in range(3): forward_logits(self.llm,self.prepared,x)
+            self.assertEqual([e['layer_computed_rows'] for e in cache.events],[[9,9],[9,9],[9,8]])
+            self.assertEqual([e['layer_kv_columns'] for e in cache.events],[[9,9],[9,8],[9,8]])
+        with self.assertRaisesRegex(ValueError,'layer'):
+            PrefixCache(self.llm,self.prepared,schedule,pruning={**p,'layer_start':2})
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_attention_diagnostics_preserve_logits_and_skip_changed_queries(self):

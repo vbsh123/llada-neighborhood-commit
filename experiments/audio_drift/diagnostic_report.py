@@ -103,6 +103,8 @@ def analyze(run, out=None, plots=True):
                     'hypothetical_token_layers': hypothetical['computed_token_layers']})
             # Compare ALL schedules at the same baseline forward count, independently of their EOS changes.
             for policy in bench.get('policies', []):
+                if policy.get('pruning'):
+                    continue  # Pruning uses measured accounting; a cache-only formula would mislabel its work.
                 budget = row_budget(prepared, length, f, policy, 32)
                 refresh = budget['refreshes_by_group']
                 budget_rows.append({'id': sample, 'cohort': result.get('cohort'), 'condition': policy['condition'],

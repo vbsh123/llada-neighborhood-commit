@@ -9,6 +9,8 @@ def refresh_count(forwards, interval):
 
 
 def row_budget(prepared, length, forwards, specification, layers):
+    if specification.get('pruning'):
+        raise ValueError('Pruning requires measured execution accounting, not a cache-only row budget')
     total = prepared.answer_start + length
     active = [total * forwards] * layers
     claimed = set()

@@ -1,8 +1,10 @@
 """Skip cached fixed-prefix rows through QKV, attention queries and feed-forward.
 
 Inference-only adapter for the pinned, ungrouped LLaDALlamaBlock. All answer
-rows remain active. Absolute RoPE positions and the complete key sequence are
-preserved. No upstream source changes or token pruning.
+rows remain active. Absolute RoPE positions are preserved. Cache-only policies
+retain every KV column; optional delayed pruning removes selected prefix columns
+and their subsequent transformer rows.
+No upstream source changes.
 """
 from contextlib import AbstractContextManager
 
@@ -10,14 +12,16 @@ import torch
 
 from .hooks import blocks_of
 from .protocol import layer_intervals
+from .pruning import LatePruning
 
 
 class PrefixCache(AbstractContextManager):
-    def __init__(self, llm, prepared, schedules):
+    def __init__(self, llm, prepared, schedules, pruning=None):
         if llm.training:
             raise ValueError("PrefixCache requires eval mode")
         self.blocks = blocks_of(llm)
         self.prepared = prepared
+        self.pruning = LatePruning(prepared, len(self.blocks), pruning)
         self.schedules = []
         claimed = set()
         for spec in schedules:
@@ -51,15 +55,16 @@ class PrefixCache(AbstractContextManager):
                     if _layer == 0:
                         self.step += 1
                         self.events.append({"step": self.step, "total_rows": x.shape[1],
-                                            "layer_computed_rows": [], "layer_refresh": []})
+                                            "layer_computed_rows": [], "layer_refresh": [], "layer_kv_columns": []})
                     # Each layer has its own clock and banks. Flat schedules
                     # expand to identical intervals at every layer.
                     due = tuple(self.step == 0 or bool(intervals[_layer] and
                                 self.step % intervals[_layer] == 0) for _, intervals in self.schedules)
-                    key = (x.shape[1], x.device, due)
+                    removed = self.pruning.dropped.get(_layer, ())
+                    key = (x.shape[1], x.device, due, removed)
                     if key not in self.patterns:
                         inactive = {p for (positions, _), refresh in zip(self.schedules, due)
-                                    if not refresh for p in positions}
+                                    if not refresh for p in positions} | set(removed)
                         selected = [p for p in range(x.shape[1]) if p not in inactive]
                         self.patterns[key] = torch.tensor(selected, dtype=torch.long, device=x.device)
                     active = self.patterns[key]
@@ -76,6 +81,10 @@ class PrefixCache(AbstractContextManager):
 
                         def capture(q, k, v, **kwargs):
                             self.banks[_layer] = [k.detach().clone(), v.detach().clone(), None]
+                            keep = self.pruning.select(_layer, self.step, q, k, None)
+                            event['layer_kv_columns'].append(k.shape[-2] if keep is None else len(keep))
+                            if keep is not None:
+                                k, v = k.index_select(-2, keep), v.index_select(-2, keep)
                             return attention(q, k, v, **kwargs)
                         _block._scaled_dot_product_attention = capture
                         try:
@@ -106,7 +115,11 @@ class PrefixCache(AbstractContextManager):
                     full_k, full_v, hidden = self.banks[_layer]
                     full_k.index_copy_(-2, active, k_rot.type_as(k))
                     full_v.index_copy_(-2, active, v)
-                    attended = _block._scaled_dot_product_attention(q_rot.type_as(q), full_k, full_v,
+                    keep = self.pruning.select(_layer, self.step, q_rot.type_as(q), full_k, active)
+                    event['layer_kv_columns'].append(full_k.shape[-2] if keep is None else len(keep))
+                    keys, values = ((full_k, full_v) if keep is None else
+                                    (full_k.index_select(-2, keep), full_v.index_select(-2, keep)))
+                    attended = _block._scaled_dot_product_attention(q_rot.type_as(q), keys, values,
                                       attn_mask=None, dropout_p=0., is_causal=False)
                     attended = attended.transpose(1, 2).contiguous().view(B, T, C)
                     y = y + _block.dropout(_block.attn_out(attended))
@@ -131,17 +144,23 @@ class PrefixCache(AbstractContextManager):
         self.originals.clear()
 
     def accounting(self):
-        if any(len(e['layer_computed_rows']) != len(self.blocks) for e in self.events):
+        if any(len(e['layer_computed_rows']) != len(self.blocks) or
+               len(e['layer_kv_columns']) != len(self.blocks) for e in self.events):
             raise RuntimeError("Incomplete transformer forwards in cache accounting")
         full = sum(e["total_rows"] * len(self.blocks) for e in self.events)
         used = sum(sum(e['layer_computed_rows']) for e in self.events)
         return {"forwards": len(self.events), "computed_token_layers": used,
                 "dense_token_layers_at_same_forward_count": full,
+                "pruning": self.pruning.accounting(),
+                "kv_columns_by_layer": [sum(e['layer_kv_columns'][i] for e in self.events)
+                                        for i in range(len(self.blocks))],
+                "qk_query_key_pairs_by_layer": [sum(e['layer_computed_rows'][i] * e['layer_kv_columns'][i]
+                                                     for e in self.events) for i in range(len(self.blocks))],
                 "computed_rows_by_layer": [sum(e['layer_computed_rows'][i] for e in self.events)
                                            for i in range(len(self.blocks))],
                 "effective_schedules": [{"positions": len(positions), "refresh_by_layer": list(intervals)}
                                         for positions, intervals in self.schedules],
                 "skipped_token_update_fraction": 1 - used / max(1, full),
                 "note": "Counts skipped QKV, attention query/output and MLP rows; not total FLOPs or measured speedup. "
-                        "All answer rows and all KV columns remain present. Embedding, final norm and vocabulary "
+                        "All answer rows remain; KV column counts reflect optional pruning. Embedding, final norm and vocabulary "
                         "head still process the full sequence, equally in baseline and cached runs."}

@@ -117,3 +117,8 @@ identity-cache outputs on every example. Different matrix shapes can cause
 numerical differences for approximate policies; their own generated answers,
 not dense-diagnostic answers, are scored. Raw outputs, strict scores, normalized
 scores, repeated timings and memory/accounting remain available for inspection.
+
+
+Delayed KV-column pruning and the 32/50 refresh experiment are described in
+[PRUNING_GUIDE.md](PRUNING_GUIDE.md). Existing cache-only behavior is unchanged
+when no pruning specification is supplied.

@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mode="${1:-smoke}"
 case "$mode" in
-  setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep|gsm-depth|gsm-night|gsm-diagnose) ;;
-  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep|gsm-depth|gsm-night|gsm-diagnose]'; exit 2 ;;
+  setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep|gsm-depth|gsm-night|gsm-diagnose|gsm-prune) ;;
+  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep|gsm-depth|gsm-night|gsm-diagnose|gsm-prune]'; exit 2 ;;
 esac
 audio_venv="${AUDIO_VENV:-$PWD/.venv-audio}"
 if [[ ! -x "$audio_venv/bin/python" ]]; then
@@ -35,7 +35,7 @@ PY
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 experiment_name="${RUN_NAME:-audio_drift_${mode}_$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ "$experiment_name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid RUN_NAME'; exit 2; }
-if [[ "$mode" == gsm-night || "$mode" == gsm-diagnose ]]; then
+if [[ "$mode" == gsm-night || "$mode" == gsm-diagnose || "$mode" == gsm-prune ]]; then
   manifest="${MANIFEST:-$PWD/data/audio_drift/gsm8k_speech30_v10.jsonl}"
   base_manifest="${BASE_MANIFEST:-$PWD/data/audio_drift/gsm8k_speech10_v7.jsonl}"
   if [[ ! -f "$manifest" && -z "${MANIFEST:-}" ]]; then
@@ -47,6 +47,7 @@ if [[ "$mode" == gsm-night || "$mode" == gsm-diagnose ]]; then
   fi
   default_count=30
   if [[ "$mode" == gsm-diagnose ]]; then default_count=6; fi
+  if [[ "$mode" == gsm-prune ]]; then default_count=20; fi
   count="${SAMPLES:-$default_count}"
   length="${LENGTH:-512}"
   block="${BLOCK_LENGTH:-32}"
@@ -89,7 +90,22 @@ else
   block="${BLOCK_LENGTH:-32}"
 fi
 extra=()
-if [[ "$mode" == gsm-diagnose ]]; then
+if [[ "$mode" == gsm-prune ]]; then
+  read -r -a prune_starts <<< "${PRUNE_STARTS:-16 32}"
+  read -r -a prune_fractions <<< "${PRUNE_FRACTIONS:-0.25}"
+  extra+=(--interventions freeze --freeze-groups prefix --refresh-intervals 1 8 32 50
+          --triple-refresh 32:8:32 50:8:50
+          --late-prune --prune-starts "${prune_starts[@]}" --prune-fractions "${prune_fractions[@]}"
+          --prune-layer-start "${PRUNE_LAYER_START:-24}" --prune-queries "${PRUNE_QUERIES:-16}"
+          --skip-dense-interventions --no-drift --shuffle-policy-order
+          --benchmark-samples "$count" --benchmark-repeats "${BENCHMARK_REPEATS:-2}" --benchmark-stopping eos
+          --replay-samples "${REPLAY_SAMPLES:-$count}" --replay-steps "${REPLAY_STEPS:-256}"
+          --replay-repeats "${REPLAY_REPEATS:-2}")
+  # Exclude the generated permanent-prefix policy, retain all generated pruning controls.
+  extra+=(--condition-names freeze_prefix_r1 freeze_prefix_r8 freeze_prefix_r32 freeze_prefix_r50
+          freeze_triple_a32_p8_s32 freeze_triple_a50_p8_s50)
+  # Pruning variants are appended after named cache filtering by the runner.
+elif [[ "$mode" == gsm-diagnose ]]; then
   default_refresh_samples=2
   if (( count < default_refresh_samples )); then default_refresh_samples="$count"; fi
   extra+=(--interventions freeze --freeze-groups prefix --refresh-intervals 1 8
@@ -172,7 +188,7 @@ if [[ "$mode" == control-pilot ]]; then default_profiles=0; fi
 if [[ "$mode" == gsm-pilot ]]; then
   default_fractions=0; default_profiles=0; default_layers=all; default_steps=128
 fi
-if [[ "$mode" == gsm-sweep || "$mode" == gsm-depth || "$mode" == gsm-night || "$mode" == gsm-diagnose ]]; then
+if [[ "$mode" == gsm-sweep || "$mode" == gsm-depth || "$mode" == gsm-night || "$mode" == gsm-diagnose || "$mode" == gsm-prune ]]; then
   default_fractions=0; default_profiles=0; default_layers=all
   default_steps=$((length / 2))
 fi
@@ -188,14 +204,17 @@ python -u -m experiments.audio_drift.run \
   --cpu-threads "${CPU_THREADS:-4}" \
   --verify-samples "${VERIFY_SAMPLES:-1}" --seed "${SEED:-1729}" \
   --progress-every "${PROGRESS_EVERY:-8}" --branch-fractions "${branch_fractions[@]}" "${extra[@]}"
-if [[ "$mode" == gsm-pilot || "$mode" == gsm-sweep || "$mode" == gsm-night || "$mode" == gsm-diagnose ]]; then
+if [[ "$mode" == gsm-pilot || "$mode" == gsm-sweep || "$mode" == gsm-night || "$mode" == gsm-diagnose || "$mode" == gsm-prune ]]; then
   python -m experiments.audio_drift.reasoning_report --run "runs/$experiment_name"
+fi
+if [[ "$mode" == gsm-prune ]]; then
+  python -m experiments.audio_drift.pruning_report --run "runs/$experiment_name"
 fi
 if [[ "$mode" == gsm-diagnose ]]; then
   python -m experiments.audio_drift.diagnostic_report --run "runs/$experiment_name"
   python -m experiments.audio_drift.attention_recurrence --run "runs/$experiment_name"
 fi
-if [[ "$mode" != gsm-night && "$mode" != gsm-diagnose ]]; then
+if [[ "$mode" != gsm-night && "$mode" != gsm-diagnose && "$mode" != gsm-prune ]]; then
 python -m experiments.audio_drift.analyze --run "runs/$experiment_name"
 python -m experiments.audio_drift.stability --run "runs/$experiment_name" --statistic median
 python -m experiments.audio_drift.stability --run "runs/$experiment_name" --statistic p90

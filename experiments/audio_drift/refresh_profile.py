@@ -40,8 +40,10 @@ def profile_refresh(llm, prepared, states, active_forwards, args, work, sample_i
     from .run import write_json
     count = min(active_forwards, len(states), args.refresh_profile_steps)
     inputs = [x.to(prepared.prompt.device) for x in states[:count]]
-    specs = [None, *policy_specs(args, sample_id)]
-    report = {'forwards': count, 'active_baseline_forwards': active_forwards,
+    all_specs = policy_specs(args, sample_id)
+    specs = [None, *[s for s in all_specs if not s.get('pruning')]]
+    report = {'pruning_policies_excluded': [s['condition'] for s in all_specs if s.get('pruning')],
+              'forwards': count, 'active_baseline_forwards': active_forwards,
               'timed_repeats': args.refresh_profile_repeats, 'conditions': [],
               'note': 'Separate diagnostic: each forward uses CUDA events and synchronized wall timing. '
                       'Do NOT substitute these timings for continuous replay or autonomous decode. '
@@ -53,13 +55,13 @@ def profile_refresh(llm, prepared, states, active_forwards, args, work, sample_i
         print(f'  refresh profile {name}: warmup + {args.refresh_profile_repeats} synchronized repeats; '
               f'{count} forwards each', flush=True)
         # Warm this complete pattern with a fresh cache, outside all timings.
-        with PrefixCache(llm, prepared, spec['schedule']) if spec else nullcontext():
+        with PrefixCache(llm, prepared, spec['schedule'], pruning=spec.get('pruning')) if spec else nullcontext():
             for x in inputs:
                 output = forward_logits(llm, prepared, x)
                 del output
         records = []
         for repeat in range(args.refresh_profile_repeats):
-            with (PrefixCache(llm, prepared, spec['schedule']) if spec else nullcontext()) as cache:
+            with (PrefixCache(llm, prepared, spec['schedule'], pruning=spec.get('pruning')) if spec else nullcontext()) as cache:
                 for step, x in enumerate(inputs):
                     start_event, end_event = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                     torch.cuda.synchronize()
@@ -105,7 +107,7 @@ def capture_traces(llm, prepared, inputs, specs, work):
         name = spec['condition'] if spec else 'uncached'
         if spec and name not in keep:
             continue
-        with PrefixCache(llm, prepared, spec['schedule']) if spec else nullcontext():
+        with PrefixCache(llm, prepared, spec['schedule'], pruning=spec.get('pruning')) if spec else nullcontext():
             for step, x in enumerate(inputs[:max(chosen) + 1]):
                 if step not in chosen:
                     output = forward_logits(llm, prepared, x)

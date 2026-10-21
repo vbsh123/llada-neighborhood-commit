@@ -47,6 +47,10 @@ def intervention_specs(args):
         if unknown:
             raise ValueError(f"Requested conditions not in generated matrix: {sorted(unknown)}")
         specs = [s for s in specs if s["condition"] in names]
+    if getattr(args, 'late_prune', False):
+        from .pruning import pruning_conditions
+        specs += pruning_conditions(args.prune_starts, args.prune_fractions, args.prune_layer_start,
+                                    args.prune_queries, args.seed)
     factors = getattr(args, 'depth_multipliers', [])
     return with_depth_variants(specs, factors) if factors else specs
 
@@ -241,6 +245,11 @@ def parser():
                    help="Independent intervals for the two groups, e.g. 8:2 2:8; 0 means no refresh")
     p.add_argument("--triple-refresh", nargs="*", default=[], metavar="ACOUSTIC:PROMPT:SEMANTIC",
                    help="Independent fixed-prefix schedules for all three groups")
+    p.add_argument('--late-prune', action='store_true', help='Add delayed audio and matched-budget pruning controls')
+    p.add_argument('--prune-starts', type=int, nargs='+', default=[16, 32], help='Zero-based forward indices; no future-answer dependence')
+    p.add_argument('--prune-fractions', type=float, nargs='+', default=[.25], help='Drop quota as a fraction of audio positions')
+    p.add_argument('--prune-layer-start', type=int, default=24, help='Prune from this layer through the last layer')
+    p.add_argument('--prune-queries', type=int, default=16, help='Fixed online answer-canvas probes, including masks')
     p.add_argument("--skip-dense-interventions", action="store_true",
                    help="Run generated policies only in the compact benchmark, without dense branches")
     p.add_argument("--depth-multipliers", type=int, nargs="*", default=[],
@@ -297,6 +306,8 @@ def main():
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
+    if args.late_prune and (not args.skip_dense_interventions or args.depth_multipliers):
+        raise ValueError('Delayed pruning requires compact-only policies and no depth variants')
     if args.depth_multipliers and not args.skip_dense_interventions:
         raise ValueError("Depth variants require --skip-dense-interventions; use compact benchmarks/replay")
     if args.no_drift and (args.pairwise_count or args.token_metrics or args.snapshot_steps):
