@@ -43,6 +43,8 @@ def analyze(run, out=None):
                     removed_semantic=pick.get('dropped_by_group',{}).get('semantic',0),
                     removed_prompt=pick.get('dropped_by_group',{}).get('prompt',0),
                     actual_scope_fraction=pick.get('actual_scope_fraction'), removed_attention_mass=pick.get('removed_attention_mass'),
+                    anchor_revealed_fraction=pick.get('anchor_progress',{}).get('revealed_fraction'),
+                    anchor_remaining_masks=pick.get('anchor_progress',{}).get('remaining_masks'),
                     baseline_decode_seconds=bench['baseline_median_seconds'], policy_decode_seconds=policy['median_seconds'],
                     replay_baseline_seconds=replay.get('baseline_median_seconds'), replay_policy_seconds=same.get('median_seconds'),
                     replay_forwards=replay.get('forwards'),

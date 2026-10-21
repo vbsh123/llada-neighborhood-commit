@@ -1,124 +1,113 @@
-# Delayed audio/text pruning and longer cache intervals
+# Separate cache and delayed-pruning experiments
 
-`gsm-prune` reuses the current spoken-GSM manifest. This is an exploratory
-quality/latency experiment, not held-out validation. It collects final answers,
-strict/normalized numerical scores, clean autonomous timings and matched-input
-replay. It does not repeat the large baseline drift/attention archive. The fixed
-quota decoder, 512 answer positions, 256 maximum forwards and safe EOS stopping
-remain unchanged. All examples ending before a pruning anchor stay in primary
-results; the activation report exposes them separately.
+Test each idea independently before combining them. Both modes reuse the first
+20 rows of the existing spoken-GSM manifest, retain baseline failures, save final
+answers/scores/forward counts, and measure autonomous decoding plus identical-input
+replay. They omit repeated large drift/attention collection and operator traces.
+These are exploratory examples, not held-out validation.
 
-## Six cache-only conditions
+## Cache only: gsm-cache
 
-- Refresh every forward (identity).
-- Shared prefix interval 8.
-- Shared prefix interval 32 = A32/P32/S32.
-- Shared prefix interval 50 = A50/P50/S50.
-- A32/P8/S32.
-- A50/P8/S50.
+Exactly four conditions, acoustic / fixed prompt text / semantic:
 
-Intervals count consecutive global model forwards, including across decoding
-blocks, with initialization at index zero. Interval 50 deliberately is not
-aligned to the 16-forward decoding blocks. A 50 interval has no later refresh
-on an example that ends within 50 forwards; actual execution counts are saved.
+- A32/P8/S32: prior promising reference, remeasured on the new GPU.
+- A32/P32/S32: shared-32 sanity comparison.
+- A50/P8/S50: longer audio caching while keeping prompt at 8.
+- A50/P50/S50: shared-50 comparison.
 
-## Twelve pruning conditions by default
+No identity policy, shared-8 policy, or pruning. A fresh uncached baseline is
+still timed for quality/latency comparison on the current machine. Intervals
+count global consecutive forwards across decoding blocks, initializing at zero.
+Interval 50 is intentionally not aligned with the 16-forward decoding blocks;
+examples ending within 50 forwards only initialize that cache.
 
-Every strategy is paired across three eligible pools: audio only, fixed prompt
-text only, and the full conditioning prefix (audio plus text). Answer positions
-are never candidates. Each corresponding comparison has the same absolute
-removal budget, anchor, layer range and base caching schedule.
+## Pruning only: gsm-prune
 
-- Shared-8 + lowest-mean-attention pruning after 16 forwards: three pools.
-- Shared-8 + lowest-mean-attention pruning after 32 forwards: three pools.
-- Shared-8 + random pruning after 32 forwards: three pools.
-- Refresh-every-forward + lowest-mean-attention pruning after 32: three pools.
-  This last trio isolates pruning without prefix cache reuse.
+Nine policies; no cache reuse for surviving positions:
 
-Removal count is floor(0.25 * number_of_audio_positions), capped to leave at
-least one position in each of the audio and prompt groups. This is a
-COUNT-matched experiment, not a fraction-matched experiment: the much shorter
-prompt can lose a large fraction of its positions. Actual count/fraction and
-removed acoustic/semantic/prompt counts are logged. `PRUNE_FRACTIONS` changes
-the requested audio-based quota. Structural prompt positions are not exempted;
-interpret fixed-template text pruning accordingly.
+| Selection | After how many forwards? | Eligible pools |
+|---|---:|---|
+| Lowest mean attention | 16 | Audio; fixed prompt text; complete audio+text prefix |
+| Lowest mean attention | 32 | Audio; fixed prompt text; complete audio+text prefix |
+| Random, matched budget | 32 | Audio; fixed prompt text; complete audio+text prefix |
 
-Selection uses the state at the anchor in layer 24, averaged across all heads
-and 16 evenly spread answer-CANVAS query positions, including masks and future
-blocks. It does not use the final answer length, a baseline trajectory, future
-attention, correctness labels, or retrospective revealed fractions. Attention
-is reconstructed in FP32 for selection; the ordinary model attention backend
-is used for generation. Random variants receive reproducible sample-specific
-seeds and record the same attention-mass diagnostic for overhead comparability.
-This first intervention ranks instantaneous mean attention. It does not claim
-a persistent-low or peak/drift-guarded safety rule.
+Within each trio, timing/layers and absolute removal counts match. Count is
+floor(0.25 * audio positions), capped to leave at least one position in each of
+the audio and text groups. This matches counts, not fractions: the short text
+prompt may lose a large fraction of its positions, including structural tokens.
+Actual counts, fractions and acoustic/semantic/prompt composition are recorded.
 
-The same selected positions are omitted from attention KV columns immediately
-at layer 24 and in all deeper layers. They stay omitted on later forwards,
-including refresh forwards. Their QKV/query/MLP rows are skipped from the next
-forward in those layers; selection happens after anchor QKV computation.
-Earlier layers still process these positions normally under the base cache.
-Original RoPE coordinates remain unchanged. No removed lower-layer position is
-revived in a deeper layer using a stale hidden state.
+Anchors use only observed forward number. With 512 answer slots and two commits
+per forward, the defaults correspond to 32/64 revealed slots (6.25%/12.5% of the
+full canvas). These are NOT fractions of the unknown final answer length.
+Autonomous selection records the actual remaining masks, revealed fraction,
+block and block progress. Forward index and global canvas unmasking are coupled
+under the fixed-quota decoder; they are not independent triggers here.
 
-Full-size backing KV/hidden banks and full embedding/final norm/vocabulary
-allocations are retained; retained KV columns are gathered before attention.
-Thus this measures real attention-column and transformer-row work reduction,
-including selection/gather overhead, not GPU memory reclamation or guaranteed
-speedup. Both peak allocated memory and actual row/KV/query-key-pair counts are
-saved. Cached information can still reach answer positions through earlier
-layers; this is deliberate late-layer removal.
+Selection happens once at layer 24, using all heads and 16 fixed answer-CANVAS
+query positions, including masks and future decoding blocks. No baseline future
+trajectory, final answer span, future attention, or target answer is consulted.
+The FP32 selection softmax ranks current mean attention; this is a quota test,
+not a calibrated persistent-low/peak/drift-guarded safety rule. Random controls
+use deterministic sample-specific seeds and record removed attention mass too.
 
-## Run
+Selected KV columns disappear immediately in layers 24–31 and remain omitted
+on later forwards. Their QKV/query/MLP rows are skipped from the next forward in
+those layers. The SAME positions stay removed throughout the deeper stack;
+a removed lower-layer position is never revived with stale representations.
+Earlier layers and all surviving rows recompute every forward, with unchanged
+absolute RoPE coordinates. All answer rows remain active. Full-size backing
+banks, embeddings, final norm and vocabulary projection allocations remain;
+retained KV columns are gathered before attention. This is real column/row
+work removal with selection/gather overhead included, not memory reclamation
+or a guaranteed speedup. The adapter's internal interval 1 means no reuse of
+surviving prefix representations. Deep-layer-only pruning may give modest gains.
+
+## Run sequentially on the same GPU
+
+Use a new run name for each stage. Install and prepare the pinned manifests
+first (the setup steps from the previous instructions remain valid).
 
 ```bash
 cd /workspace/llada-audio-drift
 git pull --ff-only
-nohup env RUN_NAME=audio_gsm_prune20_v14 SAMPLES=20 SKIP_INSTALL=1 \
-  REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
-  bash scripts/vast_audio_drift.sh gsm-prune \
-  > audio_gsm_prune20_v14.log 2>&1 &
-tail -f audio_gsm_prune20_v14.log
+nohup env SAMPLES=20 SKIP_INSTALL=1 REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
+  WHISPER_REVISION=06f233fe06e710322aca913c1bc4249a0d71fce1 \
+  bash -c '
+    RUN_NAME=audio_gsm_cache20_v15 bash scripts/vast_audio_drift.sh gsm-cache > audio_gsm_cache20_v15.log 2>&1 &&
+    RUN_NAME=audio_gsm_prune20_v15 bash scripts/vast_audio_drift.sh gsm-prune > audio_gsm_prune20_v15.log 2>&1
+  ' > audio_followup_v15.log 2>&1 &
 ```
 
-Default total: uncached baseline plus 18 benchmark policies on each example,
-one policy warmup plus two timed repeats, and two matched-input replay repeats
-through up to 256 baseline pre-EOS forwards. All selection and gathering costs
-are included in both autonomous timing and replay. Replay outputs are not
-scored; replay and autonomous runs may select different positions because they
-follow different token trajectories. There is no repeat of full attention
-histories/operator profiling in this mode. `SAMPLES=1` with a new run name is a
-GPU smoke option before committing to the full experiment.
+The pruning stage starts only if the cache stage succeeds. Download BOTH run
+folders and both stage logs. Full-size checkpoints download on first use.
+Both stages use 512 answer slots, 256 maximum forwards, 32-position blocks and
+safe EOS stopping. Each policy has a warmup and two timed repeats, plus two
+identical-input replay repeats up to the complete baseline pre-EOS trajectory.
+Replay outputs are not graded, and its token selections can differ from those
+in autonomous generation. Full-size CUDA execution remains to be validated;
+CPU tests cover the pinned tiny upstream model in FP32/BF16 and explicit KV
+removal, scope pairing, onset/propagation, accounting, repeat behavior and reports.
 
-`PRUNE_STARTS="16 32"`, `PRUNE_LAYER_START=24`, `PRUNE_QUERIES=16`,
-`PRUNE_FRACTIONS="0.25"`, `BENCHMARK_REPEATS`, `REPLAY_REPEATS`,
-`REPLAY_SAMPLES` and `REPLAY_STEPS` are adjustable. Random/no-cache controls are
-added at the largest requested anchor; attention/shared-8 pairs cover every
-anchor. Multiple requested fractions expand every corresponding scope pair.
-Pruning is tested on shared-8 and without cache reuse, not crossed with every
-cache interval. The longer intervals form a separate cache-only comparison.
+## Retained data and controls
 
-## Read the results
+`cache_benchmark.json` saves final texts/IDs/scores, schedules, time repeats,
+peak allocated memory, actual row/KV/query-key-pair accounting, and selected
+positions/group composition/removed mass. Pruning anchors also record actual
+autonomous unmasking progress. `fixed_input_replay.json` measures matched-state
+forward timing independently of generated length; all selection/gather costs
+are included. `analysis/reasoning_report.md` reports paired quality/latency.
+The pruning stage additionally writes `pruning_report.md` and `pruning_pairs.csv`,
+including activation and actual budgets. Examples ending before their pruning
+anchor remain in primary scores; inspect activation separately.
 
-- `cache_benchmark.json`: policy specs, final texts/token IDs, quality, repeats,
-  peak memory and exact execution accounting. Pruning accounting records anchor,
-  absolute positions, pool composition, removed mass and downstream layers.
-- `fixed_input_replay.json`: same baseline inputs and forward count for each
-  policy, separate initialization/selection in each fresh run.
-- `analysis/reasoning_report.md`: primary paired quality and speed results.
-- `analysis/pruning_report.md` and `pruning_pairs.csv`: activation counts,
-  actual budgets/fractions, group composition and per-example compute/timing.
-  Activation is diagnostic; do not drop unactivated/failed baseline examples
-  from primary scores to improve the headline result.
+`PRUNE_STARTS="16 32"`, `PRUNE_FRACTIONS="0.25"`, `PRUNE_LAYER_START=24`,
+`PRUNE_QUERIES=16`, `BENCHMARK_REPEATS`, `REPLAY_REPEATS`, `REPLAY_SAMPLES`,
+`REPLAY_STEPS` and `SAMPLES` are configurable. Random controls are added at the
+largest requested anchor; every strategy is paired across all three pools.
 
-Manual review plus pinned tiny-upstream FP32/BF16 tests check agreement with an
-independent reference that computes every row and explicitly removes the same
-KV columns, delayed onset, retained RoPE positions, downstream mask persistence,
-identity controls, scope pairing, measured row/KV counts, repeat reproducibility
-and report integration. Full-size CUDA speed and quality require the GPU run.
-
-For a fresh machine reproducing v13, set `WHISPER_REVISION=06f233fe06e710322aca913c1bc4249a0d71fce1`.
-Recreate the development manifest with seed 1729 at GSM8K-Speech revision
-`e94caa2154433a54cd430702666c454977df3083`, then recreate the 30-row combined
-manifest using seed 20261020 and that base manifest. The first 20 rows reproduce
-the preceding diagnostic cohort; these remain exploratory rather than held out.
+For reproducibility, the previous dataset revision is
+`e94caa2154433a54cd430702666c454977df3083`: prepare 10 development examples
+with seed 1729, then the 30-row combined manifest with that base and seed
+20261020; run its first 20 rows. The LLaDA and DIFFA adapter revisions are
+already pinned; the command above pins the previous Whisper revision too.

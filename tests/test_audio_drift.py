@@ -27,14 +27,15 @@ class InputTests(unittest.TestCase):
         from experiments.audio_drift.pruning import pruning_conditions
         from experiments.audio_drift.protocol import is_identity
         specs = pruning_conditions()
-        self.assertEqual(len(specs), 12)
-        self.assertEqual(len({s['condition'] for s in specs}), 12)
+        self.assertEqual(len(specs), 9)
+        self.assertEqual(len({s['condition'] for s in specs}), 9)
         groups = {}
         for spec in specs:
             p = spec['pruning']
             key = (p['start'], p['selection'], spec['schedule'][0]['refresh_every'])
             groups.setdefault(key, set()).add(p['scope'])
             self.assertFalse(is_identity(spec))
+            self.assertEqual(spec['schedule'][0]['refresh_every'], 1)
         self.assertTrue(all(g == {'audio', 'prompt', 'prefix'} for g in groups.values()))
         for kw in [dict(starts=[0]), dict(fractions=[1.]), dict(fractions=[float('nan')]), dict(layer_start=-1)]:
             with self.assertRaises(ValueError): pruning_conditions(**kw)
@@ -722,16 +723,17 @@ class UpstreamTests(unittest.TestCase):
             root=Path(directory);work=root/'samples/00000';work.mkdir(parents=True)
             bench=benchmark(self.llm,self.prepared,final,args,tokenizer,{'id':'tiny','metric':'numeric','target':'1'},work)
             replay=benchmark_replay(self.llm,self.prepared,states,bench['baseline_forwards'],args,work,sample_id='tiny')
-            self.assertEqual(len(bench['policies']),11)
-            self.assertEqual(len(replay['policies']),11)
+            self.assertEqual(len(bench['policies']),8)
+            self.assertEqual(len(replay['policies']),8)
             for policy in bench['policies']:
                 if policy.get('pruning'):
                     selection=policy['accounting'][0]['pruning']['selections'][0]
                     self.assertEqual(selection['drop_budget'],1)
+                    self.assertEqual(selection['anchor_progress']['revealed_fraction'],.25)
                     self.assertEqual(sum(selection['dropped_by_group'].values()),1)
             write_json(work/'result.json',{'id':'tiny','score':{'correct':True},'benchmark':bench})
             rows=analyze(root)
-            self.assertEqual(len(rows),9)
+            self.assertEqual(len(rows),6)
             self.assertEqual({r['scope'] for r in rows},{'audio','prompt','prefix'})
             self.assertTrue(all(r['activated'] and r['replay_activated'] for r in rows))
             self.assertTrue((root/'analysis/pruning_report.md').exists())

@@ -62,6 +62,13 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
         elapsed = time.perf_counter() - start
         peak = torch.cuda.max_memory_allocated()
         counts = cache.accounting() if spec else {"forwards": len(events)}
+        if spec and spec.get('pruning'):
+            for pick in counts['pruning']['selections']:
+                anchor = events[pick['step']]
+                pick['anchor_progress'] = {key: anchor[key] for key in
+                    ('remaining_masks', 'remaining_fraction', 'active_remaining_masks', 'active_remaining_fraction',
+                     'block', 'step_in_block', 'previous_changed_tokens')}
+                pick['anchor_progress']['revealed_fraction'] = 1 - anchor['remaining_fraction']
         return final, elapsed, peak, counts
 
     print(f"  benchmark: {len(specs)} policies; {args.benchmark_repeats} timed repeats; "

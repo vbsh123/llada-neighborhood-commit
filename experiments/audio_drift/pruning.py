@@ -18,15 +18,14 @@ def pruning_conditions(starts=(16, 32), fractions=(.25,), layer_start=24, querie
     specs = []
     for fraction in fractions:
         for start in starts:
-            variants = [(scope, 'attention', 8) for scope in ('audio', 'prompt', 'prefix')]
+            variants = [(scope, 'attention', 1) for scope in ('audio', 'prompt', 'prefix')]
             if start == max(starts):
-                variants += [(scope, 'random', 8) for scope in ('audio', 'prompt', 'prefix')]
-                variants += [(scope, 'attention', 1) for scope in ('audio', 'prompt', 'prefix')]
+                variants += [(scope, 'random', 1) for scope in ('audio', 'prompt', 'prefix')]
             for scope, selection, interval in variants:
                 tag = format(fraction * 100, '.8g').replace('.', 'p')
                 plan = dict(start=start, fraction=fraction, layer_start=layer_start,
                             queries=queries, seed=seed, scope=scope, selection=selection)
-                specs.append(dict(condition=f'freeze_prefix_r{interval}_prune_{scope}_{selection}_f{tag}_start{start}_l{layer_start}',
+                specs.append(dict(condition=f'prune_{scope}_{selection}_f{tag}_start{start}_l{layer_start}',
                                   mode='freeze', schedule=[dict(group='prefix', refresh_every=interval)], pruning=plan))
     return specs
 
