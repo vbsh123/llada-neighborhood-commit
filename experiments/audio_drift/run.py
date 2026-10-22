@@ -59,6 +59,11 @@ def intervention_specs(args):
         from .crossing_pruning import crossing_conditions
         specs += crossing_conditions(args.crossing_fractions,args.crossing_layer,args.crossing_start,
                                      args.crossing_interval,args.crossing_patience,args.prune_queries,args.seed)
+    if getattr(args,'progressive_prune',False):
+        from .progressive_pruning import progressive_conditions
+        specs += progressive_conditions(args.length,args.block_length,args.steps,args.acoustic_start,
+            args.progressive_semantic_start,args.progressive_interval,args.progressive_patience,
+            args.progressive_threshold,args.progressive_fraction,args.seed)
     factors = getattr(args, 'depth_multipliers', [])
     return with_depth_variants(specs, factors) if factors else specs
 
@@ -260,6 +265,12 @@ def parser():
     p.add_argument('--crossing-start', type=int, default=8)
     p.add_argument('--crossing-interval', type=int, default=8)
     p.add_argument('--crossing-patience', type=int, default=2)
+    p.add_argument('--progressive-prune', action='store_true')
+    p.add_argument('--progressive-semantic-start',type=int,default=44)
+    p.add_argument('--progressive-interval',type=int,default=8)
+    p.add_argument('--progressive-patience',type=int,default=2)
+    p.add_argument('--progressive-threshold',type=float,default=.5)
+    p.add_argument('--progressive-fraction',type=float,default=.25)
     p.add_argument('--sensitivity-samples', type=int, default=0)
     p.add_argument('--sensitivity-fractions', type=float, nargs='+', default=[.25,.5,.75])
     p.add_argument('--sensitivity-budgets', type=int, nargs='+', default=[8,16,32])
@@ -269,6 +280,9 @@ def parser():
     p.add_argument('--priority-text-sources', nargs='+', choices=['revealed','prompt'], default=['revealed'])
     p.add_argument('--priority-start', type=int, default=40)
     p.add_argument('--priority-smoothing', type=float, default=.2)
+    p.add_argument('--priority-method',choices=['legacy_balance','phased_odds'],default='legacy_balance')
+    p.add_argument('--priority-midpoint',type=int,default=44)
+    p.add_argument('--priority-end',type=int,default=88)
     p.add_argument('--staged-fractions', type=float, nargs='+', default=[.5,.75])
     p.add_argument('--acoustic-start', type=int, default=16)
     p.add_argument('--later-start', type=int, default=32)
@@ -348,6 +362,9 @@ def main():
                 or len(set(args.priority_text_sources))!=len(args.priority_text_sources)
                 or args.priority_start<0 or not 0<args.priority_smoothing<=1):
             raise ValueError('Invalid attention priority strengths/sources/ramp')
+        if args.priority_method=='phased_odds' and (args.priority_start!=0 or args.priority_text_sources!=['prompt']
+                or not 0<args.priority_midpoint<args.priority_end):
+            raise ValueError('Phased odds needs start0, fixed prompt text, and midpoint<end')
     if args.sensitivity_samples:
         import math
         if (not args.sensitivity_fractions or args.sensitivity_fractions!=sorted(set(args.sensitivity_fractions))
@@ -358,6 +375,10 @@ def main():
     if args.crossing_prune and (args.staged_prune or args.late_prune or not args.skip_dense_interventions
             or args.depth_multipliers or not args.no_drift or args.diagnostic_samples or args.pruning_profile_samples):
         raise ValueError('Crossing pruning requires its own compact-only, no-drift experiment; operator tracing is separate')
+    if args.progressive_prune and (args.crossing_prune or args.staged_prune or args.late_prune
+            or not args.skip_dense_interventions or not args.no_drift or args.depth_multipliers
+            or args.diagnostic_samples or args.pruning_profile_samples or args.refresh_profile_samples):
+        raise ValueError('Progressive pruning requires its own compact-only no-drift experiment')
     if args.staged_prune and (args.late_prune or not args.skip_dense_interventions or args.depth_multipliers or not args.no_drift or args.diagnostic_samples):
         raise ValueError('Staged pruning requires its own compact-only experiment without cache/depth variants')
     if args.pruning_profile_samples < 0 or args.pruning_profile_samples > args.replay_samples:

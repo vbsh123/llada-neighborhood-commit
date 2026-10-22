@@ -65,6 +65,7 @@ def benchmark_replay(llm, prepared, states, baseline_forwards, args, work, sampl
     for spec in specs:
         from .crossing_pruning import resolve_control
         spec = resolve_control(spec, report['policies'])
+        print(f"    replay {spec['condition']}: warmup starting",flush=True)
         warm, _, _, _ = measure(spec)
         identity = is_identity(spec)
         identity_match = torch.equal(warm.argmax(-1), expected_last) if identity else None

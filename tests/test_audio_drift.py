@@ -23,6 +23,30 @@ if HAS_TORCH:
 
 class InputTests(unittest.TestCase):
     @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_phased_prompt_weights_and_attention_gate(self):
+        from experiments.audio_drift.attention_priority import FixedPhaseRamp,high_attention_factor
+        ramp=FixedPhaseRamp()
+        for step,left,right in [(0,1,0),(22,.5,0),(44,0,0),(66,0,.5),(88,0,1),(200,0,1)]:
+            r=ramp.update(step,0,0)
+            self.assertEqual(r['semantic_weight'],left);self.assertEqual(r['text_weight'],right)
+        factors,_,_=high_attention_factor(torch.arange(100,dtype=torch.float32))
+        self.assertEqual(float(factors[:75].sum()),0.)
+        self.assertEqual(float(factors[-1]),1.)
+        self.assertEqual(float(high_attention_factor(torch.ones(8))[0].sum()),0.)
+        for midpoint,end in [(0,88),(44,44)]:
+            with self.assertRaises(ValueError):FixedPhaseRamp(midpoint,end)
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_progressive_matrix_controls_and_invalid_settings(self):
+        from experiments.audio_drift.progressive_pruning import progressive_conditions
+        specs=progressive_conditions()
+        self.assertEqual(len(specs),4)
+        self.assertEqual([s['pruning']['control'] for s in specs],['audio','early_text','late_text','generic'])
+        self.assertTrue(all(s['control_source']==specs[0]['condition'] for s in specs[1:]))
+        for kw in [dict(threshold=0),dict(fraction=0),dict(patience=0),dict(semantic_start=256)]:
+            with self.assertRaises(ValueError):progressive_conditions(**kw)
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
     def test_priority_balance_after40_crossing_and_bounds(self):
         from experiments.audio_drift.attention_priority import BalanceRamp
         ramp=BalanceRamp(40,1.)
@@ -705,6 +729,106 @@ class UpstreamTests(unittest.TestCase):
         self.llm.model.transformer.ff_out = output
         self.prepared = Prepared(torch.tensor([[1, 2, 3]]),
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_progressive_all_layers_compaction_dense_reference_and_controls(self):
+        from experiments.audio_drift.progressive_pruning import progressive_conditions
+        from experiments.audio_drift.crossing_pruning import resolve_control
+        from experiments.audio_drift.compact import policy_context
+        from experiments.audio_drift.decode import forward_logits
+        from experiments.audio_drift.hooks import blocks_of
+        self.prepared=Prepared(self.prepared.prompt,torch.randn(1,4,16).to(torch.bfloat16),1,2,31)
+        self.llm.float();x=torch.tensor([[1,2,3,31,31,31,31]])
+        specs=progressive_conditions(4,2,4,1,2,1,1,100,.5)
+        completed=[];baseline=forward_logits(self.llm,self.prepared,x)
+        for spec in specs:
+            spec=resolve_control(spec,completed)
+            with policy_context(self.llm,self.prepared,spec) as engine:
+                actual=[forward_logits(self.llm,self.prepared,x) for _ in range(4)]
+                counts=engine.accounting();picks=engine.records
+            self.assertEqual(sum(p['drop_budget'] for p in picks),4)
+            self.assertTrue(all(p['score_step']==p['step']-1 and p['layer']==0 for p in picks))
+            self.assertEqual(counts['computed_rows_by_layer'][0],counts['computed_rows_by_layer'][1])
+            self.assertEqual(len(spec['pruning']['stages']),1)
+            completed.append(dict(condition=spec['condition'],accounting=[counts]))
+            for earlier in completed:
+                self.assertEqual(counts['computed_rows_by_layer'],earlier['accounting'][0]['computed_rows_by_layer'])
+            if spec['pruning']['control'] in ('early_text','late_text'):
+                self.assertEqual(sum(p['dropped_by_group']['prompt'] for p in picks),1)
+            originals=[];current=[0]
+            try:
+                for layer,block in enumerate(blocks_of(self.llm)):
+                    method=block._scaled_dot_product_attention;existed='_scaled_dot_product_attention' in block.__dict__
+                    originals.append((block,method,existed))
+                    def dense(q,k,v,_method=method,**kwargs):
+                        removed={p for r in picks if r['step']<=current[0] for p in r['dropped_positions']}
+                        keep=torch.tensor([i for i in range(11) if i not in removed])
+                        return _method(q,k.index_select(-2,keep),v.index_select(-2,keep),**kwargs)
+                    block._scaled_dot_product_attention=dense
+                for step in range(4):
+                    current[0]=step
+                    torch.testing.assert_close(actual[step],forward_logits(self.llm,self.prepared,x),rtol=2e-5,atol=2e-5)
+            finally:
+                for block,method,existed in originals:
+                    if existed:block._scaled_dot_product_attention=method
+                    else:delattr(block,'_scaled_dot_product_attention')
+            torch.testing.assert_close(forward_logits(self.llm,self.prepared,x),baseline,rtol=0,atol=0)
+        with policy_context(self.llm,self.prepared,specs[0]) as engine:
+            for _ in range(2):forward_logits(self.llm,self.prepared,x)
+            counts=engine.accounting()
+            self.assertEqual(sum(p['drop_budget'] for p in engine.records),1)
+            self.assertEqual(sum(len(p['dropped_positions']) for p in counts['pruning']['pending_unapplied']),2)
+        # A long semantic pool can exhaust the naturally finite prompt pool.
+        self.prepared=Prepared(self.prepared.prompt,torch.randn(1,12,16).float(),1,2,31)
+        large=progressive_conditions(4,2,4,1,2,1,1,100,1.)
+        with policy_context(self.llm,self.prepared,large[0]) as source:
+            for _ in range(4):forward_logits(self.llm,self.prepared,x)
+            source_counts=source.accounting()
+        late=resolve_control(large[2],[dict(condition=large[0]['condition'],accounting=[source_counts])])
+        with policy_context(self.llm,self.prepared,late) as control:
+            for _ in range(4):forward_logits(self.llm,self.prepared,x)
+            counts=control.accounting()
+        self.assertEqual(counts['computed_rows_by_layer'],source_counts['computed_rows_by_layer'])
+        replacements=[p for c in counts['pruning']['trigger_checks'] for p in c['replacement_details']]
+        self.assertTrue(any(p['requested_text_count']==5 and p['allocated_text_count']==3 for p in replacements))
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_progressive_benchmark_replay_and_phased_odds_quality(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.run import parser,write_json
+        from experiments.audio_drift.benchmark import benchmark
+        from experiments.audio_drift.replay import benchmark_replay
+        from experiments.audio_drift.attention_priority import AttentionPriority,run_priority_study
+        from experiments.audio_drift.pruning_report import analyze
+        self.prepared=Prepared(self.prepared.prompt,torch.randn(1,4,16).to(torch.bfloat16),1,2,31)
+        self.llm.float()
+        args=parser().parse_args(['--manifest','unused','--out','unused','--progressive-prune','--interventions',
+            '--skip-dense-interventions','--no-drift','--length','4','--block-length','2','--steps','4',
+            '--acoustic-start','1','--progressive-semantic-start','2','--progressive-interval','1',
+            '--progressive-patience','1','--progressive-threshold','100','--progressive-fraction','.5',
+            '--benchmark-repeats','2','--replay-repeats','2','--shuffle-policy-order'])
+        baseline,states,_=decode(self.llm,self.prepared,4,2,4)
+        tokenizer=SimpleNamespace(eos_token_id=30,all_special_ids=[30,31],decode=lambda ids,**kw:'#### 1')
+        with tempfile.TemporaryDirectory() as directory,patch.object(torch.cuda,'synchronize'), \
+                patch.object(torch.cuda,'reset_peak_memory_stats'),patch.object(torch.cuda,'max_memory_allocated',return_value=0):
+            root=Path(directory);work=root/'samples/00000';work.mkdir(parents=True)
+            bench=benchmark(self.llm,self.prepared,baseline,args,tokenizer,dict(id='progressive',metric='numeric',target='1'),work)
+            replay=benchmark_replay(self.llm,self.prepared,states,bench['baseline_forwards'],args,work,sample_id='progressive')
+            self.assertEqual(len(bench['policies']),4);self.assertEqual(len(replay['policies']),4)
+            write_json(work/'result.json',dict(id='progressive',score=dict(correct=True),benchmark=bench))
+            self.assertEqual(len(analyze(root)),4)
+            args.priority_method='phased_odds';args.priority_start=0;args.priority_midpoint=2;args.priority_end=4
+            args.priority_text_sources=['prompt'];args.priority_strengths=[.1]
+            self.assertEqual(run_priority_study(self.llm,self.prepared,baseline,args,tokenizer,dict(metric='numeric',target='1'),work)['policies'],4)
+        with AttentionPriority(self.llm,self.prepared,tokenizer,alpha=.1,text_source='prompt',start=0,
+                               method='phased_odds',midpoint=2,end=4) as priority:
+            decode(self.llm,self.prepared,4,2,4,priority=priority)
+        self.assertGreater(max(priority.records[0]['priority_bonus']),0.)
+        self.assertEqual(max(priority.records[2]['priority_bonus']),0.)
+        for r in priority.records:
+            for p,b,z in zip(r['base_top1_confidence'],r['priority_bonus'],r['log_odds_shift']):
+                self.assertGreaterEqual(b,0.)
+                self.assertAlmostEqual(p+b,p/(p+(1-p)*__import__('math').exp(-z)),places=12)
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_online_attention_scores_zero_priority_and_priority_selection(self):

@@ -172,6 +172,9 @@ def policy_context(llm, prepared, specification):
         if any(s['refresh_every'] != 1 for s in specification['schedule']):
             raise ValueError('Compact staged pruning must be evaluated without cache reuse')
         from .staged_pruning import CompactStagedPruning
+        if plan.get('progressive_global'):
+            from .progressive_pruning import ProgressivePruning
+            return ProgressivePruning(llm, prepared, plan)
         if plan.get('generation_trigger'):
             from .crossing_pruning import CrossingPruning
             return CrossingPruning(llm, prepared, plan)

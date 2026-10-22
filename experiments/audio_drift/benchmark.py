@@ -98,8 +98,13 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
     for spec in specs:
         from .crossing_pruning import resolve_control
         spec = resolve_control(spec, report['policies'])
-        warm, _, _, _ = measure(spec)
+        print(f"    benchmark {spec['condition']}: warmup starting",flush=True)
+        warm, _, _, warm_counts = measure(spec)
         del warm
+        if spec.get('pruning',{}).get('progressive_global'):
+            picks=warm_counts['pruning']['selections']
+            print(f"      warmup: {sum(p['drop_budget'] for p in picks)} prefix positions removed, "
+                  f"{len(picks)} applied batches; skipped row updates={warm_counts['skipped_token_update_fraction']:.2%}",flush=True)
         durations, outputs, accounting, peaks = [], [], [], []
         for _ in range(args.benchmark_repeats):
             final, elapsed, peak, counts = measure(spec)
@@ -107,6 +112,7 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
             outputs.append(visible_ids(final, prepared, tokenizer.eos_token_id))
             accounting.append(counts)
             peaks.append(peak)
+            print(f"      timed repeat {len(durations)}/{args.benchmark_repeats}: {elapsed:.2f}s; {counts['forwards']} forwards",flush=True)
             text = display_text(tokenizer, final, prepared.prompt.shape[1])
             del final
         reproducible = all(x == outputs[0] for x in outputs)

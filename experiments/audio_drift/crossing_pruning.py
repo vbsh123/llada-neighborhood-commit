@@ -53,6 +53,9 @@ def resolve_control(spec, completed):
     if not spec.get('control_source'):return spec
     source=next((p for p in completed if p['condition']==spec['control_source']),None)
     if source is None:raise ValueError('Missing crossing source measurements')
+    if spec['pruning'].get('progressive_global'):
+        from .progressive_pruning import resolve_progressive_control
+        return resolve_progressive_control(spec,source)
     account=source['accounting'][0]['pruning']
     resolved=deepcopy(spec);plan=resolved['pruning']
     plan['resolved_control']=True

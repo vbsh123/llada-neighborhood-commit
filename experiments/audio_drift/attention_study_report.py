@@ -33,11 +33,14 @@ def analyze(root):
         summary=folder/'attention_priority.json'
         if summary.exists():
             for p in json.loads(summary.read_text())['policies']:
+                raw=json.loads((folder/(p['condition']+'.json')).read_text())
+                active=p.get('nonzero_bonus_forwards')
+                if active is None:active=sum(any(v!=0 for v in r['priority_bonus']) for r in raw['forwards'])
                 priority.append(dict(id=result['id'],cohort=result.get('cohort','unspecified'),condition=p['condition'],baseline_correct=result['score'].get('correct'),
                     policy_correct=p['score'].get('correct'),parse_failed=p['score'].get('parse_failed'),
                     forwards=p['forwards'],cutoff=p['cutoff'],no_eos=p['answer_has_no_eos'],
+                    active_bonus_forwards=active,
                     instrumented_seconds=p['instrumented_seconds']))
-                raw=json.loads((folder/(p['condition']+'.json')).read_text())
                 for r in raw['forwards']:
                     trajectories.append(dict(id=result['id'],condition=p['condition'],step=r['step'],phase=r['phase'],
                         semantic_mass=r['mean_mass']['semantic'],prompt_mass=r['mean_mass']['prompt'],
@@ -77,14 +80,14 @@ def analyze(root):
         fig.suptitle('Forward-only removal sensitivity; examples equally weighted, layers fixed within run')
         fig.tight_layout();fig.savefig(out/'removal_sensitivity.png',dpi=160);plt.close(fig)
     if priority:
-        lines += ['| Policy | N | Baseline correct | Policy correct | Correct → wrong | Wrong → correct | Cutoff observed | Parse failures |',
-                  '|---|---:|---:|---:|---:|---:|---:|---:|']
+        lines += ['| Policy | N | Baseline correct | Policy correct | Correct → wrong | Wrong → correct | Cutoff observed | Nonzero-bonus samples | Parse failures |',
+                  '|---|---:|---:|---:|---:|---:|---:|---:|---:|']
         for condition in sorted({r['condition'] for r in priority}):
             v=[r for r in priority if r['condition']==condition]
             lines.append(f"| {condition} | {len(v)} | {sum(bool(r['baseline_correct']) for r in v)} | "
                          f"{sum(bool(r['policy_correct']) for r in v)} | {sum(bool(r['baseline_correct']) and not r['policy_correct'] for r in v)} | "
                          f"{sum(not r['baseline_correct'] and bool(r['policy_correct']) for r in v)} | {sum(r['cutoff'] is not None for r in v)} | "
-                         f"{sum(bool(r['parse_failed']) for r in v)} |")
+                         f"{sum(bool(r['active_bonus_forwards']) for r in v)} | {sum(bool(r['parse_failed']) for r in v)} |")
     (out/'attention_study_report.md').write_text('\n'.join(lines)+'\n')
     print('\n'.join(lines),flush=True)
     print(f'Attention study report: {len(sensitivity)} sensitivity rows, {len(priority)} priority results',flush=True)
