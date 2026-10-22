@@ -23,6 +23,21 @@ if HAS_TORCH:
 
 class InputTests(unittest.TestCase):
     @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_priority_balance_after40_crossing_and_bounds(self):
+        from experiments.audio_drift.attention_priority import BalanceRamp
+        ramp=BalanceRamp(40,1.)
+        self.assertEqual(ramp.update(20,1,9)['phase'],'before_start')
+        self.assertEqual(ramp.update(40,1,9)['phase'],'waiting_for_semantic_dominance')
+        self.assertIsNone(ramp.cutoff)
+        self.assertEqual(ramp.update(41,3,1)['semantic_weight'],1.)
+        self.assertAlmostEqual(ramp.update(42,2,1)['semantic_weight'],2/3)
+        cross=ramp.update(43,1,1)
+        self.assertEqual(cross['cutoff'],43);self.assertEqual(cross['semantic_weight'],0.)
+        self.assertAlmostEqual(ramp.update(44,1,3)['text_weight'],.5)
+        bounce=ramp.update(45,3,1)
+        self.assertEqual(bounce['semantic_weight'],0.);self.assertAlmostEqual(bounce['text_weight'],.5)
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
     def test_crossing_configuration_and_source_order(self):
         from experiments.audio_drift.crossing_pruning import crossing_conditions,dependency_order,resolve_control
         a,b=crossing_conditions()
@@ -690,6 +705,74 @@ class UpstreamTests(unittest.TestCase):
         self.llm.model.transformer.ff_out = output
         self.prepared = Prepared(torch.tensor([[1, 2, 3]]),
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_online_attention_scores_zero_priority_and_priority_selection(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.attention_scores import OnlineAttentionScores
+        from experiments.audio_drift.attention_priority import AttentionPriority
+        from experiments.audio_drift.decode import forward_logits,commit
+        self.llm.float()
+        x=torch.tensor([[1,2,3,31,31,31,31]])
+        expected=forward_logits(self.llm,self.prepared,x)
+        with OnlineAttentionScores(self.llm,self.prepared,special_ids=[30,31]) as probe:
+            probe.begin(x,0,2,30)
+            actual=forward_logits(self.llm,self.prepared,x)
+            key,mass=probe.summaries()
+            self.assertEqual(probe.query_offsets.tolist(),[0,1])
+            self.assertEqual(tuple(mass.shape),(2,4));self.assertEqual(len(probe.layer_mass),2)
+            self.assertEqual(mass[:,3].sum(),0.)
+            self.assertTrue(bool((key>=0).all()));self.assertTrue(bool((mass.sum(-1)<=1.00001).all()))
+        torch.testing.assert_close(actual,expected,rtol=0,atol=0)
+        tokenizer=SimpleNamespace(eos_token_id=30,all_special_ids=[30,31])
+        baseline,_,_=decode(self.llm,self.prepared,4,2,4)
+        with AttentionPriority(self.llm,self.prepared,tokenizer,alpha=0,start=0) as control:
+            identity,_,_=decode(self.llm,self.prepared,4,2,4,priority=control)
+        self.assertTrue(torch.equal(identity,baseline))
+        self.assertEqual(len(control.records),4)
+        self.assertTrue(all(all(v==0 for v in r['priority_bonus']) for r in control.records))
+        # A priority can change which position commits without changing the argmax token.
+        logits=torch.tensor([[[0.,2.,0.],[0.,1.9,0.],[0.,1.,0.],[0.,1.,0.]]])
+        plain=x.clone();boosted=x.clone()
+        _,p=commit(plain,logits,self.prepared,0,2,1)
+        _,q=commit(boosted,logits,self.prepared,0,2,1,torch.tensor([[0.,.2,0.,0.]]))
+        self.assertEqual(p,[0]);self.assertEqual(q,[1]);self.assertEqual(int(boosted[0,4]),1)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_sensitivity_checkpoints_measurements_and_priority_report(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.removal_sensitivity import collect_sensitivity,prediction_change,checkpoint_states
+        from experiments.audio_drift.attention_priority import run_priority_study
+        from experiments.audio_drift.attention_study_report import analyze
+        from experiments.audio_drift.run import parser,write_json
+        self.prepared=Prepared(self.prepared.prompt,torch.randn(1,4,16).to(torch.bfloat16),1,2,31)
+        self.llm.float()
+        final,states,events=decode(self.llm,self.prepared,4,2,4)
+        args=parser().parse_args(['--manifest','unused','--out','unused','--no-drift',
+            '--length','4','--block-length','2','--steps','4','--sensitivity-layer','1',
+            '--sensitivity-budgets','1','2','--priority-strengths','.02','--priority-start','0'])
+        tokenizer=SimpleNamespace(eos_token_id=30,all_special_ids=[30,31],decode=lambda ids,**kw:'#### 1')
+        points,reason=checkpoint_states(states,self.prepared,[7,8,9,10],[30,31],30,[.25,.5,.75])
+        self.assertEqual([p['step'] for p in points],[1,2,3]);self.assertIsNone(reason)
+        identical=prediction_change(torch.tensor([[1.,2.]]),torch.tensor([[1.,2.]]))
+        self.assertEqual(identical['kl_mean'],0.);self.assertEqual(identical['top1_change_rate'],0.)
+        with tempfile.TemporaryDirectory() as directory,patch.object(torch.cuda,'synchronize'):
+            root=Path(directory);work=root/'samples/00000';work.mkdir(parents=True)
+            summary=collect_sensitivity(self.llm,self.prepared,states,events,[7,8,9,10],tokenizer,args,work)
+            self.assertEqual(summary['measurements'],48)
+            rows=[json.loads(r) for r in (work/'removal_sensitivity.jsonl').read_text().splitlines()]
+            self.assertTrue(all(len(r['removed_positions'])==r['budget'] for r in rows))
+            for group in ('acoustic','semantic','prompt','prefix'):
+                same=[r for r in rows if r['group']==group and r['budget']==1 and r['selection']=='fixed_early']
+                self.assertTrue(all(r['removed_positions']==same[0]['removed_positions'] for r in same))
+            result=run_priority_study(self.llm,self.prepared,final,args,tokenizer,dict(metric='numeric',target='1'),work)
+            self.assertEqual(result['policies'],4)
+            write_json(work/'result.json',dict(id='tiny',score=dict(correct=True)))
+            # Plotting is not installed in the minimal CPU test environment.
+            (work/'removal_sensitivity.jsonl').rename(work/'sensitivity.saved')
+            sensitivity,priority=analyze(root)
+            self.assertEqual(len(priority),4)
+            self.assertTrue((root/'analysis/attention_priority_trajectories.csv').exists())
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_crossing_patience_progression_and_uncapped_budgets(self):

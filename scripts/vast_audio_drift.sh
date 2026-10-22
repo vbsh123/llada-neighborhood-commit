@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mode="${1:-smoke}"
 case "$mode" in
-  setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep|gsm-depth|gsm-night|gsm-diagnose|gsm-prune|gsm-cache|gsm-staged-prune|gsm-crossing-prune) ;;
-  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep|gsm-depth|gsm-night|gsm-diagnose|gsm-prune|gsm-cache|gsm-staged-prune|gsm-crossing-prune]'; exit 2 ;;
+  setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep|gsm-depth|gsm-night|gsm-diagnose|gsm-prune|gsm-cache|gsm-staged-prune|gsm-crossing-prune|gsm-sensitivity|gsm-attention-priority) ;;
+  *) echo 'Usage: bash scripts/vast_audio_drift.sh [setup|smoke|pilot|long-pilot|control-pilot|cosine-pilot|gsm-pilot|gsm-sweep|gsm-depth|gsm-night|gsm-diagnose|gsm-prune|gsm-cache|gsm-staged-prune|gsm-crossing-prune|gsm-sensitivity|gsm-attention-priority]'; exit 2 ;;
 esac
 audio_venv="${AUDIO_VENV:-$PWD/.venv-audio}"
 if [[ ! -x "$audio_venv/bin/python" ]]; then
@@ -35,7 +35,7 @@ PY
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 experiment_name="${RUN_NAME:-audio_drift_${mode}_$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ "$experiment_name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid RUN_NAME'; exit 2; }
-if [[ "$mode" == gsm-night || "$mode" == gsm-diagnose || "$mode" == gsm-prune || "$mode" == gsm-cache || "$mode" == gsm-staged-prune || "$mode" == gsm-crossing-prune ]]; then
+if [[ "$mode" == gsm-night || "$mode" == gsm-diagnose || "$mode" == gsm-prune || "$mode" == gsm-cache || "$mode" == gsm-staged-prune || "$mode" == gsm-crossing-prune || "$mode" == gsm-sensitivity || "$mode" == gsm-attention-priority ]]; then
   manifest="${MANIFEST:-$PWD/data/audio_drift/gsm8k_speech30_v10.jsonl}"
   base_manifest="${BASE_MANIFEST:-$PWD/data/audio_drift/gsm8k_speech10_v7.jsonl}"
   if [[ ! -f "$manifest" && -z "${MANIFEST:-}" ]]; then
@@ -48,6 +48,7 @@ if [[ "$mode" == gsm-night || "$mode" == gsm-diagnose || "$mode" == gsm-prune ||
   default_count=30
   if [[ "$mode" == gsm-diagnose ]]; then default_count=6; fi
   if [[ "$mode" == gsm-staged-prune || "$mode" == gsm-crossing-prune ]]; then default_count=2; fi
+  if [[ "$mode" == gsm-sensitivity || "$mode" == gsm-attention-priority ]]; then default_count=10; fi
   count="${SAMPLES:-$default_count}"
   if [[ ( "$mode" == gsm-staged-prune || "$mode" == gsm-crossing-prune ) && -z "${MANIFEST:-}" ]]; then
     source_manifest="$manifest"
@@ -95,7 +96,18 @@ else
   block="${BLOCK_LENGTH:-32}"
 fi
 extra=()
-if [[ "$mode" == gsm-cache || "$mode" == gsm-prune || "$mode" == gsm-staged-prune || "$mode" == gsm-crossing-prune ]]; then
+if [[ "$mode" == gsm-sensitivity ]]; then
+  read -r -a sensitivity_fractions <<< "${SENSITIVITY_FRACTIONS:-0.25 0.5 0.75}"
+  read -r -a sensitivity_budgets <<< "${SENSITIVITY_BUDGETS:-8 16 32}"
+  extra+=(--no-drift --sensitivity-samples "$count" --sensitivity-fractions "${sensitivity_fractions[@]}"
+          --sensitivity-budgets "${sensitivity_budgets[@]}" --sensitivity-layer "${SENSITIVITY_LAYER:-25}")
+elif [[ "$mode" == gsm-attention-priority ]]; then
+  read -r -a priority_strengths <<< "${PRIORITY_STRENGTHS:-0.02 0.05}"
+  read -r -a priority_sources <<< "${PRIORITY_TEXT_SOURCES:-revealed}"
+  extra+=(--no-drift --priority-samples "$count" --priority-strengths "${priority_strengths[@]}"
+          --priority-text-sources "${priority_sources[@]}" --priority-start "${PRIORITY_START:-40}"
+          --priority-smoothing "${PRIORITY_SMOOTHING:-0.2}")
+elif [[ "$mode" == gsm-cache || "$mode" == gsm-prune || "$mode" == gsm-staged-prune || "$mode" == gsm-crossing-prune ]]; then
   extra+=(--skip-dense-interventions --no-drift --shuffle-policy-order
           --benchmark-samples "$count" --benchmark-repeats "${BENCHMARK_REPEATS:-2}" --benchmark-stopping eos
           --replay-samples "${REPLAY_SAMPLES:-$count}" --replay-steps "${REPLAY_STEPS:-256}"
@@ -207,7 +219,7 @@ if [[ "$mode" == control-pilot ]]; then default_profiles=0; fi
 if [[ "$mode" == gsm-pilot ]]; then
   default_fractions=0; default_profiles=0; default_layers=all; default_steps=128
 fi
-if [[ "$mode" == gsm-sweep || "$mode" == gsm-depth || "$mode" == gsm-night || "$mode" == gsm-diagnose || "$mode" == gsm-prune || "$mode" == gsm-cache || "$mode" == gsm-staged-prune || "$mode" == gsm-crossing-prune ]]; then
+if [[ "$mode" == gsm-sweep || "$mode" == gsm-depth || "$mode" == gsm-night || "$mode" == gsm-diagnose || "$mode" == gsm-prune || "$mode" == gsm-cache || "$mode" == gsm-staged-prune || "$mode" == gsm-crossing-prune || "$mode" == gsm-sensitivity || "$mode" == gsm-attention-priority ]]; then
   default_fractions=0; default_profiles=0; default_layers=all
   default_steps=$((length / 2))
 fi
@@ -234,13 +246,16 @@ if [[ "$mode" == gsm-diagnose ]]; then
   python -m experiments.audio_drift.diagnostic_report --run "runs/$experiment_name"
   python -m experiments.audio_drift.attention_recurrence --run "runs/$experiment_name"
 fi
-if [[ "$mode" != gsm-night && "$mode" != gsm-diagnose && "$mode" != gsm-prune && "$mode" != gsm-cache && "$mode" != gsm-staged-prune && "$mode" != gsm-crossing-prune ]]; then
+if [[ "$mode" != gsm-night && "$mode" != gsm-diagnose && "$mode" != gsm-prune && "$mode" != gsm-cache && "$mode" != gsm-staged-prune && "$mode" != gsm-crossing-prune && "$mode" != gsm-sensitivity && "$mode" != gsm-attention-priority ]]; then
 python -m experiments.audio_drift.analyze --run "runs/$experiment_name"
 python -m experiments.audio_drift.stability --run "runs/$experiment_name" --statistic median
 python -m experiments.audio_drift.stability --run "runs/$experiment_name" --statistic p90
 fi
 if [[ "$mode" == cosine-pilot || "$mode" == gsm-pilot || "$mode" == gsm-sweep || "$mode" == gsm-depth ]]; then
   python -m experiments.audio_drift.paper_plots --run "runs/$experiment_name"
+fi
+if [[ "$mode" == gsm-sensitivity || "$mode" == gsm-attention-priority ]]; then
+  python -m experiments.audio_drift.attention_study_report --run "runs/$experiment_name"
 fi
 python -m pip freeze > "runs/$experiment_name/packages.txt"
 nvidia-smi > "runs/$experiment_name/nvidia-smi.txt"

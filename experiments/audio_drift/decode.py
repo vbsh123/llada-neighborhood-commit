@@ -76,7 +76,7 @@ def forward_logits(llm, prepared, x):
     return llm(inputs_embeds=embeddings, use_cache=False).logits[:, prepared.answer_start:].clone()
 
 
-def commit(x, logits, prepared, block, block_length, count):
+def commit(x, logits, prepared, block, block_length, count, priority_bonus=None):
     answer = x[:, prepared.prompt.shape[1]:]
     eligible = answer == prepared.mask_id
     # Matches upstream: earlier unresolved slots remain eligible; future blocks do not.
@@ -86,6 +86,10 @@ def commit(x, logits, prepared, block, block_length, count):
     predictions = logits.argmax(-1)
     # Match upstream's float64 confidence, calculated only on answer rows.
     confidence = F.softmax(logits.double(), dim=-1).gather(-1, predictions.unsqueeze(-1)).squeeze(-1)
+    if priority_bonus is not None:
+        if priority_bonus.shape != confidence.shape or not torch.isfinite(priority_bonus).all():
+            raise ValueError('Invalid commitment priority bonus')
+        confidence = confidence + priority_bonus.to(confidence)
     confidence = torch.where(eligible, confidence, -torch.inf)
     positions = torch.topk(confidence[0], k=count).indices
     before = answer.clone()
@@ -96,7 +100,7 @@ def commit(x, logits, prepared, block, block_length, count):
 @torch.no_grad()
 def decode(llm, prepared, length, block_length, steps, recorder=None, layers=None,
            start_x=None, start_step=0, first_logits=None, save_states=True,
-           progress_every=0, eos_id=None):
+           progress_every=0, eos_id=None, priority=None, progress_label='baseline'):
     plan = schedule(length, block_length, steps)
     if start_x is None:
         x = prepared.prompt.new_full((1, prepared.prompt.shape[1] + length), prepared.mask_id)
@@ -123,10 +127,14 @@ def decode(llm, prepared, length, block_length, steps, recorder=None, layers=Non
             states.append(x.detach().cpu().clone())
         if recorder is not None:
             recorder.begin(meta, prepared.ids_with_audio(x))
+        if priority is not None:
+            if first_logits is not None:raise ValueError('Priority scoring requires its own observed forward')
+            priority.begin(x,step,block,block_length)
         logits = first_logits if step == start_step and first_logits is not None else forward_logits(llm, prepared, x)
         if recorder is not None:
             recorder.end(layers)
-        last_changes, positions = commit(x, logits, prepared, block, block_length, count)
+        bonus = priority.bonus(logits) if priority is not None else None
+        last_changes, positions = commit(x, logits, prepared, block, block_length, count,bonus)
         del logits
         events.append({**meta, "changed_tokens": last_changes, "committed_positions": positions})
         if eos_id is not None:
@@ -137,7 +145,7 @@ def decode(llm, prepared, length, block_length, steps, recorder=None, layers=Non
                     stopped_at_eos = True
                     break
         if progress_every and (step == start_step or (step + 1) % progress_every == 0 or step + 1 == len(plan)):
-            print(f"  baseline forward {step + 1}/{len(plan)}; block {block + 1}; "
+            print(f"  {progress_label} forward {step + 1}/{len(plan)}; block {block + 1}; "
                   f"{remaining - last_changes} answer masks remain", flush=True)
     if not stopped_at_eos and (x[:, prepared.prompt.shape[1]:] == prepared.mask_id).any():
         raise ValueError("Decoder finished with unresolved masks (upstream permits predicting MASK)")

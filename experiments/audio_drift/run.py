@@ -260,6 +260,15 @@ def parser():
     p.add_argument('--crossing-start', type=int, default=8)
     p.add_argument('--crossing-interval', type=int, default=8)
     p.add_argument('--crossing-patience', type=int, default=2)
+    p.add_argument('--sensitivity-samples', type=int, default=0)
+    p.add_argument('--sensitivity-fractions', type=float, nargs='+', default=[.25,.5,.75])
+    p.add_argument('--sensitivity-budgets', type=int, nargs='+', default=[8,16,32])
+    p.add_argument('--sensitivity-layer', type=int, default=25)
+    p.add_argument('--priority-samples', type=int, default=0)
+    p.add_argument('--priority-strengths', type=float, nargs='+', default=[.02,.05])
+    p.add_argument('--priority-text-sources', nargs='+', choices=['revealed','prompt'], default=['revealed'])
+    p.add_argument('--priority-start', type=int, default=40)
+    p.add_argument('--priority-smoothing', type=float, default=.2)
     p.add_argument('--staged-fractions', type=float, nargs='+', default=[.5,.75])
     p.add_argument('--acoustic-start', type=int, default=16)
     p.add_argument('--later-start', type=int, default=32)
@@ -326,6 +335,26 @@ def main():
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
+    if (min(args.sensitivity_samples,args.priority_samples)<0 or
+            (args.samples is not None and max(args.sensitivity_samples,args.priority_samples)>args.samples)):
+        raise ValueError('Attention study sample counts must fit requested samples')
+    if (args.sensitivity_samples or args.priority_samples) and (specifications or not args.no_drift or args.benchmark_samples
+            or args.replay_samples or args.diagnostic_samples or args.profile_samples or args.pruning_profile_samples or args.refresh_profile_samples):
+        raise ValueError('Run sensitivity/priority as dedicated no-drift experiments without cache benchmarks/profiling')
+    if args.priority_samples:
+        import math
+        if (not args.priority_strengths or len(set(args.priority_strengths))!=len(args.priority_strengths)
+                or any(not math.isfinite(a) or not 0<a<=.2 for a in args.priority_strengths)
+                or len(set(args.priority_text_sources))!=len(args.priority_text_sources)
+                or args.priority_start<0 or not 0<args.priority_smoothing<=1):
+            raise ValueError('Invalid attention priority strengths/sources/ramp')
+    if args.sensitivity_samples:
+        import math
+        if (not args.sensitivity_fractions or args.sensitivity_fractions!=sorted(set(args.sensitivity_fractions))
+                or any(not math.isfinite(f) or not 0<f<1 for f in args.sensitivity_fractions)
+                or not args.sensitivity_budgets or min(args.sensitivity_budgets)<1
+                or len(set(args.sensitivity_budgets))!=len(args.sensitivity_budgets) or args.sensitivity_layer<0):
+            raise ValueError('Invalid removal sensitivity fractions/budgets/layer')
     if args.crossing_prune and (args.staged_prune or args.late_prune or not args.skip_dense_interventions
             or args.depth_multipliers or not args.no_drift or args.diagnostic_samples or args.pruning_profile_samples):
         raise ValueError('Crossing pruning requires its own compact-only, no-drift experiment; operator tracing is separate')
@@ -510,6 +539,15 @@ def main():
                   "instrumented_seconds": elapsed, "peak_allocated_bytes": peak_memory,
                   "interventions": []}
         write_json(work / "baseline.json", result)
+        if index < max(args.sensitivity_samples,args.priority_samples):
+            import numpy as np
+            np.savez_compressed(work/'baseline_token_states.npz',states=torch.stack(states).numpy())
+        if index < args.sensitivity_samples:
+            from .removal_sensitivity import collect_sensitivity
+            result['removal_sensitivity']=collect_sensitivity(llm,prepared,states,events,answer_ids,tokenizer,args,work)
+        if index < args.priority_samples:
+            from .attention_priority import run_priority_study
+            result['attention_priority']=run_priority_study(llm,prepared,final,args,tokenizer,row,work)
         if index < args.profile_samples:
             from .profile import profile_baseline
             profile_baseline(model, tokenizer, extractor, audio, row["prompt"], prepared,
