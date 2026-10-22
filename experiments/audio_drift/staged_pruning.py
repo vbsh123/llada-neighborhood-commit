@@ -59,6 +59,20 @@ class CompactStagedPruning(AbstractContextManager):
     def scope(self, name):
         return torch.profiler.record_function(name) if self.profile_scopes else nullcontext()
 
+    def pending_stages(self, layer):
+        return [i for i,s in enumerate(self.stages) if i not in self.selected and
+                s['layer'] == layer and self.step >= s['start']]
+
+    def should_score(self, layer, pending):
+        return bool(pending)
+
+    def choose_pending(self, scores, positions, pending):
+        return pending
+
+    def drop_budget(self, stage):
+        n = len(self.prepared.group_positions(stage['group']))
+        return stage.get('drop_count', int(n*stage['fraction'])-int(n*stage.get('previous_fraction',0)))
+
     def known_removals(self, layer):
         return tuple(sorted({p for i, positions in self.selected.items()
                              if self.stages[i]['layer'] <= layer for p in positions}))
@@ -109,11 +123,11 @@ class CompactStagedPruning(AbstractContextManager):
                         keep = self.keep_rows(positions, self.known_removals(_layer))
                         if keep is not None:
                             x,positions = x.index_select(1,keep),positions.index_select(0,keep)
-                    pending = [i for i,s in enumerate(self.stages) if i not in self.selected and
-                               s['layer'] == _layer and self.step >= s['start']]
+                    pending = self.pending_stages(_layer)
+                    score_needed = self.should_score(_layer, pending)
                     event = self.events[-1]
                     qkv_rows = x.shape[1]
-                    if not pending and x.shape[1] == self.length:
+                    if not score_needed and x.shape[1] == self.length:
                         # Truly unchanged upstream execution; no clones/banks.
                         output = _original(x)
                         event['layer_qkv_rows'].append(qkv_rows)
@@ -137,17 +151,18 @@ class CompactStagedPruning(AbstractContextManager):
                         qr=rotary.apply_rotary_pos_emb(sin,cos,qr)
                         kr=rotary.apply_rotary_pos_emb(sin,cos,kr)
                     q,k=qr.type_as(q),kr.type_as(k)
-                    if pending:
+                    if score_needed:
                         with self.scope('prune.selection'):
                             local=torch.searchsorted(positions,self.probes)
                             probability=(q[:,:,local,:].float()@k.float().transpose(-1,-2)/math.sqrt(q.shape[-1])).softmax(-1)
                             scores=probability.mean((0,1,2))
+                            pending=self.choose_pending(scores,positions,pending)
                             available=set(self.position_ids)
                             removed_now=set()
                             for i in pending:
                                 stage=self.stages[i]
                                 original_group=self.prepared.group_positions(stage['group'])
-                                budget=int(len(original_group)*stage['fraction'])
+                                budget=self.drop_budget(stage)
                                 pool=sorted(available.intersection(range(self.prepared.answer_start) if self.spec['generic'] else original_group)-removed_now)
                                 if budget>len(pool):
                                     raise ValueError('Requested stage budget exceeds its available pool')

@@ -63,6 +63,8 @@ def benchmark_replay(llm, prepared, states, baseline_forwards, args, work, sampl
     path = work / 'fixed_input_replay.json'
     write_json(path, report)
     for spec in specs:
+        from .crossing_pruning import resolve_control
+        spec = resolve_control(spec, report['policies'])
         warm, _, _, _ = measure(spec)
         identity = is_identity(spec)
         identity_match = torch.equal(warm.argmax(-1), expected_last) if identity else None
@@ -76,6 +78,8 @@ def benchmark_replay(llm, prepared, states, baseline_forwards, args, work, sampl
             if counts['forwards'] != count:
                 raise RuntimeError("Replay cache forward count differs from baseline")
             durations.append(seconds); peaks.append(peak); accounting.append(counts)
+        if spec.get('pruning') and any(a['pruning'] != accounting[0]['pruning'] for a in accounting):
+            raise RuntimeError('Replay repeats changed pruning selection or trigger checks')
         result = {**spec, 'seconds': durations, 'median_seconds': statistics.median(durations),
                   'peak_allocated_bytes': max(peaks), 'accounting': accounting,
                   'identity_last_step_top1_match': identity_match}

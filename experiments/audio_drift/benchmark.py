@@ -41,7 +41,8 @@ def policy_specs(args, sample_id=None):
         rest = [s for s in specs if not is_identity(s)]
         random.Random(seed).shuffle(rest)
         specs = identities + rest
-    return specs
+    from .crossing_pruning import dependency_order
+    return dependency_order(specs)
 
 
 @torch.no_grad()
@@ -95,6 +96,8 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
               "slower. The skipped-token-update fraction is not a wall-time prediction."}
     write_json(work / "cache_benchmark.json", report)
     for spec in specs:
+        from .crossing_pruning import resolve_control
+        spec = resolve_control(spec, report['policies'])
         warm, _, _, _ = measure(spec)
         del warm
         durations, outputs, accounting, peaks = [], [], [], []

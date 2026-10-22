@@ -55,6 +55,10 @@ def intervention_specs(args):
         from .staged_pruning import staged_conditions
         specs += staged_conditions(args.staged_fractions,args.acoustic_start,args.later_start,args.deep_layer,
                                    args.prune_queries,args.seed)
+    if getattr(args, 'crossing_prune', False):
+        from .crossing_pruning import crossing_conditions
+        specs += crossing_conditions(args.crossing_fractions,args.crossing_layer,args.crossing_start,
+                                     args.crossing_interval,args.crossing_patience,args.prune_queries,args.seed)
     factors = getattr(args, 'depth_multipliers', [])
     return with_depth_variants(specs, factors) if factors else specs
 
@@ -250,6 +254,12 @@ def parser():
     p.add_argument("--triple-refresh", nargs="*", default=[], metavar="ACOUSTIC:PROMPT:SEMANTIC",
                    help="Independent fixed-prefix schedules for all three groups")
     p.add_argument('--staged-prune', action='store_true', help='Compact group/layer/time-specific pruning and matched generic controls')
+    p.add_argument('--crossing-prune', action='store_true', help='Online audio/prompt attention crossing and event-matched full-prefix control')
+    p.add_argument('--crossing-fractions', type=float, nargs='+', default=[.25,.5,.75])
+    p.add_argument('--crossing-layer', type=int, default=25)
+    p.add_argument('--crossing-start', type=int, default=8)
+    p.add_argument('--crossing-interval', type=int, default=8)
+    p.add_argument('--crossing-patience', type=int, default=2)
     p.add_argument('--staged-fractions', type=float, nargs='+', default=[.5,.75])
     p.add_argument('--acoustic-start', type=int, default=16)
     p.add_argument('--later-start', type=int, default=32)
@@ -316,6 +326,9 @@ def main():
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
+    if args.crossing_prune and (args.staged_prune or args.late_prune or not args.skip_dense_interventions
+            or args.depth_multipliers or not args.no_drift or args.diagnostic_samples or args.pruning_profile_samples):
+        raise ValueError('Crossing pruning requires its own compact-only, no-drift experiment; operator tracing is separate')
     if args.staged_prune and (args.late_prune or not args.skip_dense_interventions or args.depth_multipliers or not args.no_drift or args.diagnostic_samples):
         raise ValueError('Staged pruning requires its own compact-only experiment without cache/depth variants')
     if args.pruning_profile_samples < 0 or args.pruning_profile_samples > args.replay_samples:

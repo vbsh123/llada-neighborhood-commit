@@ -23,6 +23,18 @@ if HAS_TORCH:
 
 class InputTests(unittest.TestCase):
     @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_crossing_configuration_and_source_order(self):
+        from experiments.audio_drift.crossing_pruning import crossing_conditions,dependency_order,resolve_control
+        a,b=crossing_conditions()
+        self.assertEqual(dependency_order([b,a]),[a,b])
+        with self.assertRaises(ValueError):dependency_order([b])
+        for kw in [dict(fractions=[.5,.25]),dict(fractions=[float('nan')]),dict(interval=0),dict(patience=0)]:
+            with self.assertRaises(ValueError):crossing_conditions(**kw)
+        empty=resolve_control(b,[dict(condition=a['condition'],accounting=[dict(pruning=dict(selections=[],trigger_checks=[]))])])
+        self.assertEqual(empty['pruning']['monitor_steps'],[])
+        self.assertGreater(empty['pruning']['stages'][0]['start'],10**6)
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
     def test_delayed_pruning_matrix_pairs_every_strategy_across_scopes(self):
         from experiments.audio_drift.pruning import pruning_conditions
         from experiments.audio_drift.protocol import is_identity
@@ -678,6 +690,102 @@ class UpstreamTests(unittest.TestCase):
         self.llm.model.transformer.ff_out = output
         self.prepared = Prepared(torch.tensor([[1, 2, 3]]),
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_crossing_patience_progression_and_uncapped_budgets(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.crossing_pruning import CrossingPruning,crossing_conditions
+        groups=dict(acoustic=list(range(100)),semantic=list(range(100,300)),prompt=list(range(300,380)))
+        prepared=SimpleNamespace(group_positions=lambda g:groups[g])
+        engine=CrossingPruning.__new__(CrossingPruning)
+        engine.prepared=prepared;engine.spec=crossing_conditions(patience=2)[0]['pruning']
+        engine.stages=engine.spec['stages'];engine.selected={};engine.position_ids=tuple(range(400));engine.checks=[]
+        engine.streaks=dict(acoustic=0,semantic=0);positions=torch.arange(400)
+        scores=torch.zeros(400);scores[:100]=.0001;scores[100:300]=.0005;scores[300:380]=.01
+        for step,expected in [(8,[]),(16,[0,3]),(24,[]),(32,[1,4]),(40,[]),(48,[2,5])]:
+            engine.step=step
+            pending=engine.pending_stages(25)
+            self.assertTrue(engine.should_score(25,pending))
+            chosen=engine.choose_pending(scores,positions,pending)
+            self.assertEqual(chosen,expected)
+            for i in chosen:engine.selected[i]=()
+        self.assertEqual(sum(engine.drop_budget(s) for s in engine.stages if s['group']=='semantic'),150)
+        self.assertEqual(engine.drop_budget(dict(group='semantic',fraction=.75)),150)
+        self.assertFalse(engine.should_score(25,[]))
+        # A single failed crossing resets patience; groups trigger independently.
+        engine.selected={};engine.streaks=dict(acoustic=0,semantic=0)
+        engine.step=8;engine.choose_pending(scores,positions,engine.pending_stages(25))
+        scores[:100]=.1;engine.step=16
+        self.assertEqual(engine.choose_pending(scores,positions,engine.pending_stages(25)),[3])
+        self.assertEqual(engine.streaks['acoustic'],0)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_crossing_real_compaction_pair_replay_and_dense_reference(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.crossing_pruning import CrossingPruning,crossing_conditions,resolve_control
+        from experiments.audio_drift.compact import policy_context
+        from experiments.audio_drift.decode import forward_logits
+        from experiments.audio_drift.hooks import blocks_of
+        from experiments.audio_drift.run import parser
+        from experiments.audio_drift.benchmark import benchmark
+        from experiments.audio_drift.replay import benchmark_replay
+        self.prepared=Prepared(self.prepared.prompt,torch.randn(1,4,16).to(torch.bfloat16),1,2,31)
+        self.llm.float()
+        inputs=[torch.tensor([[1,2,3,31,31,31,31]]) for _ in range(4)]
+        a,b=crossing_conditions([.5,1.],layer=1,start=1,interval=1,patience=1,queries=3)
+        original_choose=CrossingPruning.choose_pending
+        def guaranteed_crossing(engine,scores,positions,pending):
+            forced=torch.zeros_like(scores)
+            prompt=torch.tensor(engine.prepared.group_positions('prompt'))
+            local=torch.searchsorted(positions,prompt)
+            # Prompt positions survive in the audio source; generic is scheduled.
+            if not engine.spec.get('resolved_control'):forced[local]=1.
+            return original_choose(engine,scores if engine.spec.get('resolved_control') else forced,positions,pending)
+        completed=[]
+        with patch.object(CrossingPruning,'choose_pending',guaranteed_crossing):
+            for spec in [a,b]:
+                spec=resolve_control(spec,completed)
+                with policy_context(self.llm,self.prepared,spec) as engine:
+                    actual=[forward_logits(self.llm,self.prepared,x) for x in inputs]
+                    counts=engine.accounting();picks=engine.records
+                self.assertEqual(sum(p['drop_budget'] for p in picks),4)
+                self.assertEqual([p['step'] for p in picks],[1,1,2,2])
+                completed.append(dict(condition=spec['condition'],accounting=[counts]))
+                # Dense model with identical removed KV columns is the numerical reference.
+                original_methods=[];current=[0]
+                try:
+                    for layer,block in enumerate(blocks_of(self.llm)):
+                        method=block._scaled_dot_product_attention
+                        existed='_scaled_dot_product_attention' in block.__dict__
+                        original_methods.append((block,method,existed))
+                        def dense(q,k,v,_layer=layer,_method=method,**kwargs):
+                            removed={p for r in picks if r['step']<=current[0] and r['layer']<=_layer for p in r['dropped_positions']}
+                            keep=torch.tensor([i for i in range(11) if i not in removed])
+                            return _method(q,k.index_select(-2,keep),v.index_select(-2,keep),**kwargs)
+                        block._scaled_dot_product_attention=dense
+                    for step,x in enumerate(inputs):
+                        current[0]=step
+                        torch.testing.assert_close(actual[step],forward_logits(self.llm,self.prepared,x),rtol=2e-5,atol=2e-5)
+                finally:
+                    for block,method,existed in original_methods:
+                        if existed:block._scaled_dot_product_attention=method
+                        else:delattr(block,'_scaled_dot_product_attention')
+            self.assertEqual(completed[0]['accounting'][0]['computed_rows_by_layer'],completed[1]['accounting'][0]['computed_rows_by_layer'])
+            args=parser().parse_args(['--manifest','unused','--out','unused','--interventions','--crossing-prune',
+                '--crossing-fractions','.5','1','--crossing-layer','1','--crossing-start','1',
+                '--crossing-interval','1','--crossing-patience','1','--prune-queries','3',
+                '--skip-dense-interventions','--no-drift','--length','4','--block-length','2','--steps','4',
+                '--benchmark-repeats','2','--replay-repeats','2','--shuffle-policy-order'])
+            final,states,_=decode(self.llm,self.prepared,4,2,4)
+            tokenizer=SimpleNamespace(eos_token_id=30,decode=lambda ids,**kw:'#### 1')
+            with tempfile.TemporaryDirectory() as directory,patch.object(torch.cuda,'synchronize'), \
+                    patch.object(torch.cuda,'reset_peak_memory_stats'),patch.object(torch.cuda,'max_memory_allocated',return_value=0):
+                work=Path(directory)
+                bench=benchmark(self.llm,self.prepared,final,args,tokenizer,dict(id='crossing',metric='numeric',target='1'),work)
+                replay=benchmark_replay(self.llm,self.prepared,states,bench['baseline_forwards'],args,work,sample_id='crossing')
+                self.assertEqual(len(replay['policies']),2)
+                self.assertTrue(bench['policies'][1]['pruning']['resolved_control'])
+                self.assertEqual(len(bench['policies'][0]['accounting'][0]['pruning']['trigger_checks']),2)
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_compact_stages_match_dense_removal_without_banks(self):
