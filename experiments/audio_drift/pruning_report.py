@@ -2,6 +2,7 @@
 import argparse
 from collections import defaultdict
 from pathlib import Path
+import json
 
 from .diagnostic_report import Archive, write_csv
 
@@ -31,18 +32,20 @@ def analyze(run, out=None):
                 picks = account['pruning']['selections']
                 pick = picks[0] if picks else {}
                 same = replays.get(policy['condition'], {})
+                grouped_counts = {g: sum(p.get('dropped_by_group',{}).get(g,0) for p in picks) for g in ('acoustic','semantic','prompt')}
                 rows.append(dict(id=r['id'], condition=policy['condition'], scope=spec['scope'],
                     selection=spec['selection'], start=spec['start'], layer_start=spec['layer_start'],
                     cache_interval=policy['schedule'][0]['refresh_every'],
-                    requested_audio_fraction=spec['fraction'], baseline_correct=r['score'].get('correct'),
+                    requested_fraction=spec['fraction'], budget_basis='stage_fraction_with_matched_generic' if spec.get('engine')=='compact_staged' else pick.get('budget_basis','legacy_matched_count'), baseline_correct=r['score'].get('correct'),
                     policy_correct=policy['score'].get('correct'), parse_failed=policy['score'].get('parse_failed'),
                     baseline_forwards=bench['baseline_forwards'], policy_forwards=account['forwards'],
                     activated=bool(picks), activated_layers=account['pruning']['activated_layers'],
                     active_pruning_forwards=max(0,account['forwards']-spec['start']) if picks else 0,
-                    removed_tokens=pick.get('drop_budget',0), removed_acoustic=pick.get('dropped_by_group',{}).get('acoustic',0),
-                    removed_semantic=pick.get('dropped_by_group',{}).get('semantic',0),
-                    removed_prompt=pick.get('dropped_by_group',{}).get('prompt',0),
-                    actual_scope_fraction=pick.get('actual_scope_fraction'), removed_attention_mass=pick.get('removed_attention_mass'),
+                    removed_tokens=sum(p['drop_budget'] for p in picks), removed_acoustic=grouped_counts['acoustic'],
+                    removed_semantic=grouped_counts['semantic'], removed_prompt=grouped_counts['prompt'],
+                    activated_stages=len(picks), expected_stages=len(spec.get('stages',[spec])),
+                    stage_details=json.dumps(picks),
+                    actual_scope_fraction=pick.get('actual_scope_fraction'), removed_attention_mass=pick.get('removed_attention_mass') if len(picks)==1 else None,
                     anchor_revealed_fraction=pick.get('anchor_progress',{}).get('revealed_fraction'),
                     anchor_remaining_masks=pick.get('anchor_progress',{}).get('remaining_masks'),
                     baseline_decode_seconds=bench['baseline_median_seconds'], policy_decode_seconds=policy['median_seconds'],
@@ -56,8 +59,8 @@ def analyze(run, out=None):
         for row in rows:grouped[row['condition']].append(row)
         lines=['# Delayed pruning pilot', '',
             'All primary quality results retain baseline failures and examples ending before the pruning anchor. '
-            'Activated subsets are diagnostics, not replacement headline scores. Count-matched scope controls '
-            'remove different fractions of each group. Timings include one-shot selection and key/value gathering. '
+            'Activated subsets are diagnostics, not replacement headline scores. Staged generic controls match each stage count; '
+            'single-pool variants use their recorded budget basis. Timings include one-shot selection and key/value gathering. '
             'Equal-input replay is separate from autonomous decoding; its selections can differ from autonomous selections.', '',
             '| Policy | N | Activated | Baseline correct | Policy correct | Correct → wrong | Wrong → correct | Decode speedup | Replay speedup |',
             '|---|---:|---:|---:|---:|---:|---:|---:|---:|']

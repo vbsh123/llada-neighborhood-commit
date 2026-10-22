@@ -15,7 +15,7 @@ SCOPES = ("acoustic", "semantic", "audio", "prompt", "prefix")
 def pruning_conditions(starts=(1, 16, 32), fractions=(.25,), layer_start=24, queries=16, seed=1729):
     if (not starts or len(set(starts)) != len(starts) or any(s < 1 for s in starts)
             or not fractions or len(set(fractions)) != len(fractions)
-            or any(not math.isfinite(f) or not 0 < f < 1 for f in fractions)
+            or any(not math.isfinite(f) or not 0 < f <= 1 for f in fractions)
             or layer_start < 0 or queries < 1):
         raise ValueError('Invalid delayed pruning settings')
     specs = []
@@ -63,10 +63,9 @@ class LatePruning:
             pools = dict(audio=audio, acoustic=acoustic, semantic=semantic, prompt=prompt,
                          prefix=list(range(self.prepared.answer_start)))
             pool = pools[p['scope']]
-            # One count across all five scopes, constrained by the smallest
-            # atomic group. Never silently compare different removal budgets.
-            count = max(0, min(len(acoustic) - 1, len(semantic) - 1, len(prompt) - 1,
-                               int(len(audio) * p['fraction'])))
+            # Independent fraction of the selected pool; no cross-group cap.
+            # Staged experiments provide separate count-matched generic controls.
+            count = int(len(pool) * p['fraction'])
             positions = torch.tensor(pool, dtype=torch.long, device=k.device)
             # Same fixed absolute answer-canvas query positions in every layer;
             # no baseline trajectory, EOS, or final answer span is consulted.
@@ -95,7 +94,7 @@ class LatePruning:
             self.records.append(dict(layer=layer, applies_to_layers=list(range(layer, self.layers)), step=step, dropped_positions=list(self.dropped[layer]),
                 dropped_by_group={g: len(removed.intersection(self.prepared.group_positions(g)))
                                   for g in ('acoustic', 'semantic', 'prompt')},
-                candidate_count=len(pool), requested_audio_fraction=p['fraction'], drop_budget=count,
+                candidate_count=len(pool), requested_audio_fraction=p['fraction'], budget_basis='scope_fraction', drop_budget=count,
                 actual_audio_budget_fraction=count / max(1, len(audio)), actual_scope_fraction=count / max(1, len(pool)), probe_positions=offsets.cpu().tolist(),
                 removed_attention_mass=float(mean.index_select(0, drop).sum())))
         return self.kept[layer]

@@ -7,7 +7,7 @@ import time
 
 import torch
 
-from .compact import PrefixCache
+from .compact import policy_context
 from .decode import decode
 from .inputs import score
 from .protocol import is_identity
@@ -54,7 +54,7 @@ def benchmark(llm, prepared, official_baseline, args, tokenizer, row, work, diag
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         start = time.perf_counter()
-        context = PrefixCache(llm, prepared, spec["schedule"], pruning=spec.get("pruning")) if spec else nullcontext()
+        context = policy_context(llm, prepared, spec) if spec else nullcontext()
         with context as cache:
             final, _, events = decode(llm, prepared, args.length, args.block_length, args.steps,
                                      save_states=False, eos_id=eos)

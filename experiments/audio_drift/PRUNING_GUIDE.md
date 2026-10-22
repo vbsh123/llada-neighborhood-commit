@@ -32,12 +32,13 @@ Twenty policies; no cache reuse for surviving positions:
 | Lowest mean attention | 32 | Same five pools |
 | Random, matched budget | 32 | Same five pools |
 
-Across the five pools, timing/layers and absolute removal counts match. Count
-is floor(0.25 * audio positions), capped to leave at least one position in each
-of the acoustic, semantic and text groups. With 64 acoustic positions the common
-budget can therefore be at most 63. This matches counts, not fractions: the short text
-prompt may lose a large fraction of its positions, including structural tokens.
-Actual counts, fractions and acoustic/semantic/prompt composition are recorded.
+Current single-pool `gsm-prune` uses a fraction of the SELECTED pool, up to
+100%, with no shared cross-group cap. Its random control uses the same fraction
+within the same pool. Counts therefore differ between pools of different sizes.
+The archived v16 results used a count-matched63-position cap; those historical
+outputs remain unchanged. For independent group budgets with count-matched
+generic controls and efficient execution, use the new staged pilot described in
+[STAGED_PRUNING_GUIDE.md](STAGED_PRUNING_GUIDE.md).
 
 Anchors use only observed forward number. With 512 answer slots and two commits
 per forward, the defaults correspond to 2/32/64 revealed slots

@@ -122,3 +122,6 @@ scores, repeated timings and memory/accounting remain available for inspection.
 Delayed KV-column pruning and the 32/50 refresh experiment are described in
 [PRUNING_GUIDE.md](PRUNING_GUIDE.md). Existing cache-only behavior is unchanged
 when no pruning specification is supplied.
+
+The uncapped staged pruning pilot and compact execution path are documented in
+[STAGED_PRUNING_GUIDE.md](STAGED_PRUNING_GUIDE.md).

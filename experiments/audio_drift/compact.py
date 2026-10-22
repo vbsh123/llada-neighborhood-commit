@@ -164,3 +164,13 @@ class PrefixCache(AbstractContextManager):
                 "note": "Counts skipped QKV, attention query/output and MLP rows; not total FLOPs or measured speedup. "
                         "All answer rows remain; KV column counts reflect optional pruning. Embedding, final norm and vocabulary "
                         "head still process the full sequence, equally in baseline and cached runs."}
+
+
+def policy_context(llm, prepared, specification):
+    plan = specification.get('pruning')
+    if plan and plan.get('engine') == 'compact_staged':
+        if any(s['refresh_every'] != 1 for s in specification['schedule']):
+            raise ValueError('Compact staged pruning must be evaluated without cache reuse')
+        from .staged_pruning import CompactStagedPruning
+        return CompactStagedPruning(llm, prepared, plan)
+    return PrefixCache(llm, prepared, specification['schedule'], pruning=plan)

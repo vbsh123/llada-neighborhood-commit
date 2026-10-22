@@ -51,6 +51,10 @@ def intervention_specs(args):
         from .pruning import pruning_conditions
         specs += pruning_conditions(args.prune_starts, args.prune_fractions, args.prune_layer_start,
                                     args.prune_queries, args.seed)
+    if getattr(args, 'staged_prune', False):
+        from .staged_pruning import staged_conditions
+        specs += staged_conditions(args.staged_fractions,args.acoustic_start,args.later_start,args.deep_layer,
+                                   args.prune_queries,args.seed)
     factors = getattr(args, 'depth_multipliers', [])
     return with_depth_variants(specs, factors) if factors else specs
 
@@ -245,6 +249,12 @@ def parser():
                    help="Independent intervals for the two groups, e.g. 8:2 2:8; 0 means no refresh")
     p.add_argument("--triple-refresh", nargs="*", default=[], metavar="ACOUSTIC:PROMPT:SEMANTIC",
                    help="Independent fixed-prefix schedules for all three groups")
+    p.add_argument('--staged-prune', action='store_true', help='Compact group/layer/time-specific pruning and matched generic controls')
+    p.add_argument('--staged-fractions', type=float, nargs='+', default=[.5,.75])
+    p.add_argument('--acoustic-start', type=int, default=16)
+    p.add_argument('--later-start', type=int, default=32)
+    p.add_argument('--deep-layer', type=int, default=16)
+    p.add_argument('--pruning-profile-samples', type=int, default=0)
     p.add_argument('--late-prune', action='store_true', help='Add delayed audio and matched-budget pruning controls')
     p.add_argument('--prune-starts', type=int, nargs='+', default=[1, 16, 32], help='Zero-based forward indices; no future-answer dependence')
     p.add_argument('--prune-fractions', type=float, nargs='+', default=[.25], help='Drop quota as a fraction of audio positions')
@@ -306,6 +316,10 @@ def main():
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
+    if args.staged_prune and (args.late_prune or not args.skip_dense_interventions or args.depth_multipliers or not args.no_drift or args.diagnostic_samples):
+        raise ValueError('Staged pruning requires its own compact-only experiment without cache/depth variants')
+    if args.pruning_profile_samples < 0 or args.pruning_profile_samples > args.replay_samples:
+        raise ValueError('Pruning profiles require corresponding replay examples')
     if args.late_prune and (not args.skip_dense_interventions or args.depth_multipliers):
         raise ValueError('Delayed pruning requires compact-only policies and no depth variants')
     if args.depth_multipliers and not args.skip_dense_interventions:
@@ -506,6 +520,9 @@ def main():
             from .attention_dynamics import collect_dynamics
             collect_dynamics(llm, prepared, states, events, answer_ids,
                              tokenizer.eos_token_id, args, work)
+        if index < args.pruning_profile_samples:
+            from .staged_profile import profile_staged
+            profile_staged(llm,prepared,states,result['benchmark']['baseline_forwards'],args,work,row['id'])
         if index < args.refresh_profile_samples:
             from .refresh_profile import profile_refresh
             profile_refresh(llm, prepared, states, result["benchmark"]["baseline_forwards"],

@@ -10,7 +10,7 @@ import time
 
 import torch
 
-from .compact import PrefixCache
+from .compact import policy_context
 from .decode import forward_logits
 from .protocol import is_identity
 
@@ -29,7 +29,7 @@ def benchmark_replay(llm, prepared, states, baseline_forwards, args, work, sampl
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         began = time.perf_counter()
-        context = PrefixCache(llm, prepared, spec['schedule'], pruning=spec.get('pruning')) if spec else nullcontext()
+        context = policy_context(llm, prepared, spec) if spec else nullcontext()
         with context as cache:
             last = None
             for x in inputs:
@@ -82,6 +82,14 @@ def benchmark_replay(llm, prepared, states, baseline_forwards, args, work, sampl
         report['policies'].append(result)
         write_json(path, report)
         print(f"    replay {spec['condition']}: {result['median_seconds']:.2f}s; {count} forwards", flush=True)
+    peers = {p['condition']: p for p in report['policies']}
+    for policy in report['policies']:
+        paired = peers.get(policy.get('paired_condition'))
+        if paired:
+            for a,b in zip(policy['accounting'],paired['accounting']):
+                if (a['computed_rows_by_layer'] != b['computed_rows_by_layer'] or
+                        a['qk_query_key_pairs_by_layer'] != b['qk_query_key_pairs_by_layer']):
+                    raise RuntimeError('Staged generic replay control has a different execution budget')
     after, after_seconds, _, _ = measure()
     if not torch.equal(after.argmax(-1), expected_last):
         raise RuntimeError("Replay post-policy baseline changed final-step predictions")

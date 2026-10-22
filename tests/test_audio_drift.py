@@ -37,8 +37,36 @@ class InputTests(unittest.TestCase):
             self.assertFalse(is_identity(spec))
             self.assertEqual(spec['schedule'][0]['refresh_every'], 1)
         self.assertTrue(all(g == {'acoustic', 'semantic', 'audio', 'prompt', 'prefix'} for g in groups.values()))
-        for kw in [dict(starts=[0]), dict(fractions=[1.]), dict(fractions=[float('nan')]), dict(layer_start=-1)]:
+        for kw in [dict(starts=[0]), dict(fractions=[1.1]), dict(fractions=[float('nan')]), dict(layer_start=-1)]:
             with self.assertRaises(ValueError): pruning_conditions(**kw)
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_staged_matrix_and_duration_pilot_selection(self):
+        from experiments.audio_drift.staged_pruning import staged_conditions
+        from experiments.audio_drift.select_pilot import select
+        specs=staged_conditions()
+        self.assertEqual(len(specs),12)
+        names={s['condition'] for s in specs}
+        self.assertTrue(all(s['paired_condition'] in names for s in specs))
+        self.assertTrue(all(s['schedule']==[{'group':'prefix','refresh_every':1}] for s in specs))
+        self.assertEqual({len(s['pruning']['stages']) for s in specs},{1,2,3})
+        self.assertEqual(select([{'id':1,'audio_seconds':10},{'id':2,'audio_seconds':20}],1,15)[0]['id'],2)
+        with self.assertRaises(ValueError):select([],2,15)
+        for kw in [dict(fractions=[1.1]),dict(deep_layer=0),dict(acoustic_start=0),dict(later_start=1)]:
+            with self.assertRaises(ValueError):staged_conditions(**kw)
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_single_pool_budget_has_no_shared_63_cap(self):
+        from experiments.audio_drift.pruning import LatePruning
+        prepared=Prepared(torch.ones((1,76),dtype=torch.long),torch.randn(1,274,4),0,64,31)
+        q,k=torch.randn(1,1,354,4),torch.randn(1,1,354,4)
+        for scope,fraction,count in [('semantic',.75,157),('prefix',.5,175),('acoustic',1.,64)]:
+            spec=dict(start=1,fraction=fraction,layer_start=0,queries=2,seed=1729,scope=scope,selection='attention')
+            engine=LatePruning(prepared,1,spec)
+            keep=engine.select(0,1,q,k,None)
+            self.assertEqual(len(keep),354-count)
+            self.assertEqual(engine.records[0]['drop_budget'],count)
+            self.assertEqual(engine.records[0]['budget_basis'],'scope_fraction')
 
     def test_refresh_math_includes_initialization_and_short_runs(self):
         from experiments.audio_drift.budget import refresh_count, row_budget
@@ -652,6 +680,90 @@ class UpstreamTests(unittest.TestCase):
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_compact_stages_match_dense_removal_without_banks(self):
+        from experiments.audio_drift.staged_pruning import staged_conditions, CompactStagedPruning
+        from experiments.audio_drift.decode import forward_logits
+        from experiments.audio_drift.hooks import blocks_of
+        self.prepared=Prepared(self.prepared.prompt,torch.randn(1,4,16).to(torch.bfloat16),1,2,31)
+        inputs=[torch.tensor([[1,2,3,31,31,31,31]]) for _ in range(4)]
+        inputs[2][0,3]=5;inputs[3][0,4]=6
+        for dtype in [torch.float32,torch.bfloat16]:
+            self.llm.to(dtype)
+            specs=staged_conditions([.5,1.],1,2,1,3)
+            self.assertEqual(len(specs),12)
+            for spec in specs:
+                with CompactStagedPruning(self.llm,self.prepared,spec['pruning']) as engine:
+                    actual=[forward_logits(self.llm,self.prepared,x) for x in inputs]
+                    counts=engine.accounting()
+                    self.assertFalse(hasattr(engine,'banks'))
+                    picks=engine.records
+                    self.assertEqual(len(picks),len(spec['pruning']['stages']))
+                    self.assertTrue(all(p['drop_budget']==int(len(self.prepared.group_positions(p['group']))*spec['pruning']['fraction']) for p in picks))
+                    self.assertTrue(all(p<self.prepared.answer_start for r in picks for p in r['dropped_positions']))
+                    self.assertGreater(counts['skipped_token_update_fraction'],0)
+                    if spec['pruning']['scope']=='asp' and spec['pruning']['fraction']==1.:
+                        self.assertEqual(engine.events[-1]['layer_computed_rows'][-1],4)
+                step=[-1];originals=[]
+                try:
+                    for layer,block in enumerate(blocks_of(self.llm)):
+                        original=block._scaled_dot_product_attention;existed='_scaled_dot_product_attention' in block.__dict__
+                        originals.append((block,original,existed))
+                        def dense(q,k,v,_layer=layer,_original=original,**kwargs):
+                            removed={p for r in picks if r['step']<=step[0] and r['layer']<=_layer for p in r['dropped_positions']}
+                            keep=torch.tensor([i for i in range(11) if i not in removed])
+                            return _original(q,k.index_select(-2,keep),v.index_select(-2,keep),**kwargs)
+                        block._scaled_dot_product_attention=dense
+                    reference=[]
+                    for i,x in enumerate(inputs):
+                        step[0]=i;reference.append(forward_logits(self.llm,self.prepared,x))
+                finally:
+                    for block,original,existed in originals:
+                        if existed:block._scaled_dot_product_attention=original
+                        else:delattr(block,'_scaled_dot_product_attention')
+                for a,b in zip(actual,reference):
+                    torch.testing.assert_close(a,b,rtol=.04 if dtype==torch.bfloat16 else 2e-5,atol=.04 if dtype==torch.bfloat16 else 2e-5)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_staged_benchmark_replay_reports_and_cpu_operator_capture(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.run import parser,write_json
+        from experiments.audio_drift.benchmark import benchmark
+        from experiments.audio_drift.replay import benchmark_replay
+        from experiments.audio_drift.pruning_report import analyze
+        from experiments.audio_drift.staged_profile import profile_staged
+        self.prepared=Prepared(self.prepared.prompt,torch.randn(1,4,16).to(torch.bfloat16),1,2,31)
+        self.llm.float()
+        args=parser().parse_args(['--manifest','unused','--out','unused','--interventions','--staged-prune',
+            '--staged-fractions','0.5','0.75','--acoustic-start','1','--later-start','2','--deep-layer','1',
+            '--skip-dense-interventions','--no-drift','--length','4','--block-length','2','--steps','4',
+            '--benchmark-repeats','1','--replay-repeats','1'])
+        final,states,_=decode(self.llm,self.prepared,4,2,4)
+        tokenizer=SimpleNamespace(eos_token_id=30,decode=lambda ids,**kw:'#### 1')
+        actual_profiler=torch.profiler.profile
+        def cpu_profile(**kw):
+            kw['activities']=[torch.profiler.ProfilerActivity.CPU]
+            return actual_profiler(**kw)
+        with tempfile.TemporaryDirectory() as directory,patch.object(torch.cuda,'synchronize'), \
+                patch.object(torch.cuda,'reset_peak_memory_stats'),patch.object(torch.cuda,'max_memory_allocated',return_value=0):
+            root=Path(directory);work=root/'samples/00000';work.mkdir(parents=True)
+            bench=benchmark(self.llm,self.prepared,final,args,tokenizer,{'id':'tiny','metric':'numeric','target':'1'},work)
+            replay=benchmark_replay(self.llm,self.prepared,states,bench['baseline_forwards'],args,work,sample_id='tiny')
+            self.assertEqual(len(bench['policies']),12)
+            self.assertEqual(len(replay['policies']),12)
+            self.assertTrue(all(p['accounting'][0]['pruning']['selections'][-1]['anchor_progress'] for p in bench['policies']))
+            write_json(work/'result.json',{'id':'tiny','score':{'correct':True},'benchmark':bench})
+            rows=analyze(root)
+            self.assertEqual(len(rows),12)
+            self.assertEqual(max(r['activated_stages'] for r in rows),3)
+            with patch.object(torch.profiler,'profile',side_effect=cpu_profile):
+                profile_staged(self.llm,self.prepared,states,4,args,work,'tiny')
+            trace=json.loads((work/'pruning_traces/index.json').read_text())
+            self.assertTrue(trace['captures'])
+            labels={s['name'] for c in trace['captures'] for s in c['scopes']}
+            self.assertTrue({'prune.selection','prune.compact_rows','prune.restore_output','decoder.qkv_projections'}<=labels)
+            self.assertTrue(all(not p['pruning'].get('banks') for p in bench['policies']))
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_delayed_pruning_matches_explicit_dense_kv_removal(self):
         from experiments.audio_drift.compact import PrefixCache
         from experiments.audio_drift.decode import forward_logits
@@ -672,9 +784,10 @@ class UpstreamTests(unittest.TestCase):
                     counts = cache.accounting()
                     dropped = cache.pruning.dropped[0]
                     self.assertEqual(cache.pruning.dropped[1], dropped)
-                    self.assertEqual(len(dropped), 1)
+                    size=len(self.prepared.group_positions('both' if scope=='audio' else scope))
+                    self.assertEqual(len(dropped),int(size*.5))
                     self.assertTrue(set(dropped) <= set(self.prepared.group_positions('both' if scope=='audio' else scope)))
-                    self.assertEqual([e['layer_kv_columns'] for e in cache.events], [[11,11], [10,10], [10,10], [10,10]])
+                    self.assertEqual([e['layer_kv_columns'] for e in cache.events], [[11,11]]+[[11-len(dropped)]*2]*3)
                     self.assertEqual(counts['pruning']['activated_layers'], 2)
                     self.assertEqual(len(counts['pruning']['selections']), 1)
                     self.assertTrue(all(p >= self.prepared.answer_start for p in counts['pruning']['selections'][0]['probe_positions']))
@@ -730,9 +843,11 @@ class UpstreamTests(unittest.TestCase):
             for policy in bench['policies']:
                 if policy.get('pruning'):
                     selection=policy['accounting'][0]['pruning']['selections'][0]
-                    self.assertEqual(selection['drop_budget'],1)
+                    scope=policy['pruning']['scope']
+                    size=len(self.prepared.group_positions('both' if scope=='audio' else scope))
+                    self.assertEqual(selection['drop_budget'],int(size*.5))
                     self.assertEqual(selection['anchor_progress']['revealed_fraction'],.25)
-                    self.assertEqual(sum(selection['dropped_by_group'].values()),1)
+                    self.assertEqual(sum(selection['dropped_by_group'].values()),selection['drop_budget'])
             write_json(work/'result.json',{'id':'tiny','score':{'correct':True},'benchmark':bench})
             rows=analyze(root)
             self.assertEqual(len(rows),10)
@@ -758,8 +873,8 @@ class UpstreamTests(unittest.TestCase):
         p.update(fraction=.5,start=1)
         with PrefixCache(self.llm,self.prepared,schedule,pruning=p) as cache:
             for _ in range(3): forward_logits(self.llm,self.prepared,x)
-            self.assertEqual([e['layer_computed_rows'] for e in cache.events],[[11,11],[11,11],[11,10]])
-            self.assertEqual([e['layer_kv_columns'] for e in cache.events],[[11,11],[11,10],[11,10]])
+            self.assertEqual([e['layer_computed_rows'] for e in cache.events],[[11,11],[11,11],[11,9]])
+            self.assertEqual([e['layer_kv_columns'] for e in cache.events],[[11,11],[11,9],[11,9]])
         with self.assertRaisesRegex(ValueError,'layer'):
             PrefixCache(self.llm,self.prepared,schedule,pruning={**p,'layer_start':2})
 
