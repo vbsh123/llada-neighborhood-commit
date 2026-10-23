@@ -22,6 +22,28 @@ if HAS_TORCH:
 
 
 class InputTests(unittest.TestCase):
+    def test_reference_blind_secondary_answer_extraction(self):
+        from experiments.audio_drift.numeric_answer_report import extract_answer
+        cases={
+            '#### Final numerical answer: 336':'336',
+            '#### Numerical answer: 2,400':'2400',
+            '**Toby will be 20 minutes early.**':'20',
+            'Therefore, Eli will need 2 bookcases to hold all 110 books.':'2',
+            'So, it will take Matthew 4 hours to dig 30 small holes and 15 large holes.':'4',
+            'So, the total cost is **$2400**.':'2400',
+            'Paul starts with 52 marbles. So Paul has 80 - 20 = 60 marbles left.\n####':'60',
+            'The answer is 2.':'2',
+            '#### 34 hours':'34',
+            'To':None,
+            "To solve the problem, let's break it down.":None,
+            'First calculate 2 + 3 = 5.':None,
+            'So, either 2 or 3.':None,
+            'We computed 2.\n#### unknown':None,
+            'How many days will 720 grams last?':None,
+        }
+        for text,expected in cases.items():
+            with self.subTest(text=text):self.assertEqual(extract_answer(text)[0],expected)
+
     @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
     def test_phased_prompt_weights_and_attention_gate(self):
         from experiments.audio_drift.attention_priority import FixedPhaseRamp,high_attention_factor
@@ -307,6 +329,46 @@ class InputTests(unittest.TestCase):
             provenance = json.loads(manifest.with_suffix('.provenance.json').read_text())
             self.assertEqual(provenance['scanned'], 5)
             self.assertEqual(provenance['eligible'], 5)
+
+    @unittest.skipUnless(HAS_TORCH, 'audio dependencies unavailable')
+    def test_spoken_math_exclusion_only_validation_pool(self):
+        import io
+        import soundfile as sf
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from unittest.mock import Mock
+        from experiments.audio_drift.prepare_gsm import main,DATASET,PROMPT
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory);buffer=io.BytesIO()
+            sf.write(buffer,np.zeros(1600),1600,format='WAV')
+            (directory/'old.wav').write_bytes(buffer.getvalue())
+            old=directory/'old.jsonl'
+            old.write_text(''.join(json.dumps(dict(id=f'gsm8k-speech-{i:05}',audio='old.wav',task='gsm8k_speech',
+                prompt='old prompt',metric='numeric',target=str(i),source_dataset=DATASET,source_revision='pinned'))+'\n' for i in [1,3]))
+            shard=directory/'data.parquet'
+            pq.write_table(pa.Table.from_pylist([dict(audio=dict(bytes=buffer.getvalue(),path='a.wav'),answer=str(i)) for i in range(12)]),shard)
+            api=Mock();api.dataset_info.return_value.sha='pinned';api.list_repo_files.return_value=['data/test-0.parquet']
+            manifest=directory/'validation.jsonl'
+            with patch('sys.argv',['prepare_gsm','--out',str(manifest),'--samples','3','--exclude-manifests',str(old)]), \
+                 patch('huggingface_hub.HfApi',return_value=api),patch('huggingface_hub.hf_hub_download',return_value=str(shard)):
+                main()
+            rows=read_manifest(manifest)
+            self.assertEqual(len(rows),3)
+            self.assertFalse({r['id'] for r in rows}&{'gsm8k-speech-00001','gsm8k-speech-00003'})
+            self.assertTrue(all(r['cohort']=='validation_v21' and r['prompt']==PROMPT for r in rows))
+            p=json.loads(manifest.with_suffix('.provenance.json').read_text())
+            self.assertEqual(p['excluded_source_indices'],[1,3]);self.assertEqual(p['fresh_samples'],3)
+            self.assertEqual(p['development_samples'],0);self.assertEqual(p['eligible'],10)
+            api.dataset_info.assert_called_once_with(DATASET,revision='pinned')
+            id_file=directory/'old_ids.json'
+            id_file.write_text(json.dumps(dict(source_dataset=DATASET,source_revision='pinned',ids=['gsm8k-speech-00001','gsm8k-speech-00003'])))
+            second=directory/'second_machine.jsonl'
+            with patch('sys.argv',['prepare_gsm','--out',str(second),'--samples','3','--exclude-id-files',str(id_file)]), \
+                 patch('huggingface_hub.HfApi',return_value=api),patch('huggingface_hub.hf_hub_download',return_value=str(shard)):
+                main()
+            other=read_manifest(second)
+            self.assertEqual([r['id'] for r in rows],[r['id'] for r in other])
+            self.assertEqual([r['audio_sha256'] for r in rows],[r['audio_sha256'] for r in other])
 
     def test_numeric_labels_preserve_strict_audit(self):
         for text in ["#### Answer: 2", "#### <final numerical answer> 2"]:

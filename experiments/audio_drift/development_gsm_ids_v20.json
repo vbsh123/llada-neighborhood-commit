@@ -1,0 +1,16 @@
+{
+  "source_dataset": "mistralai/gsm8k_speech",
+  "source_revision": "e94caa2154433a54cd430702666c454977df3083",
+  "ids": [
+    "gsm8k-speech-00019", "gsm8k-speech-00083", "gsm8k-speech-00124",
+    "gsm8k-speech-00211", "gsm8k-speech-00277", "gsm8k-speech-00408",
+    "gsm8k-speech-00460", "gsm8k-speech-00556", "gsm8k-speech-00632",
+    "gsm8k-speech-00646", "gsm8k-speech-00685", "gsm8k-speech-00748",
+    "gsm8k-speech-00760", "gsm8k-speech-00766", "gsm8k-speech-00773",
+    "gsm8k-speech-00820", "gsm8k-speech-00861", "gsm8k-speech-00875",
+    "gsm8k-speech-00908", "gsm8k-speech-01033", "gsm8k-speech-01051",
+    "gsm8k-speech-01054", "gsm8k-speech-01059", "gsm8k-speech-01106",
+    "gsm8k-speech-01156", "gsm8k-speech-01240", "gsm8k-speech-01262",
+    "gsm8k-speech-01280", "gsm8k-speech-01288", "gsm8k-speech-01291"
+  ]
+}

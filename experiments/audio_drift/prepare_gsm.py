@@ -79,6 +79,10 @@ def main():
     p.add_argument("--samples", type=int, default=10)
     p.add_argument("--revision", default="main")
     p.add_argument("--base-manifest", type=Path, help="Keep these development examples and add disjoint fresh rows")
+    p.add_argument('--exclude-manifests',type=Path,nargs='+',default=[],
+                   help='Exclude all these source questions; do not copy them into the output')
+    p.add_argument('--exclude-id-files',type=Path,nargs='+',default=[],
+                   help='JSON files with source_dataset, source_revision and ids; no old WAVs required')
     p.add_argument("--seed", type=int, default=1729)
     p.add_argument("--min-seconds", type=float, default=0)
     p.add_argument("--max-seconds", type=float, default=30)
@@ -91,18 +95,30 @@ def main():
     from huggingface_hub import HfApi
     import soundfile as sf
     base = read_manifest(args.base_manifest) if args.base_manifest else []
+    excluded_rows=[row for path in args.exclude_manifests for row in read_manifest(path)]
+    for path in args.exclude_id_files:
+        data=json.loads(path.read_text())
+        if (not isinstance(data.get('ids'),list) or not data['ids']
+                or not all(isinstance(i,str) for i in data['ids']) or len(set(data['ids']))!=len(data['ids'])):
+            raise ValueError('Exclusion ID file must contain unique source question IDs')
+        excluded_rows.extend(dict(id=i,source_dataset=data.get('source_dataset'),source_revision=data.get('source_revision')) for i in data['ids'])
+    if {r['id'] for r in base}&{r['id'] for r in excluded_rows}:
+        raise ValueError('Base examples cannot also be explicitly excluded')
     if base and args.samples <= len(base):
         raise ValueError("Combined sample count must exceed the development manifest size")
-    revisions = {r.get('source_revision') for r in base}
-    if base and (len(revisions) != 1 or None in revisions or
-                 any(r.get('source_dataset') != DATASET for r in base)):
-        raise ValueError("Base manifest must identify a single pinned GSM8K Speech revision")
-    selected_revision = next(iter(revisions)) if base else args.revision
+    references=base+excluded_rows
+    revisions = {r.get('source_revision') for r in references}
+    if references and (len(revisions) != 1 or None in revisions or
+                 any(r.get('source_dataset') != DATASET for r in references)):
+        raise ValueError("Reference manifests must identify a single pinned GSM8K Speech revision")
+    if any(not str(r['id']).startswith('gsm8k-speech-') or not str(r['id']).removeprefix('gsm8k-speech-').isdigit() for r in references):
+        raise ValueError('Reference manifests must use source-index GSM8K Speech IDs')
+    selected_revision = next(iter(revisions)) if references else args.revision
     api = HfApi()
     revision = api.dataset_info(DATASET, revision=selected_revision).sha
-    if base and args.revision != 'main' and args.revision != revision:
+    if references and args.revision != 'main' and args.revision != revision:
         raise ValueError("Explicit revision differs from the development dataset revision")
-    excluded = {int(r['id'].removeprefix('gsm8k-speech-')) for r in base}
+    excluded = {int(r['id'].removeprefix('gsm8k-speech-')) for r in references}
     files = sorted(f for f in api.list_repo_files(DATASET, repo_type="dataset", revision=revision)
                    if f.startswith("data/test-") and f.endswith(".parquet"))
     if not files:
@@ -122,7 +138,7 @@ def main():
         manifest.append({"id": f"gsm8k-speech-{row['source_index']:05}",
                          "audio": str(path.relative_to(args.out.parent)), "task": "gsm8k_speech",
                          "prompt": PROMPT, "metric": "numeric", "target": row["target"],
-                         "audio_seconds": row["audio_seconds"], "cohort": "fresh" if base else "unspecified",
+                         "audio_seconds": row["audio_seconds"], "cohort": "fresh" if base else ('validation_v21' if excluded_rows else 'unspecified'),
                          "source_dataset": DATASET,
                          "source_revision": revision, "source_file": row["source_file"],
                          "source_row": row["source_row"]})
@@ -136,8 +152,10 @@ def main():
     args.out.with_suffix(".provenance.json").write_text(json.dumps({
         "dataset": DATASET, "revision": revision, "source_files": files, "seed": args.seed,
         "selection": "uniform reservoir over duration-eligible test rows; no correctness filtering",
-        "samples": args.samples, "development_samples": len(base), "fresh_samples": len(selected) if base else 0,
+        "samples": args.samples, "development_samples": len(base), "fresh_samples": len(selected) if references else 0,
         "base_manifest": str(args.base_manifest.resolve()) if args.base_manifest else None,
+        "exclude_manifests": [str(p.resolve()) for p in args.exclude_manifests],
+        "exclude_id_files": [str(p.resolve()) for p in args.exclude_id_files],
         "excluded_source_indices": sorted(excluded), "min_seconds": args.min_seconds, "max_seconds": args.max_seconds,
         "prompt": PROMPT, "scoring": "exact canonical numerical match; explicit final marker or bare number",
         **counts}, indent=2) + "\n")
