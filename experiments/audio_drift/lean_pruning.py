@@ -12,12 +12,17 @@ from .inputs import score
 
 @torch.no_grad()
 def warmup(llm,prepared,args,tokenizer):
-    print('One-time warmup: baseline, audio pruning, generic control (untimed)',flush=True)
+    specs=policy_specs(args,'process-warmup')
+    if getattr(args,'pruning_sweep',False):
+        # Warm the shared implementation once, not all ten configurations.
+        source=next(s for s in specs if s['pruning']['control']=='audio')
+        specs=[source,next(s for s in specs if s.get('control_source')==source['condition'])]
+    print(f'One-time warmup: baseline and {len(specs)} pruning policies (untimed)',flush=True)
     final,_,_=decode(llm,prepared,args.length,args.block_length,args.steps,
                      save_states=False,eos_id=tokenizer.eos_token_id)
     del final
     completed=[]
-    for spec in policy_specs(args,'process-warmup'):
+    for spec in specs:
         spec=resolve_control(spec,completed)
         with policy_context(llm,prepared,spec) as engine:
             final,_,_=decode(llm,prepared,args.length,args.block_length,args.steps,
@@ -40,7 +45,7 @@ def evaluate(llm,prepared,baseline,baseline_seconds,baseline_events,args,tokeniz
              'median_seconds is a compatibility field equal to the single measured duration. '
              'No repeated baseline, per-example warmup, replay, or full-canvas state saving. '
              'Includes pruning observations/selection and token commitment. Excludes audio preparation, '
-             'scoring, output writes and accounting serialization. Baseline -> audio -> generic order; '
+             'scoring, output writes and accounting serialization. Baseline first; each audio source precedes its generic control. '
              'generic uses audio event times/budgets and ranks its own prefix. No claim of identical-input timing.')
     for spec in policy_specs(args,row['id']):
         spec=resolve_control(spec,report['policies'])
@@ -54,6 +59,14 @@ def evaluate(llm,prepared,baseline,baseline_seconds,baseline_events,args,tokeniz
         torch.cuda.synchronize();seconds=time.perf_counter()-began
         peak=torch.cuda.max_memory_allocated()
         accounting=engine.accounting()
+        if getattr(args,'pruning_sweep',False):
+            # The matched control needs check times and removal budgets, not
+            # full per-position attention histories. Preserve only decisions.
+            account=accounting['pruning']
+            account['trigger_checks']=[{k:r[k] for k in ('step','apply_step','current_key_count',
+                'eligible_by_group','planned_removals')} for r in account['trigger_checks']]
+            for pick in account['selections']:
+                pick.pop('probe_positions',None)
         for pick in accounting['pruning']['selections']:
             anchor=events[pick['step']]
             pick['anchor_progress']={k:anchor[k] for k in ('remaining_masks','remaining_fraction',
@@ -70,7 +83,8 @@ def evaluate(llm,prepared,baseline,baseline_seconds,baseline_events,args,tokeniz
             decode_speedup=baseline_seconds/seconds,
             same_forward_count_as_baseline=accounting['forwards']==len(baseline_events))
         report['policies'].append(result)
-        write_json(work/(spec['condition']+'_steps.json'),events)
+        if not getattr(args,'pruning_sweep',False):
+            write_json(work/(spec['condition']+'_steps.json'),events)
         write_json(work/'cache_benchmark.json',report)
         print(f"    {seconds:.2f}s; {accounting['forwards']} forwards; "
               f"{result['visible_answer_tokens']/seconds:.2f} TPS; score={result['score']}",flush=True)

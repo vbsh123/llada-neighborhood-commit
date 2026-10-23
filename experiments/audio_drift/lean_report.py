@@ -9,22 +9,29 @@ from pathlib import Path
 def analyze(run):
     run=Path(run);out=run/'analysis';out.mkdir(exist_ok=True)
     secondary={(r['id'],r['condition']):r for r in csv.DictReader((out/'numeric_secondary_pairs.csv').open())}
-    rows=[]
+    rows=[];cohorts=set()
     for path in sorted((run/'samples').glob('*/result.json')):
         if path.parent.name.startswith('.'):continue
         r=json.loads(path.read_text());b=r['benchmark']
+        cohorts.add(r.get('cohort','unspecified'))
         if b.get('protocol')!='single-pass-eos-v1':raise ValueError('Expected lean single-pass protocol')
         policies=[dict(condition='baseline',score=r['score'],median_seconds=b['baseline_median_seconds'],
             visible_answer_tokens=b['baseline_visible_answer_tokens'],accounting=[dict(forwards=b['baseline_forwards'])])]+b['policies']
         for p in policies:
             s=secondary[r['id'],p['condition']]
+            plan=p.get('pruning',{});picks=p['accounting'][0].get('pruning',{}).get('selections',[])
             rows.append(dict(id=r['id'],condition=p['condition'],original_correct=bool(p['score']['correct']),
                 correct=s['correct']=='True',parse_failed=s['parse_failed']=='True',prediction=s['prediction'],reference=s['reference'],
-                seconds=p['median_seconds'],visible_answer_tokens=p['visible_answer_tokens'],forwards=p['accounting'][0]['forwards']))
+                seconds=p['median_seconds'],visible_answer_tokens=p['visible_answer_tokens'],forwards=p['accounting'][0]['forwards'],
+                threshold=plan.get('threshold_uniform'),fraction=plan.get('fraction'),control=plan.get('control'),
+                activated=bool(picks),removed_acoustic=sum(v['dropped_by_group']['acoustic'] for v in picks),
+                removed_semantic=sum(v['dropped_by_group']['semantic'] for v in picks),
+                removed_prompt=sum(v['dropped_by_group']['prompt'] for v in picks)))
     grouped=defaultdict(list)
     for row in rows:grouped[row['condition']].append(row)
-    lines=['# Held-out pruning: single-pass accuracy and throughput','',
-        'One decode per condition/example after process-wide warmup; baseline -> audio -> reference-guided generic order. '
+    title='Development pruning sensitivity' if 'development_v24' in cohorts else 'Held-out pruning'
+    lines=[f'# {title}: single-pass accuracy and throughput','',
+        'One decode per condition/example after process-wide warmup; baseline first and each audio source precedes its reference-guided generic. '
         'TPS is summed visible answer tokens excluding EOS divided by summed synchronized decode time. '
         'Decode includes pruning observations, selection and commitment; excludes audio preparation/scoring/file writes. '
         'No repeated per-example timing or identical-input replay. Legacy median fields hold one observation. '
@@ -40,6 +47,8 @@ def analyze(run):
     for i,left in enumerate(names):
         a={r['id']:r for r in grouped[left]}
         for right in names[i+1:]:
+            if left!='baseline' and (grouped[left][0]['threshold'],grouped[left][0]['fraction'])!=(grouped[right][0]['threshold'],grouped[right][0]['fraction']):
+                continue
             pairs=[(a[r['id']],r) for r in grouped[right]]
             wins=sum(not a['correct'] and b['correct'] for a,b in pairs)
             losses=sum(a['correct'] and not b['correct'] for a,b in pairs)

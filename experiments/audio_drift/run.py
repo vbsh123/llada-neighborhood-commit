@@ -38,6 +38,9 @@ def display_text(tokenizer, x, prompt_length):
 
 
 def intervention_specs(args):
+    if getattr(args,'pruning_sweep',False):
+        from .pruning_sweep import conditions as sweep_conditions
+        return sweep_conditions(args)
     if getattr(args,'cache_progressive_prune',False):
         from .cache_pruning import combined_conditions
         return combined_conditions(args.length,args.block_length,args.steps,args.acoustic_start,
@@ -274,6 +277,7 @@ def parser():
     p.add_argument('--crossing-patience', type=int, default=2)
     p.add_argument('--progressive-prune', action='store_true')
     p.add_argument('--lean-pruning',action='store_true',help='Baseline/audio/generic, one timed EOS decode each')
+    p.add_argument('--pruning-sweep',action='store_true',help='Development: five threshold/fraction pairs, audio/generic each')
     p.add_argument('--cache-progressive-prune', action='store_true')
     p.add_argument('--progressive-semantic-start',type=int,default=44)
     p.add_argument('--progressive-interval',type=int,default=8)
@@ -358,11 +362,14 @@ def main():
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
+    if args.pruning_sweep and not args.lean_pruning:
+        raise ValueError('Pruning sensitivity sweep requires lean single-pass mode')
     if args.lean_pruning and (not args.progressive_prune or args.cache_progressive_prune
             or not args.skip_dense_interventions or not args.no_drift or args.benchmark_samples
             or args.replay_samples or args.profile_samples or args.diagnostic_samples or args.pairwise_count
             or args.sensitivity_samples or args.priority_samples or args.pruning_profile_samples or args.refresh_profile_samples
-            or args.benchmark_conditions or args.benchmark_stopping!='eos' or len(specifications)!=2):
+            or args.benchmark_conditions or args.benchmark_stopping!='eos'
+            or len(specifications)!=(10 if args.pruning_sweep else 2)):
         raise ValueError('Lean pruning requires only progressive audio/generic, no extra benchmarks/diagnostics')
     if (min(args.sensitivity_samples,args.priority_samples)<0 or
             (args.samples is not None and max(args.sensitivity_samples,args.priority_samples)>args.samples)):
@@ -423,11 +430,11 @@ def main():
     estimate = work_estimate(args.steps, args.branch_fractions,
                              [] if args.skip_dense_interventions else specifications)
     if args.lean_pruning:
-        estimate['single_pass_policy_max_forwards']=2*args.steps
-        estimate['note']='Baseline and two policies stop at safe EOS; excludes process-wide warmup and first-sample official verification.'
+        estimate['single_pass_policy_max_forwards']=len(specifications)*args.steps
+        estimate['note']='Baseline and policies stop at safe EOS; excludes process-wide warmup and first-sample official verification.'
     print("Work per example:", json.dumps(estimate), flush=True)
     if args.lean_pruning:
-        print('Lean evaluation: three single-pass EOS generations per example; one process-wide warmup; no replay.',flush=True)
+        print(f'Lean evaluation: {1+len(specifications)} single-pass EOS generations per example; one process-wide warmup; no replay.',flush=True)
     if args.diagnostic_samples or args.refresh_profile_samples:
         print(f"Additional diagnostics: attention replay on first {args.diagnostic_samples} samples; "
               f"per-forward refresh profiling on first {args.refresh_profile_samples}, "
@@ -573,7 +580,8 @@ def main():
                 break
         baseline_score = score(text, row.get("target"), row.get("metric", "none"))
         print(f"  baseline: official_match={verified}; score={baseline_score}; text={text!r}", flush=True)
-        write_json(work / "steps.json", events)
+        if not args.pruning_sweep:
+            write_json(work / "steps.json", events)
         result = {"id": row["id"], "task": row["task"], "prompt": row["prompt"],
                   "cohort": row.get("cohort", "unspecified"), "drift_recorded": recorder is not None,
                   "target": row.get("target"), "audio_seconds": duration,

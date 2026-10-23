@@ -843,6 +843,49 @@ class UpstreamTests(unittest.TestCase):
             self.assertIn('Tokens/sec',(root/'analysis/lean_report.md').read_text())
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_pruning_sweep_matrix_single_pass_and_minimal_records(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.run import parser,intervention_specs,write_json
+        from experiments.audio_drift.lean_pruning import evaluate,warmup
+        from experiments.audio_drift.numeric_answer_report import analyze as numeric_analyze
+        from experiments.audio_drift.lean_report import analyze as lean_analyze
+        from experiments.audio_drift.pruning_sweep import analyze,SETTINGS
+        from experiments.audio_drift.decode import decode as real_decode
+        self.llm.float()
+        args=parser().parse_args(['--manifest','unused','--out','unused','--progressive-prune','--lean-pruning',
+            '--pruning-sweep','--shuffle-policy-order','--skip-dense-interventions','--no-drift','--profile-samples','0',
+            '--length','4','--block-length','2','--steps','4','--acoustic-start','1',
+            '--progressive-semantic-start','2','--progressive-interval','1','--progressive-patience','1'])
+        specs=intervention_specs(args)
+        self.assertEqual(len(specs),10);self.assertEqual(len({s['condition'] for s in specs}),10)
+        self.assertEqual({(s['pruning']['threshold_uniform'],s['pruning']['fraction']) for s in specs},set(SETTINGS))
+        tokenizer=SimpleNamespace(eos_token_id=30,all_special_ids=[30,31],decode=lambda ids,**kw:'#### 1')
+        baseline,_,events=decode(self.llm,self.prepared,4,2,4,save_states=False,eos_id=30)
+        with tempfile.TemporaryDirectory() as directory,patch.object(torch.cuda,'synchronize'), \
+                patch.object(torch.cuda,'reset_peak_memory_stats'),patch.object(torch.cuda,'max_memory_allocated',return_value=0):
+            root=Path(directory);work=root/'samples/00000';work.mkdir(parents=True)
+            with patch('experiments.audio_drift.lean_pruning.decode',wraps=real_decode) as counted:
+                warmup(self.llm,self.prepared,args,tokenizer)
+                self.assertEqual(counted.call_count,3)
+                counted.reset_mock()
+                report=evaluate(self.llm,self.prepared,baseline,.1,events,args,tokenizer,
+                    dict(id='sweep',target='1',metric='numeric'),work,.01)
+                self.assertEqual(counted.call_count,10)
+            self.assertFalse(list(work.glob('*_steps.json')))
+            for p in report['policies']:
+                self.assertEqual(len(p['seconds']),1)
+                checks=p['accounting'][0]['pruning']['trigger_checks']
+                self.assertTrue(all('attention_mean' not in c and 'positions' not in c for c in checks))
+                if p.get('control_source'):
+                    source=next(s for s in report['policies'] if s['condition']==p['control_source'])
+                    self.assertEqual([s['drop_budget'] for s in p['accounting'][0]['pruning']['selections']],
+                        [s['drop_budget'] for s in source['accounting'][0]['pruning']['selections']])
+            write_json(work/'result.json',dict(id='sweep',task='gsm8k_speech',cohort='development_v24',target='1',
+                text='#### 1',score=dict(metric='numeric',correct=True,prediction='1',reference='1',parse_failed=False),benchmark=report))
+            numeric_analyze(root);self.assertEqual(len(lean_analyze(root)),11)
+            self.assertEqual(len(analyze(root)),10)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_cached_progressive_against_dense_frozen_kv_and_removed_columns(self):
         from contextlib import ExitStack
         from experiments.audio_drift.cache_pruning import CachedProgressivePruning, combined_conditions
