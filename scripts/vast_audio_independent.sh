@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Frozen standalone evaluations on one disjoint question pool; no combinations.
+# Standalone evaluations, plus an explicit combined cache/pruning mode.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mode="${1:-prepare}"
-case "$mode" in prepare|cache|prune|boost|all) ;; *) echo 'Usage: bash scripts/vast_audio_independent.sh [prepare|cache|prune|boost|all]'; exit 2;; esac
+case "$mode" in prepare|cache|prune|boost|combined|all) ;; *) echo 'Usage: bash scripts/vast_audio_independent.sh [prepare|cache|prune|boost|combined|all]'; exit 2;; esac
 audio_venv="${AUDIO_VENV:-$PWD/.venv-audio}"
 [[ -x "$audio_venv/bin/python" ]] || { echo 'Run bash scripts/vast_audio_drift.sh setup first'; exit 2; }
 source "$audio_venv/bin/activate"
@@ -54,12 +54,14 @@ if [[ "$mode" == prepare ]]; then echo "Manifest: $manifest"; exit 0; fi
 run_family() {
   local family="$1"
   local launcher
-  case "$family" in cache) launcher=gsm-cache;; prune) launcher=gsm-progressive-prune;; boost) launcher=gsm-prompt-boost;; esac
+  case "$family" in cache) launcher=gsm-cache;; prune|combined) launcher=gsm-progressive-prune;; boost) launcher=gsm-prompt-boost;; esac
   local run="${prefix}_${family}${count}_v21"
+  local combined=0
+  if [[ "$family" == combined ]]; then combined=1; run="${prefix}_combined${count}_v22"; fi
   local replay="${REPLAY_SAMPLES:-2}"
   if (( replay > count )); then replay="$count"; fi
-  echo "Starting standalone $family on $count new questions: runs/$run"
-  env MANIFEST="$manifest" SAMPLES="$count" RUN_NAME="$run" \
+  echo "Starting $family on $count paired questions: runs/$run"
+  env MANIFEST="$manifest" SAMPLES="$count" RUN_NAME="$run" CACHE_PROGRESSIVE="$combined" \
     SKIP_INSTALL="${SKIP_INSTALL:-1}" WHISPER_REVISION="${WHISPER_REVISION:-06f233fe06e710322aca913c1bc4249a0d71fce1}" \
     REPLAY_SAMPLES="$replay" BENCHMARK_REPEATS="${BENCHMARK_REPEATS:-2}" REPLAY_REPEATS="${REPLAY_REPEATS:-2}" \
     ACOUSTIC_START=16 SEMANTIC_START=44 PRUNE_INTERVAL=8 PRUNE_PATIENCE=2 PRUNE_THRESHOLD=0.5 PRUNE_ELIGIBLE_FRACTION=0.25 \

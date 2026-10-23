@@ -169,6 +169,9 @@ class PrefixCache(AbstractContextManager):
 def policy_context(llm, prepared, specification):
     plan = specification.get('pruning')
     if plan and plan.get('engine') == 'compact_staged':
+        if plan.get('temporal_cache'):
+            from .cache_pruning import CachedProgressivePruning
+            return CachedProgressivePruning(llm, prepared, specification)
         if any(s['refresh_every'] != 1 for s in specification['schedule']):
             raise ValueError('Compact staged pruning must be evaluated without cache reuse')
         from .staged_pruning import CompactStagedPruning

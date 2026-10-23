@@ -114,6 +114,7 @@ elif [[ "$mode" == gsm-attention-priority ]]; then
           --priority-text-sources "${priority_sources[@]}" --priority-start "${PRIORITY_START:-40}"
           --priority-smoothing "${PRIORITY_SMOOTHING:-0.2}")
 elif [[ "$mode" == gsm-progressive-prune ]]; then
+  if [[ "${CACHE_PROGRESSIVE:-0}" == 1 ]]; then extra+=(--cache-progressive-prune); fi
   replay_count="${REPLAY_SAMPLES:-2}"
   if (( replay_count > count )); then replay_count="$count"; fi
   extra+=(--interventions --progressive-prune --skip-dense-interventions --no-drift --shuffle-policy-order

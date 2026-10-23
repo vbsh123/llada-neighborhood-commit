@@ -793,6 +793,78 @@ class UpstreamTests(unittest.TestCase):
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_cached_progressive_against_dense_frozen_kv_and_removed_columns(self):
+        from contextlib import ExitStack
+        from experiments.audio_drift.cache_pruning import CachedProgressivePruning, combined_conditions
+        from experiments.audio_drift.compact import PrefixCache
+        from experiments.audio_drift.progressive_pruning import ProgressivePruning
+        from experiments.audio_drift.decode import forward_logits
+        self.llm.float()
+        spec=combined_conditions(8,2,8,1,2,1,1,100,.5)[1]
+        spec['schedule']=[dict(group=g,refresh_every=r) for g,r in
+                          [('acoustic',2),('prompt',3),('semantic',2)]]
+        inputs=[torch.tensor([[1,2,3,4+i%4,31,31,31,31,31,31,31]]) for i in range(8)]
+        removals=[]
+        with CachedProgressivePruning(self.llm,self.prepared,spec) as engine:
+            actual=[]
+            for x in inputs:
+                actual.append(forward_logits(self.llm,self.prepared,x).clone())
+                removals.append(engine.controller.known_removals(0))
+            counts=engine.accounting()
+        self.assertEqual(removals[0],())
+        self.assertEqual(set(removals[-1]),set(self.prepared.audio_positions))
+        self.assertLess(counts['computed_token_layers'],counts['dense_token_layers_at_same_forward_count'])
+        self.assertTrue(all(p['score_step']==p['step']-1 for p in counts['pruning']['selections']))
+        banks={};clock=[0]
+        with ExitStack() as stack:
+            for layer,block in enumerate(engine.blocks):
+                original=block._scaled_dot_product_attention
+                def attention(q,k,v,_layer=layer,_original=original,**kw):
+                    inactive=sorted({p for s in spec['schedule']
+                        if clock[0] and clock[0]%s['refresh_every'] for p in self.prepared.group_positions(s['group'])})
+                    k=k.clone();v=v.clone()
+                    if inactive:
+                        ids=torch.tensor(inactive);k.index_copy_(-2,ids,banks[_layer][0].index_select(-2,ids))
+                        v.index_copy_(-2,ids,banks[_layer][1].index_select(-2,ids))
+                    banks[_layer]=[k.clone(),v.clone(),banks.get(_layer,[None,None,None])[2]]
+                    keep=torch.tensor([p for p in range(k.shape[-2]) if p not in removals[clock[0]]])
+                    return _original(q,k.index_select(-2,keep),v.index_select(-2,keep),**kw)
+                block._scaled_dot_product_attention=attention
+                stack.callback(delattr,block,'_scaled_dot_product_attention')
+                def hidden(module,args,output,_layer=layer):
+                    h=output[0].clone()
+                    inactive=sorted({p for s in spec['schedule']
+                        if clock[0] and clock[0]%s['refresh_every'] for p in self.prepared.group_positions(s['group'])})
+                    if inactive:
+                        ids=torch.tensor(inactive);h.index_copy_(1,ids,banks[_layer][2].index_select(1,ids))
+                    banks[_layer][2]=h.clone()
+                    return h,None
+                handle=block.register_forward_hook(hidden);stack.callback(handle.remove)
+            for i,x in enumerate(inputs):
+                clock[0]=i
+                expected=forward_logits(self.llm,self.prepared,x)
+                torch.testing.assert_close(actual[i][:,self.prepared.answer_start:],
+                    expected[:,self.prepared.answer_start:],rtol=2e-5,atol=2e-6)
+        # Identity cache reduces to the already verified pruning-only engine.
+        fresh={**spec,'schedule':[dict(group='prefix',refresh_every=1)]}
+        with CachedProgressivePruning(self.llm,self.prepared,fresh):
+            a=[forward_logits(self.llm,self.prepared,x).clone() for x in inputs]
+        with ProgressivePruning(self.llm,self.prepared,spec['pruning']):
+            b=[forward_logits(self.llm,self.prepared,x).clone() for x in inputs]
+        for x,y in zip(a,b):torch.testing.assert_close(x[:,self.prepared.answer_start:],y[:,self.prepared.answer_start:],rtol=2e-5,atol=2e-6)
+        # Inactive pruning is numerically the ordinary cache, including refreshes.
+        quiet={**spec,'pruning':{**spec['pruning'],'threshold_uniform':1e-30}}
+        with CachedProgressivePruning(self.llm,self.prepared,quiet):
+            a=[forward_logits(self.llm,self.prepared,x).clone() for x in inputs]
+        with PrefixCache(self.llm,self.prepared,spec['schedule']):
+            b=[forward_logits(self.llm,self.prepared,x).clone() for x in inputs]
+        for x,y in zip(a,b):torch.testing.assert_close(x,y,rtol=0,atol=0)
+        before=forward_logits(self.llm,self.prepared,inputs[0]).clone()
+        with self.assertRaisesRegex(RuntimeError,'cleanup'):
+            with CachedProgressivePruning(self.llm,self.prepared,spec):raise RuntimeError('cleanup')
+        torch.testing.assert_close(before,forward_logits(self.llm,self.prepared,inputs[0]),rtol=0,atol=0)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_progressive_all_layers_compaction_dense_reference_and_controls(self):
         from experiments.audio_drift.progressive_pruning import progressive_conditions
         from experiments.audio_drift.crossing_pruning import resolve_control
@@ -879,6 +951,15 @@ class UpstreamTests(unittest.TestCase):
             self.assertEqual(len(bench['policies']),4);self.assertEqual(len(replay['policies']),4)
             write_json(work/'result.json',dict(id='progressive',score=dict(correct=True),benchmark=bench))
             self.assertEqual(len(analyze(root)),4)
+            args.cache_progressive_prune=True
+            combined=benchmark(self.llm,self.prepared,baseline,args,tokenizer,dict(id='combined',metric='numeric',target='1'),work)
+            combined_replay=benchmark_replay(self.llm,self.prepared,states,combined['baseline_forwards'],args,work,sample_id='combined')
+            self.assertEqual(len(combined['policies']),4)
+            self.assertEqual(len(combined_replay['policies']),4)
+            self.assertEqual(sum(bool(p.get('pruning')) for p in combined['policies']),2)
+            write_json(work/'result.json',dict(id='combined',score=dict(correct=True),benchmark=combined))
+            self.assertEqual(len(analyze(root)),2)
+            args.cache_progressive_prune=False
             args.priority_method='phased_odds';args.priority_start=0;args.priority_midpoint=2;args.priority_end=4
             args.priority_text_sources=['prompt'];args.priority_strengths=[.1]
             self.assertEqual(run_priority_study(self.llm,self.prepared,baseline,args,tokenizer,dict(metric='numeric',target='1'),work)['policies'],4)

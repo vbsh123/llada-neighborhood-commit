@@ -38,6 +38,11 @@ def display_text(tokenizer, x, prompt_length):
 
 
 def intervention_specs(args):
+    if getattr(args,'cache_progressive_prune',False):
+        from .cache_pruning import combined_conditions
+        return combined_conditions(args.length,args.block_length,args.steps,args.acoustic_start,
+            args.progressive_semantic_start,args.progressive_interval,args.progressive_patience,
+            args.progressive_threshold,args.progressive_fraction,args.seed)
     specs = conditions(args.interventions, getattr(args, "freeze_groups", ["both"]),
                        getattr(args, "refresh_intervals", []), getattr(args, "mixed_refresh", []),
                        getattr(args, "triple_refresh", []))
@@ -266,6 +271,7 @@ def parser():
     p.add_argument('--crossing-interval', type=int, default=8)
     p.add_argument('--crossing-patience', type=int, default=2)
     p.add_argument('--progressive-prune', action='store_true')
+    p.add_argument('--cache-progressive-prune', action='store_true')
     p.add_argument('--progressive-semantic-start',type=int,default=44)
     p.add_argument('--progressive-interval',type=int,default=8)
     p.add_argument('--progressive-patience',type=int,default=2)
@@ -375,7 +381,7 @@ def main():
     if args.crossing_prune and (args.staged_prune or args.late_prune or not args.skip_dense_interventions
             or args.depth_multipliers or not args.no_drift or args.diagnostic_samples or args.pruning_profile_samples):
         raise ValueError('Crossing pruning requires its own compact-only, no-drift experiment; operator tracing is separate')
-    if args.progressive_prune and (args.crossing_prune or args.staged_prune or args.late_prune
+    if (args.progressive_prune or args.cache_progressive_prune) and (args.crossing_prune or args.staged_prune or args.late_prune
             or not args.skip_dense_interventions or not args.no_drift or args.depth_multipliers
             or args.diagnostic_samples or args.pruning_profile_samples or args.refresh_profile_samples):
         raise ValueError('Progressive pruning requires its own compact-only no-drift experiment')
