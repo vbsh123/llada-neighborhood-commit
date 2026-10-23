@@ -8,30 +8,32 @@ audio_venv="${AUDIO_VENV:-$PWD/.venv-audio}"
 [[ -x "$audio_venv/bin/python" ]] || { echo 'Run bash scripts/vast_audio_drift.sh setup first'; exit 2; }
 source "$audio_venv/bin/activate"
 count="${SAMPLES:-100}"
+pool_count="${POOL_SAMPLES:-$count}"
 seed="${DATA_SEED:-20261023}"
 revision="${DATASET_REVISION:-e94caa2154433a54cd430702666c454977df3083}"
 prefix="${RUN_PREFIX:-audio_independent}"
 [[ "$count" =~ ^[1-9][0-9]*$ && "$seed" =~ ^[0-9]+$ && "$prefix" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid sample count/seed/run prefix'; exit 2; }
-manifest="${MANIFEST:-$PWD/data/audio_drift/gsm_validation${count}_seed${seed}_v21.jsonl}"
+[[ "$pool_count" =~ ^[1-9][0-9]*$ ]] && (( pool_count >= count )) || { echo 'POOL_SAMPLES must be at least SAMPLES'; exit 2; }
+manifest="${MANIFEST:-$PWD/data/audio_drift/gsm_validation${pool_count}_seed${seed}_v21.jsonl}"
 read -r -a excludes <<< "${EXCLUDE_MANIFESTS:-}"
 id_file="$PWD/experiments/audio_drift/development_gsm_ids_v20.json"
 exclusion_args=(--exclude-id-files "$id_file")
 if (( ${#excludes[@]} )); then exclusion_args+=(--exclude-manifests "${excludes[@]}"); fi
 for path in "${excludes[@]}"; do [[ -f "$path" ]] || { echo "Missing exclusion manifest: $path"; exit 2; }; done
 if [[ ! -f "$manifest" ]]; then
-  python -u -m experiments.audio_drift.prepare_gsm --out "$manifest" --samples "$count" \
+  python -u -m experiments.audio_drift.prepare_gsm --out "$manifest" --samples "$pool_count" \
     --revision "$revision" --seed "$seed" "${exclusion_args[@]}"
 fi
-python - "$manifest" "$count" "$seed" "$revision" "$id_file" "${excludes[@]}" <<'PY'
+python - "$manifest" "$count" "$seed" "$revision" "$id_file" "$pool_count" "${excludes[@]}" <<'PY'
 import hashlib,json,sys
 from pathlib import Path
 from experiments.audio_drift.inputs import read_manifest
 path=Path(sys.argv[1]);count,seed=int(sys.argv[2]),int(sys.argv[3]);revision=sys.argv[4]
-rows=read_manifest(path);old=[r for p in sys.argv[6:] for r in read_manifest(p)]
+pool_count=int(sys.argv[6]);rows=read_manifest(path);old=[r for p in sys.argv[7:] for r in read_manifest(p)]
 ids=json.loads(Path(sys.argv[5]).read_text())
 old += [dict(id=i,source_revision=ids['source_revision']) for i in ids['ids']]
 excluded={r['id'] for r in old};new={r['id'] for r in rows}
-assert len(rows)==count and len(new)==count,'Unexpected validation sample count'
+assert len(rows)==pool_count and len(new)==pool_count and pool_count>=count,'Unexpected validation pool count'
 assert not new&excluded,'Validation questions overlap prior experiments'
 assert all(r.get('source_revision')==revision for r in rows+old),'Dataset revision mismatch'
 assert all(r.get('cohort')=='validation_v21' for r in rows),'Use a dedicated exclusion-only validation manifest'
@@ -39,10 +41,13 @@ provenance=json.loads(path.with_suffix('.provenance.json').read_text())
 assert provenance['seed']==seed and provenance['revision']==revision,'Manifest provenance mismatch'
 assert set(provenance['excluded_source_indices'])=={int(i.removeprefix('gsm8k-speech-')) for i in excluded},'Exclusion set changed'
 assert provenance['min_seconds']==0 and provenance['max_seconds']==30,'Duration distribution changed'
-print(f'Validated {count} new questions; excluded {len(excluded)} prior questions; seed={seed}',flush=True)
+print(f'Validated {pool_count} new questions; evaluating first {count}; excluded {len(excluded)} prior questions; seed={seed}',flush=True)
 content=[{k:r[k] for k in ('id','source_revision','prompt','target','metric','audio_sha256')} for r in rows]
-fingerprint=hashlib.sha256(json.dumps(content,sort_keys=True,separators=(',',':')).encode()).hexdigest()
-path.with_suffix('.fingerprint.json').write_text(json.dumps(dict(sha256=fingerprint,samples=count,seed=seed,revision=revision),indent=2)+'\n')
+digest=lambda rows:hashlib.sha256(json.dumps(rows,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+fingerprint=digest(content[:count]);pool_fingerprint=digest(content)
+path.with_suffix('.fingerprint.json').write_text(json.dumps(dict(sha256=fingerprint,samples=count,pool_samples=pool_count,
+    pool_sha256=pool_fingerprint,question_ids=[r['id'] for r in rows[:count]],seed=seed,revision=revision),indent=2)+'\n')
+print(f'POOL_FINGERPRINT={pool_fingerprint}',flush=True)
 print(f'INPUT_FINGERPRINT={fingerprint}',flush=True)
 PY
 if [[ "$mode" == prepare ]]; then echo "Manifest: $manifest"; exit 0; fi

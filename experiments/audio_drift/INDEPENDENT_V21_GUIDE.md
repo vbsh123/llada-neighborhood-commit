@@ -60,8 +60,8 @@ model downloads, generation and reports, so no later manual launch is required.
 Machine A:
 
 ```bash
-nohup env SAMPLES=100 bash scripts/vast_audio_unattended.sh prune \
-  > independent_prune100_v21.log 2>&1 &
+nohup env SAMPLES=50 POOL_SAMPLES=100 bash scripts/vast_audio_unattended.sh prune \
+  > independent_prune50_v21.log 2>&1 &
 ```
 
 Machine B:
@@ -71,7 +71,7 @@ nohup env SAMPLES=100 bash scripts/vast_audio_unattended.sh boost \
   > independent_boost100_v21.log 2>&1 &
 ```
 
-Machine A runs four standalone pruning variants and paired baseline. Machine B
+Machine A runs four standalone pruning variants on50 questions and paired baseline. Machine B
 runs seven confidence-priority variants and baseline. **Neither launches any
 caching experiment.** `vast_audio_independent.sh all` now means pruning then
 boost only. The optional explicit `cache` mode remains available for future use;
@@ -90,10 +90,22 @@ machine-specific paths. They must match. Each completed run includes
 latency against each family's own baseline; absolute seconds across different
 hardware are not controlled comparisons.
 
-Outputs: `runs/audio_independent_prune100_v21` and
+Outputs: `runs/audio_independent_prune50_v21` and
 `runs/audio_independent_boost100_v21`. All reports preserve original scores and
 add the frozen reference-blind secondary numerical evaluation. No techniques
 are combined. Use a new RUN_PREFIX if changing experiment configuration.
+
+### Different evaluation sizes with a shared pool
+
+Set `POOL_SAMPLES=100 SAMPLES=50` for pruning and `POOL_SAMPLES=100 SAMPLES=100`
+for boosting. Both prepare the exact same100-question manifest; pruning evaluates
+only its first50. Outputs are `audio_independent_prune50_v21` and
+`audio_independent_boost100_v21`. Compare `POOL_FINGERPRINT` between machines;
+it must match. Evaluation `INPUT_FINGERPRINT` differs because one run evaluates
+50 and the other100. Each saved fingerprint records pool/evaluation hashes,
+sizes and evaluated question IDs, allowing the shared50 to be checked directly.
+The pruning runtime estimate for50 is roughly4.4hours on the pilot hardware;
+boosting100 is roughly5.1hours, plus setup/downloads.
 
 Measured20-question v20 pruning and boost runs took about105 and61minutes.
 With full policy sets,100 questions scale to roughly **8.7 and5.1hours**
