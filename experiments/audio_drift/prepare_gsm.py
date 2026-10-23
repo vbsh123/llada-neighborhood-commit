@@ -84,6 +84,7 @@ def main():
     p.add_argument('--exclude-id-files',type=Path,nargs='+',default=[],
                    help='JSON files with source_dataset, source_revision and ids; no old WAVs required')
     p.add_argument("--seed", type=int, default=1729)
+    p.add_argument('--cohort',help='Explicit cohort label for a dedicated held-out evaluation')
     p.add_argument("--min-seconds", type=float, default=0)
     p.add_argument("--max-seconds", type=float, default=30)
     args = p.parse_args()
@@ -138,7 +139,7 @@ def main():
         manifest.append({"id": f"gsm8k-speech-{row['source_index']:05}",
                          "audio": str(path.relative_to(args.out.parent)), "task": "gsm8k_speech",
                          "prompt": PROMPT, "metric": "numeric", "target": row["target"],
-                         "audio_seconds": row["audio_seconds"], "cohort": "fresh" if base else ('validation_v21' if excluded_rows else 'unspecified'),
+                         "audio_seconds": row["audio_seconds"], "cohort": args.cohort or ("fresh" if base else ('validation_v21' if excluded_rows else 'unspecified')),
                          "source_dataset": DATASET,
                          "source_revision": revision, "source_file": row["source_file"],
                          "source_row": row["source_row"]})

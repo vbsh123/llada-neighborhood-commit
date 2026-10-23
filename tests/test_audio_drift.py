@@ -793,6 +793,56 @@ class UpstreamTests(unittest.TestCase):
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_lean_pruning_single_pass_eos_and_reports(self):
+        from types import SimpleNamespace
+        from experiments.audio_drift.run import parser,intervention_specs,write_json,display_text
+        from experiments.audio_drift.lean_pruning import evaluate,warmup
+        from experiments.audio_drift.numeric_answer_report import analyze as numeric_analyze
+        from experiments.audio_drift.lean_report import analyze as lean_analyze
+        from experiments.audio_drift.pruning_report import analyze as prune_analyze
+        from experiments.audio_drift.benchmark import visible_ids
+        self.llm.float()
+        args=parser().parse_args(['--manifest','unused','--out','unused','--progressive-prune','--lean-pruning',
+            '--skip-dense-interventions','--no-drift','--profile-samples','0',
+            '--length','4','--block-length','2','--steps','4','--acoustic-start','1',
+            '--progressive-semantic-start','2','--progressive-interval','1','--progressive-patience','1',
+            '--progressive-threshold','100','--progressive-fraction','.5'])
+        specs=intervention_specs(args)
+        self.assertEqual([s['pruning']['control'] for s in specs],['audio','generic'])
+        tokenizer=SimpleNamespace(eos_token_id=30,all_special_ids=[30,31],decode=lambda ids,**kw:'#### 1')
+        full,_,_=decode(self.llm,self.prepared,4,2,4)
+        baseline,states,events=decode(self.llm,self.prepared,4,2,4,save_states=False,eos_id=30)
+        self.assertEqual(states,[])
+        self.assertEqual(visible_ids(full,self.prepared,30),visible_ids(baseline,self.prepared,30))
+        with tempfile.TemporaryDirectory() as directory,patch.object(torch.cuda,'synchronize'), \
+                patch.object(torch.cuda,'reset_peak_memory_stats'),patch.object(torch.cuda,'max_memory_allocated',return_value=0):
+            root=Path(directory);work=root/'samples/00000';work.mkdir(parents=True)
+            warmup(self.llm,self.prepared,args,tokenizer)
+            from experiments.audio_drift.decode import decode as real_decode
+            with patch('experiments.audio_drift.lean_pruning.decode',wraps=real_decode) as counted:
+                report=evaluate(self.llm,self.prepared,baseline,.1,events,args,tokenizer,
+                    dict(id='lean',target='1',metric='numeric'),work,.01)
+                self.assertEqual(counted.call_count,2)
+                self.assertTrue(all(not c.kwargs['save_states'] and c.kwargs['eos_id']==30 for c in counted.call_args_list))
+            self.assertEqual(report['protocol'],'single-pass-eos-v1')
+            self.assertTrue(all(len(p['seconds'])==1 for p in report['policies']))
+            self.assertEqual(len(report['baseline_seconds']),1)
+            a,g=report['policies']
+            self.assertEqual([s['drop_budget'] for s in a['accounting'][0]['pruning']['selections']],
+                             [s['drop_budget'] for s in g['accounting'][0]['pruning']['selections']])
+            result=dict(id='lean',task='gsm8k_speech',cohort='heldout_v23',target='1',score=dict(metric='numeric',correct=True,
+                prediction='1',reference='1',parse_failed=False),text=display_text(tokenizer,baseline,self.prepared.prompt.shape[1]),
+                benchmark=report,answer_has_no_eos=30 not in visible_ids(baseline,self.prepared,30))
+            write_json(work/'result.json',result)
+            numeric_analyze(root)
+            self.assertEqual(len(prune_analyze(root)),2)
+            rows=lean_analyze(root)
+            self.assertEqual(len(rows),3)
+            self.assertEqual({r['condition'] for r in rows},{'baseline',a['condition'],g['condition']})
+            self.assertTrue(all(r['correct'] for r in rows))
+            self.assertIn('Tokens/sec',(root/'analysis/lean_report.md').read_text())
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_cached_progressive_against_dense_frozen_kv_and_removed_columns(self):
         from contextlib import ExitStack
         from experiments.audio_drift.cache_pruning import CachedProgressivePruning, combined_conditions

@@ -69,6 +69,8 @@ def intervention_specs(args):
         specs += progressive_conditions(args.length,args.block_length,args.steps,args.acoustic_start,
             args.progressive_semantic_start,args.progressive_interval,args.progressive_patience,
             args.progressive_threshold,args.progressive_fraction,args.seed)
+    if getattr(args,'lean_pruning',False):
+        specs=[s for s in specs if s.get('pruning',{}).get('control') in ('audio','generic')]
     factors = getattr(args, 'depth_multipliers', [])
     return with_depth_variants(specs, factors) if factors else specs
 
@@ -271,6 +273,7 @@ def parser():
     p.add_argument('--crossing-interval', type=int, default=8)
     p.add_argument('--crossing-patience', type=int, default=2)
     p.add_argument('--progressive-prune', action='store_true')
+    p.add_argument('--lean-pruning',action='store_true',help='Baseline/audio/generic, one timed EOS decode each')
     p.add_argument('--cache-progressive-prune', action='store_true')
     p.add_argument('--progressive-semantic-start',type=int,default=44)
     p.add_argument('--progressive-interval',type=int,default=8)
@@ -355,6 +358,12 @@ def main():
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
+    if args.lean_pruning and (not args.progressive_prune or args.cache_progressive_prune
+            or not args.skip_dense_interventions or not args.no_drift or args.benchmark_samples
+            or args.replay_samples or args.profile_samples or args.diagnostic_samples or args.pairwise_count
+            or args.sensitivity_samples or args.priority_samples or args.pruning_profile_samples or args.refresh_profile_samples
+            or args.benchmark_conditions or args.benchmark_stopping!='eos' or len(specifications)!=2):
+        raise ValueError('Lean pruning requires only progressive audio/generic, no extra benchmarks/diagnostics')
     if (min(args.sensitivity_samples,args.priority_samples)<0 or
             (args.samples is not None and max(args.sensitivity_samples,args.priority_samples)>args.samples)):
         raise ValueError('Attention study sample counts must fit requested samples')
@@ -409,11 +418,16 @@ def main():
         raise ValueError("Invalid attention/refresh diagnostic settings")
     if args.refresh_profile_samples and args.depth_multipliers:
         raise ValueError("Per-forward phase profiling currently requires flat refresh schedules")
-    if args.skip_dense_interventions and not args.benchmark_samples:
+    if args.skip_dense_interventions and not (args.benchmark_samples or args.lean_pruning):
         raise ValueError("--skip-dense-interventions requires --benchmark-samples > 0")
     estimate = work_estimate(args.steps, args.branch_fractions,
                              [] if args.skip_dense_interventions else specifications)
+    if args.lean_pruning:
+        estimate['single_pass_policy_max_forwards']=2*args.steps
+        estimate['note']='Baseline and two policies stop at safe EOS; excludes process-wide warmup and first-sample official verification.'
     print("Work per example:", json.dumps(estimate), flush=True)
+    if args.lean_pruning:
+        print('Lean evaluation: three single-pass EOS generations per example; one process-wide warmup; no replay.',flush=True)
     if args.diagnostic_samples or args.refresh_profile_samples:
         print(f"Additional diagnostics: attention replay on first {args.diagnostic_samples} samples; "
               f"per-forward refresh profiling on first {args.refresh_profile_samples}, "
@@ -450,7 +464,7 @@ def main():
         fingerprint.update(path.read_bytes())
     config = {"settings": settings, "resolved_revisions": revisions, "source_sha256": fingerprint.hexdigest(),
               "upstream_commit": COMMIT, "inputs": rows, "torch": torch.__version__,
-              "python": platform.python_version(), "protocol": "audio-drift-v2",
+              "python": platform.python_version(), "protocol": "audio-prune-single-pass-v23" if args.lean_pruning else "audio-drift-v2",
               "packages": {name: importlib.metadata.version(name) for name in
                            ("transformers", "peft", "numpy", "datasets", "huggingface-hub", "torchaudio")}}
     args.out.mkdir(parents=True, exist_ok=True)
@@ -480,6 +494,7 @@ def main():
                "vram_bytes": torch.cuda.get_device_properties(0).total_memory})
     from src.origin_generate import generate as upstream_generate
     from types import SimpleNamespace
+    warmed_up=False
     for index, row in enumerate(rows):
         destination = args.out / "samples" / f"{index:05d}"
         if (destination / "result.json").exists():
@@ -497,6 +512,10 @@ def main():
         prepared = prepare(model, tokenizer, extractor, audio, row["prompt"], args.length)
         torch.cuda.synchronize()
         preparation_seconds = time.perf_counter() - preparation_began
+        if args.lean_pruning and not warmed_up:
+            from .lean_pruning import warmup
+            warmup(llm,prepared,args,tokenizer)
+            warmed_up=True
         pairwise = None
         if args.pairwise_count:
             from .pairwise import PairwiseRecorder
@@ -516,7 +535,9 @@ def main():
             with (AttentionProbe(llm, prepared.audio_positions, recorder, layers)
                   if recorder is not None else nullcontext()):
                 final, states, events = decode(llm, prepared, args.length, args.block_length,
-                                               args.steps, recorder, layers, progress_every=args.progress_every)
+                                               args.steps, recorder, layers, progress_every=args.progress_every,
+                                               save_states=not args.lean_pruning,
+                                               eos_id=tokenizer.eos_token_id if args.lean_pruning else None)
         finally:
             if recorder is not None:
                 recorder.close()
@@ -529,7 +550,11 @@ def main():
                         prepared.prompt, prepared.prompt.new_tensor([prepared.insertion]), prepared.speech,
                         steps=args.steps, gen_length=args.length, block_length=args.block_length,
                         temperature=0., cfg_scale=0., mask_id=prepared.mask_id)
-            verified = torch.equal(final, official)
+            if args.lean_pruning:
+                from .benchmark import visible_ids
+                verified = visible_ids(final,prepared,tokenizer.eos_token_id)==visible_ids(official,prepared,tokenizer.eos_token_id)
+            else:
+                verified = torch.equal(final, official)
             if not verified:
                 raise RuntimeError("Baseline output differs from the official decoder; stopping")
             del official
@@ -563,9 +588,13 @@ def main():
                   "baseline_content_revealed_step": content_revealed_step,
                   "score": baseline_score,
                   "verified_against_upstream": verified, "forwards": len(events),
+                  "upstream_verification_scope": 'visible_through_eos' if args.lean_pruning else 'full_answer_canvas',
                   "instrumented_seconds": elapsed, "peak_allocated_bytes": peak_memory,
                   "interventions": []}
         write_json(work / "baseline.json", result)
+        if args.lean_pruning:
+            from .lean_pruning import evaluate
+            result['benchmark']=evaluate(llm,prepared,final,elapsed,events,args,tokenizer,row,work,preparation_seconds)
         if index < max(args.sensitivity_samples,args.priority_samples):
             import numpy as np
             np.savez_compressed(work/'baseline_token_states.npz',states=torch.stack(states).numpy())
