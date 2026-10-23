@@ -1,8 +1,8 @@
 # Larger independent evaluation, before combining methods
 
-`scripts/vast_audio_independent.sh` runs **standalone** cache, progressive pruning,
+`scripts/vast_audio_independent.sh` runs **standalone** progressive pruning
 and confidence-priority experiments on the same fixed, new question pool. It
-never combines these techniques. Default **50 new questions**, seed20261023;
+never combines these techniques. Default **100 new questions**, seed20261023;
 `SAMPLES` overrides the pool size. Preparation excludes the30 IDs frozen in
 `development_gsm_ids_v20.json`, covering the earlier audio development pool.
 Old manifests or WAV files need not be copied to a new machine. Dataset revision
@@ -19,7 +19,6 @@ explicitly exclude the additional previously inspected validation manifest.
 
 All methods retain their v20/v16 settings:
 
-* **cache:** shared32,32/8/32, shared50,50/8/50 (A/P/S). Four policies.
 * **prune:** progressive audio-only, early-text matched substitution, late-text
   matched substitution, and generic matched removal. Four policies. No caching
   or confidence boost. Threshold.5, patience2, quarter of eligible positions per
@@ -30,8 +29,8 @@ All methods retain their v20/v16 settings:
   recompute from eventual validation generation lengths.
 
 Each family has its own paired baseline on the exact same input manifest.
-Cache/prune use synchronized generation timings with two repeats after warmup;
-replay defaults to **two questions**, not the whole50. Boost is an instrumented
+Pruning uses synchronized generation timings with two repeats after warmup;
+replay defaults to **two questions**, not the whole100. Boost is an instrumented
 quality experiment, not a clean latency comparison. Every complete sample is
 saved, so runs can resume using unchanged config/source/inputs.
 
@@ -52,43 +51,55 @@ the extractor version/source hash in `analysis/numeric_secondary_protocol.json`.
 CSV stores extraction type, predictions and original scores. Grader limitations
 remain; ambiguous cases require a uniform audit across all methods.
 
-## Commands
+## Two-machine unattended commands
 
-Existing Vast checkout/environment:
+On each new machine, clone branch `audio-drift-study`; on an existing checkout,
+pull the latest commit. The outer `nohup` covers setup, dataset preparation,
+model downloads, generation and reports, so no later manual launch is required.
+
+Machine A:
 
 ```bash
-cd /workspace/llada-audio-drift
-git pull --ff-only
-SAMPLES=50 bash scripts/vast_audio_independent.sh prepare
-nohup env SAMPLES=50 REFERENCE_DEVICE=cuda VERIFY_SAMPLES=2 \
-  bash scripts/vast_audio_independent.sh cache > independent_cache50_v21.log 2>&1 &
+nohup env SAMPLES=100 bash scripts/vast_audio_unattended.sh prune \
+  > independent_prune100_v21.log 2>&1 &
 ```
 
-Use `prune` or `boost` for separate jobs after the prior job completes. `all`
-runs cache, then prune, then boost sequentially, with no simultaneous GPU jobs.
-Outputs: `runs/audio_independent_cache50_v21`, `..._prune50_v21`,
-`..._boost50_v21`. Change `RUN_PREFIX` if changing an experiment configuration.
+Machine B:
 
-## Two-machine split
+```bash
+nohup env SAMPLES=100 bash scripts/vast_audio_unattended.sh boost \
+  > independent_boost100_v21.log 2>&1 &
+```
 
-Prepare on each machine with the same code, `SAMPLES` and seed. Compare the
-printed **INPUT_FINGERPRINT** values: they cover ordered question IDs, pinned
-revision, exact WAV bytes, prompts and targets, excluding machine-specific paths.
-They must match. Each completed run includes `input_fingerprint.json`.
+Machine A runs four standalone pruning variants and paired baseline. Machine B
+runs seven confidence-priority variants and baseline. **Neither launches any
+caching experiment.** `vast_audio_independent.sh all` now means pruning then
+boost only. The optional explicit `cache` mode remains available for future use;
+the old `cache-boost` queue name is removed to avoid launching the canceled job.
 
-Machine A: `SAMPLES=50 bash scripts/vast_audio_independent.sh prune`.
-Machine B: `SAMPLES=50 bash scripts/vast_audio_independent.sh cache-boost`.
-The latter runs cache then boost sequentially, never together. Prefer the same
-GPU model and software on both. Compare timings against each family's own
-baseline; absolute seconds and cross-family speed rankings across different
+Setup installs/verifies dependencies and the pinned DIFFA checkout, then
+preparation creates the100-question manifest automatically. It excludes the
+bundled30 development IDs without requiring old audio folders. On existing
+complete environments, `vast_audio_independent.sh prune` or `boost` skips setup.
+Both launchers default to100; explicitly setting SAMPLES is recommended.
+
+Compare the printed **INPUT_FINGERPRINT** values: they cover ordered question
+IDs, pinned revision, exact WAV bytes, prompts and targets, excluding
+machine-specific paths. They must match. Each completed run includes
+`input_fingerprint.json`. Prefer the same GPU model/software on both. Compare
+latency against each family's own baseline; absolute seconds across different
 hardware are not controlled comparisons.
 
-The larger suite is substantial: the measured20-question v20 pruning and boost
-runs took about105 and61minutes. With their full policy sets,50 questions would
-scale to roughly4.4 and2.6hours respectively, **plus the separate cache run**;
-actual lengths/activation affect this. Run families independently if desired.
-This helper does not claim a2–3hour budget for all three larger evaluations.
+Outputs: `runs/audio_independent_prune100_v21` and
+`runs/audio_independent_boost100_v21`. All reports preserve original scores and
+add the frozen reference-blind secondary numerical evaluation. No techniques
+are combined. Use a new RUN_PREFIX if changing experiment configuration.
+
+Measured20-question v20 pruning and boost runs took about105 and61minutes.
+With full policy sets,100 questions scale to roughly **8.7 and5.1hours**
+respectively on the same hardware, plus setup/downloads. Actual generation
+lengths and activation change these estimates. Running on two machines reduces
+elapsed time but does not make either individual job shorter.
 
 Validation is independent only until results guide further choices. After
 selecting winners, subsequent tuning requires another new evaluation cohort.
-These runs choose standalone candidates before any combined implementation.

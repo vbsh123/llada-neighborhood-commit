@@ -3,11 +3,11 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mode="${1:-prepare}"
-case "$mode" in prepare|cache|prune|boost|cache-boost|all) ;; *) echo 'Usage: bash scripts/vast_audio_independent.sh [prepare|cache|prune|boost|cache-boost|all]'; exit 2;; esac
+case "$mode" in prepare|cache|prune|boost|all) ;; *) echo 'Usage: bash scripts/vast_audio_independent.sh [prepare|cache|prune|boost|all]'; exit 2;; esac
 audio_venv="${AUDIO_VENV:-$PWD/.venv-audio}"
 [[ -x "$audio_venv/bin/python" ]] || { echo 'Run bash scripts/vast_audio_drift.sh setup first'; exit 2; }
 source "$audio_venv/bin/activate"
-count="${SAMPLES:-50}"
+count="${SAMPLES:-100}"
 seed="${DATA_SEED:-20261023}"
 revision="${DATASET_REVISION:-e94caa2154433a54cd430702666c454977df3083}"
 prefix="${RUN_PREFIX:-audio_independent}"
@@ -63,9 +63,8 @@ run_family() {
   python -m experiments.audio_drift.numeric_answer_report --run "runs/$run"
   cp "${manifest%.*}.fingerprint.json" "runs/$run/input_fingerprint.json"
 }
-if [[ "$mode" == all || "$mode" == cache-boost ]]; then
-  families=(cache prune boost)
-  if [[ "$mode" == cache-boost ]]; then families=(cache boost); fi
+if [[ "$mode" == all ]]; then
+  families=(prune boost)
   for family in "${families[@]}"; do run_family "$family"; done
 else
   run_family "$mode"

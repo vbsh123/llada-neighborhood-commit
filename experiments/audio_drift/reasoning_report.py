@@ -124,16 +124,16 @@ def main():
     (out / "reasoning_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     with (out / "reasoning_pairs.csv").open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
-    lines = ["# Spoken math cache pilot", "",
+    lines = ["# Spoken math decoding evaluation", "",
              "Final numerical answer accuracy normalizes supported literal labels and an optional comma after an explicit final marker. Strict scores remain in per-sample JSON/CSV. Parse failures count as incorrect. Paired baselines use the same examples. Speedup is summed paired baseline median decode time divided by summed policy median decode time. EOS stopping may produce different forward counts; inspect reasoning_pairs.csv. No-EOS flags identify possible output-budget exhaustion.", "",
-             "| Policy | N | Baseline correct | Cache correct | Correct → wrong | Wrong → correct | Parse failures | Decode speedup |",
+             "| Policy | N | Baseline correct | Policy correct | Correct → wrong | Wrong → correct | Parse failures | Decode speedup |",
              "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for name, s in summary.items():
         n = s['samples']
         lines.append(f"| {name} | {n} | {round(s['paired_baseline_accuracy']*n)} | {round(s['accuracy']*n)} | {s['correct_to_wrong']} | {s['wrong_to_correct']} | {s['parse_failures']} | {s['decode_speedup_ratio_of_sums']:.3f}× |")
     for cohort in sorted({r['cohort'] for r in rows} - {'unspecified'}):
         lines += ["", f"## Cohort: {cohort}", "",
-                  "| Policy | N | Baseline correct | Cache correct | Decode speedup |",
+                  "| Policy | N | Baseline correct | Policy correct | Decode speedup |",
                   "|---|---:|---:|---:|---:|"]
         for name, values in summary.items():
             c = values['cohorts'].get(cohort)
