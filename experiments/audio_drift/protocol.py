@@ -102,7 +102,34 @@ def layer_intervals(specification, num_layers):
     return tuple(r for r in grouped for _ in range(width))
 
 
+def refresh_phases(specification):
+    """Validate a flat schedule with frozen, zero-based phase boundaries."""
+    phases=specification.get('refresh_phases')
+    if phases is None:return None
+    if specification.get('refresh_by_layer_group') is not None or not isinstance(phases,list) or not phases:
+        raise ValueError('Phased refreshing requires a nonempty flat phase schedule')
+    starts=[]
+    for phase in phases:
+        if not isinstance(phase,dict):raise ValueError('Each refresh phase must be a mapping')
+        start,interval=phase.get('start'),phase.get('refresh_every')
+        if (not isinstance(start,int) or start<0 or not isinstance(interval,int) or interval<1):
+            raise ValueError('Phases require nonnegative starts and positive refresh intervals')
+        starts.append(start)
+    if starts[0]!=0 or starts!=sorted(set(starts)) or phases[0]['refresh_every']!=specification['refresh_every']:
+        raise ValueError('Phases must start at zero, increase strictly and match the initial interval')
+    return tuple((p['start'],p['refresh_every']) for p in phases)
+
+
+def refresh_due(step,interval,phases=None):
+    if step==0:return True
+    if phases is None:return bool(interval and step%interval==0)
+    start,interval=next(p for p in reversed(phases) if p[0]<=step)
+    # Every phase starts with fresh KV/hidden state; no inherited cache age.
+    return (step-start)%interval==0
+
+
 def is_identity(specification):
     return (not specification.get('pruning') and specification['mode'] == 'freeze' and bool(specification['schedule']) and
             all(all(r == 1 for r in s.get('refresh_by_layer_group', [s['refresh_every']]))
+                and all(p['refresh_every']==1 for p in s.get('refresh_phases',[]))
                 for s in specification['schedule']))

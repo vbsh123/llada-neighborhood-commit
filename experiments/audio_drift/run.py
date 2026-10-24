@@ -38,6 +38,9 @@ def display_text(tokenizer, x, prompt_length):
 
 
 def intervention_specs(args):
+    if getattr(args,'cache_ramp',False):
+        from .cache_ramp import conditions as ramp_conditions
+        return ramp_conditions()
     if getattr(args,'pruning_sweep',False):
         from .pruning_sweep import conditions as sweep_conditions
         return sweep_conditions(args)
@@ -277,6 +280,7 @@ def parser():
     p.add_argument('--crossing-patience', type=int, default=2)
     p.add_argument('--progressive-prune', action='store_true')
     p.add_argument('--lean-pruning',action='store_true',help='Baseline/audio/generic, one timed EOS decode each')
+    p.add_argument('--cache-ramp',action='store_true',help='Semantic/prompt8-to16-to32 refresh ramps with constant controls')
     p.add_argument('--minimal-pruning-records',action='store_true',help='Save pruning decisions without attention arrays or per-forward traces')
     p.add_argument('--pruning-sweep',action='store_true',help='Development: five threshold/fraction pairs, audio/generic each')
     p.add_argument('--cache-progressive-prune', action='store_true')
@@ -364,16 +368,21 @@ def main():
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
+    if args.cache_ramp and (not args.lean_pruning or args.progressive_prune or args.pruning_sweep
+            or args.cache_progressive_prune or args.late_prune or args.staged_prune or args.crossing_prune
+            or args.progressive_layer_start or args.depth_multipliers or args.condition_names
+            or args.interventions or args.triple_refresh or args.mixed_refresh or args.refresh_intervals):
+        raise ValueError('Cache ramp requires a dedicated lean cache-only evaluation')
     if args.progressive_layer_start<0 or (args.progressive_layer_start and (args.cache_progressive_prune or args.pruning_sweep)):
         raise ValueError('Deep progressive pruning requires a separate progressive-only run')
     if args.pruning_sweep and not args.lean_pruning:
         raise ValueError('Pruning sensitivity sweep requires lean single-pass mode')
-    if args.lean_pruning and (not args.progressive_prune or args.cache_progressive_prune
+    if args.lean_pruning and (not (args.progressive_prune or args.cache_ramp) or args.cache_progressive_prune
             or not args.skip_dense_interventions or not args.no_drift or args.benchmark_samples
             or args.replay_samples or args.profile_samples or args.diagnostic_samples or args.pairwise_count
             or args.sensitivity_samples or args.priority_samples or args.pruning_profile_samples or args.refresh_profile_samples
             or args.benchmark_conditions or args.benchmark_stopping!='eos'
-            or len(specifications)!=(10 if args.pruning_sweep else 2)):
+            or len(specifications)!=(7 if args.cache_ramp else (10 if args.pruning_sweep else 2))):
         raise ValueError('Lean pruning requires only progressive audio/generic, no extra benchmarks/diagnostics')
     if (min(args.sensitivity_samples,args.priority_samples)<0 or
             (args.samples is not None and max(args.sensitivity_samples,args.priority_samples)>args.samples)):
@@ -475,7 +484,8 @@ def main():
         fingerprint.update(path.read_bytes())
     config = {"settings": settings, "resolved_revisions": revisions, "source_sha256": fingerprint.hexdigest(),
               "upstream_commit": COMMIT, "inputs": rows, "torch": torch.__version__,
-              "python": platform.python_version(), "protocol": "audio-prune-single-pass-v23" if args.lean_pruning else "audio-drift-v2",
+              "python": platform.python_version(), "protocol": ('audio-cache-ramp-single-pass-v26' if args.cache_ramp else
+                  ('audio-prune-single-pass-v23' if args.lean_pruning else 'audio-drift-v2')),
               "packages": {name: importlib.metadata.version(name) for name in
                            ("transformers", "peft", "numpy", "datasets", "huggingface-hub", "torchaudio")}}
     args.out.mkdir(parents=True, exist_ok=True)

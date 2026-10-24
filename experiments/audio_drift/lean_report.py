@@ -30,9 +30,11 @@ def analyze(run):
                 removed_prompt=sum(v['dropped_by_group']['prompt'] for v in picks)))
     grouped=defaultdict(list)
     for row in rows:grouped[row['condition']].append(row)
-    title='Development pruning sensitivity' if 'development_v24' in cohorts else 'Held-out pruning'
+    title=('Development cache refresh ramps' if 'development_cache_v26' in cohorts else
+           ('Development pruning sensitivity' if 'development_v24' in cohorts else 'Held-out pruning'))
     lines=[f'# {title}: single-pass accuracy and throughput','',
-        'One decode per condition/example after process-wide warmup; baseline first and each audio source precedes its reference-guided generic. '
+        'One decode per condition/example after process-wide warmup; baseline first. Cache-only order is shuffled; '
+        'where present, each audio pruning source precedes its reference-guided generic. '
         'TPS is summed visible answer tokens excluding EOS divided by summed synchronized decode time. '
         'Decode includes pruning observations, selection and commitment; excludes audio preparation/scoring/file writes. '
         'No repeated per-example timing or identical-input replay. Legacy median fields hold one observation. '

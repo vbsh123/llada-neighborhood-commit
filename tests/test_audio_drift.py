@@ -22,6 +22,21 @@ if HAS_TORCH:
 
 
 class InputTests(unittest.TestCase):
+    def test_cache_ramp_phases_matrix_and_identity(self):
+        from experiments.audio_drift.protocol import refresh_due,refresh_phases,is_identity
+        from experiments.audio_drift.cache_ramp import conditions,PROVENANCE
+        phases=refresh_phases(dict(refresh_every=2,refresh_phases=[dict(start=0,refresh_every=2),
+            dict(start=5,refresh_every=3),dict(start=11,refresh_every=4)]))
+        self.assertEqual([i for i in range(16) if refresh_due(i,2,phases)],[0,2,4,5,8,11,15])
+        for bad in [[],[dict(start=1,refresh_every=8)],[dict(start=0,refresh_every=0)],
+                    [dict(start=0,refresh_every=8),dict(start=0,refresh_every=16)],['bad']]:
+            with self.assertRaises(ValueError):refresh_phases(dict(refresh_every=8,refresh_phases=bad))
+        specs=conditions();self.assertEqual(len(specs),7)
+        self.assertEqual({s['ramp_group'] for s in specs if s['ramp_group']},{'semantic','prompt'})
+        self.assertTrue(all(s['schedule'][0]==dict(group='acoustic',refresh_every=16) for s in specs))
+        self.assertEqual(PROVENANCE['baseline_total_forwards']/PROVENANCE['samples'],93.76)
+        self.assertFalse(is_identity(dict(mode='freeze',schedule=[dict(group='prefix',refresh_every=1,
+            refresh_phases=[dict(start=0,refresh_every=1),dict(start=8,refresh_every=2)])])))
     def test_reference_blind_secondary_answer_extraction(self):
         from experiments.audio_drift.numeric_answer_report import extract_answer
         cases={
@@ -791,6 +806,76 @@ class UpstreamTests(unittest.TestCase):
         self.llm.model.transformer.ff_out = output
         self.prepared = Prepared(torch.tensor([[1, 2, 3]]),
                                  torch.randn(1, 2, 16).to(torch.bfloat16), 1, 1, 31)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_cache_ramp_dense_reference_phase_boundaries_and_leans(self):
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        from experiments.audio_drift.cache_ramp import conditions,analyze
+        from experiments.audio_drift.protocol import refresh_due,refresh_phases
+        from experiments.audio_drift.compact import PrefixCache
+        from experiments.audio_drift.decode import forward_logits
+        from experiments.audio_drift.run import parser,write_json
+        from experiments.audio_drift.lean_pruning import evaluate,warmup
+        from experiments.audio_drift.numeric_answer_report import analyze as numeric_analyze
+        from experiments.audio_drift.lean_report import analyze as lean_analyze
+        self.llm.float()
+        inputs=[torch.tensor([[1,2,3,4+i%5,10+(i//3)%4,31,31]]) for i in range(130)]
+        for spec in conditions()[1:3]:
+            with PrefixCache(self.llm,self.prepared,spec['schedule']) as cache:
+                actual=[forward_logits(self.llm,self.prepared,x).clone() for x in inputs]
+                counts=cache.accounting()
+            target=next(i for i,s in enumerate(spec['schedule']) if s.get('refresh_phases'))
+            expected_steps=list(range(0,48,8))+list(range(48,96,16))+list(range(96,130,32))
+            self.assertEqual([e['step'] for e in cache.events if e['layer_refresh'][0][target]],expected_steps)
+            self.assertEqual(counts['refresh_counts_by_schedule_and_layer'][target],[len(expected_steps)]*2)
+            banks={};clock=[0]
+            with ExitStack() as stack:
+                for layer,block in enumerate(cache.blocks):
+                    original=block._scaled_dot_product_attention
+                    def attention(q,k,v,_layer=layer,_original=original,**kw):
+                        inactive=sorted({p for s in spec['schedule']
+                            if not refresh_due(clock[0],s['refresh_every'],refresh_phases(s))
+                            for p in self.prepared.group_positions(s['group'])})
+                        k=k.clone();v=v.clone()
+                        if inactive:
+                            ids=torch.tensor(inactive);k.index_copy_(-2,ids,banks[_layer][0].index_select(-2,ids))
+                            v.index_copy_(-2,ids,banks[_layer][1].index_select(-2,ids))
+                        banks[_layer]=[k.clone(),v.clone(),banks.get(_layer,[None,None,None])[2]]
+                        return _original(q,k,v,**kw)
+                    block._scaled_dot_product_attention=attention
+                    stack.callback(delattr,block,'_scaled_dot_product_attention')
+                    def hidden(module,args,output,_layer=layer):
+                        h=output[0].clone()
+                        inactive=sorted({p for s in spec['schedule']
+                            if not refresh_due(clock[0],s['refresh_every'],refresh_phases(s))
+                            for p in self.prepared.group_positions(s['group'])})
+                        if inactive:
+                            ids=torch.tensor(inactive);h.index_copy_(1,ids,banks[_layer][2].index_select(1,ids))
+                        banks[_layer][2]=h.clone();return h,None
+                    handle=block.register_forward_hook(hidden);stack.callback(handle.remove)
+                for i,x in enumerate(inputs):
+                    clock[0]=i
+                    torch.testing.assert_close(actual[i],forward_logits(self.llm,self.prepared,x),rtol=2e-5,atol=2e-6)
+        args=parser().parse_args(['--manifest','unused','--out','unused','--cache-ramp','--lean-pruning',
+            '--minimal-pruning-records','--shuffle-policy-order','--skip-dense-interventions','--no-drift',
+            '--profile-samples','0','--length','4','--block-length','2','--steps','4'])
+        baseline,_,events=decode(self.llm,self.prepared,4,2,4,save_states=False,eos_id=30)
+        tokenizer=SimpleNamespace(eos_token_id=30,all_special_ids=[30,31],decode=lambda ids,**kw:'#### 1')
+        with tempfile.TemporaryDirectory() as directory,patch.object(torch.cuda,'synchronize'), \
+                patch.object(torch.cuda,'reset_peak_memory_stats'),patch.object(torch.cuda,'max_memory_allocated',return_value=0):
+            root=Path(directory);work=root/'samples/00000';work.mkdir(parents=True)
+            from experiments.audio_drift.decode import decode as real_decode
+            with patch('experiments.audio_drift.lean_pruning.decode',wraps=real_decode) as counted:
+                warmup(self.llm,self.prepared,args,tokenizer);self.assertEqual(counted.call_count,2);counted.reset_mock()
+                report=evaluate(self.llm,self.prepared,baseline,.1,events,args,tokenizer,dict(id='cache-ramp',target='1',metric='numeric'),work,.01)
+                self.assertEqual(counted.call_count,7)
+            self.assertTrue(all(not p.get('pruning') for p in report['policies']))
+            self.assertFalse(list(work.glob('*_steps.json')))
+            write_json(work/'result.json',dict(id='cache-ramp',task='gsm8k_speech',cohort='development_cache_v26',target='1',
+                text='#### 1',score=dict(metric='numeric',correct=True,prediction='1',reference='1',parse_failed=False),benchmark=report))
+            numeric_analyze(root);self.assertEqual(len(lean_analyze(root)),8)
+            self.assertEqual(len(analyze(root)),7)
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_lean_pruning_single_pass_eos_and_reports(self):

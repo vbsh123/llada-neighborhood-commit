@@ -11,7 +11,7 @@ from contextlib import AbstractContextManager
 import torch
 
 from .hooks import blocks_of
-from .protocol import layer_intervals
+from .protocol import layer_intervals,refresh_phases,refresh_due
 from .pruning import LatePruning
 
 
@@ -23,6 +23,7 @@ class PrefixCache(AbstractContextManager):
         self.prepared = prepared
         self.pruning = LatePruning(prepared, len(self.blocks), pruning)
         self.schedules = []
+        self.phases = []
         claimed = set()
         for spec in schedules:
             positions = prepared.group_positions(spec["group"])
@@ -30,6 +31,7 @@ class PrefixCache(AbstractContextManager):
                 raise ValueError("Cache schedules must select nonempty disjoint fixed-prefix groups")
             claimed.update(positions)
             self.schedules.append((positions, layer_intervals(spec, len(self.blocks))))
+            self.phases.append(refresh_phases(spec))
         self.step = -1
         self.patterns = {}
         self.banks = {}
@@ -58,8 +60,8 @@ class PrefixCache(AbstractContextManager):
                                             "layer_computed_rows": [], "layer_refresh": [], "layer_kv_columns": []})
                     # Each layer has its own clock and banks. Flat schedules
                     # expand to identical intervals at every layer.
-                    due = tuple(self.step == 0 or bool(intervals[_layer] and
-                                self.step % intervals[_layer] == 0) for _, intervals in self.schedules)
+                    due = tuple(refresh_due(self.step,intervals[_layer],phases)
+                                for (_,intervals),phases in zip(self.schedules,self.phases))
                     removed = self.pruning.dropped.get(_layer, ())
                     key = (x.shape[1], x.device, due, removed)
                     if key not in self.patterns:
@@ -149,7 +151,7 @@ class PrefixCache(AbstractContextManager):
             raise RuntimeError("Incomplete transformer forwards in cache accounting")
         full = sum(e["total_rows"] * len(self.blocks) for e in self.events)
         used = sum(sum(e['layer_computed_rows']) for e in self.events)
-        return {"forwards": len(self.events), "computed_token_layers": used,
+        result = {"forwards": len(self.events), "computed_token_layers": used,
                 "dense_token_layers_at_same_forward_count": full,
                 "pruning": self.pruning.accounting(),
                 "kv_columns_by_layer": [sum(e['layer_kv_columns'][i] for e in self.events)
@@ -164,10 +166,18 @@ class PrefixCache(AbstractContextManager):
                 "note": "Counts skipped QKV, attention query/output and MLP rows; not total FLOPs or measured speedup. "
                         "All answer rows remain; KV column counts reflect optional pruning. Embedding, final norm and vocabulary "
                         "head still process the full sequence, equally in baseline and cached runs."}
+        if any(p is not None for p in self.phases):
+            result['refresh_phase_schedules']=[list(p) if p is not None else None for p in self.phases]
+        result['refresh_counts_by_schedule_and_layer']=[
+            [sum(e['layer_refresh'][l][i] for e in self.events) for l in range(len(self.blocks))]
+            for i in range(len(self.schedules))]
+        return result
 
 
 def policy_context(llm, prepared, specification):
     plan = specification.get('pruning')
+    if plan and any(s.get('refresh_phases') for s in specification['schedule']):
+        raise ValueError('Phased cache schedules are evaluated without pruning')
     if plan and plan.get('engine') == 'compact_staged':
         if plan.get('temporal_cache'):
             from .cache_pruning import CachedProgressivePruning

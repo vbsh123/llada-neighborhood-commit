@@ -17,7 +17,9 @@ def warmup(llm,prepared,args,tokenizer):
         # Warm the shared implementation once, not all ten configurations.
         source=next(s for s in specs if s['pruning']['control']=='audio')
         specs=[source,next(s for s in specs if s.get('control_source')==source['condition'])]
-    print(f'One-time warmup: baseline and {len(specs)} pruning policies (untimed)',flush=True)
+    if getattr(args,'cache_ramp',False):
+        specs=[next(s for s in specs if s['condition']=='ramp_control_a16_p8_s8')]
+    print(f'One-time warmup: baseline and {len(specs)} policies (untimed)',flush=True)
     final,_,_=decode(llm,prepared,args.length,args.block_length,args.steps,
                      save_states=False,eos_id=tokenizer.eos_token_id)
     del final
@@ -46,7 +48,8 @@ def evaluate(llm,prepared,baseline,baseline_seconds,baseline_events,args,tokeniz
              'No repeated baseline, per-example warmup, replay, or full-canvas state saving. '
              'Includes pruning observations/selection and token commitment. Excludes audio preparation, '
              'scoring, output writes and accounting serialization. Baseline first; each audio source precedes its generic control. '
-             'generic uses audio event times/budgets and ranks its own prefix. No claim of identical-input timing.')
+             'When present, generic uses audio event times/budgets and ranks its own prefix. '
+             'Cache-only conditions use deterministic shuffled timing order. No claim of identical-input timing.')
     for spec in policy_specs(args,row['id']):
         spec=resolve_control(spec,report['policies'])
         print(f"  single-pass {spec['condition']}: starting",flush=True)
@@ -55,11 +58,11 @@ def evaluate(llm,prepared,baseline,baseline_seconds,baseline_events,args,tokeniz
         with policy_context(llm,prepared,spec) as engine:
             final,_,events=decode(llm,prepared,args.length,args.block_length,args.steps,
                 save_states=False,eos_id=tokenizer.eos_token_id,
-                progress_every=args.progress_every,progress_label='pruning')
+                progress_every=args.progress_every,progress_label='policy')
         torch.cuda.synchronize();seconds=time.perf_counter()-began
         peak=torch.cuda.max_memory_allocated()
         accounting=engine.accounting()
-        if getattr(args,'pruning_sweep',False) or getattr(args,'minimal_pruning_records',False):
+        if spec.get('pruning') and (getattr(args,'pruning_sweep',False) or getattr(args,'minimal_pruning_records',False)):
             # The matched control needs check times and removal budgets, not
             # full per-position attention histories. Preserve only decisions.
             account=accounting['pruning']
