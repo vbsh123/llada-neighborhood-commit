@@ -53,6 +53,13 @@ def resolve_progressive_control(spec,source):
 
 
 class ProgressivePruning(CompactStagedPruning):
+    def local_queries(self):
+        return torch.searchsorted(self.monitor_positions,self.query_positions)
+
+    def attention_scores(self, q, k):
+        p=(q.index_select(-2,self.query_local).float()@k.float().transpose(-1,-2)/math.sqrt(q.shape[-1])).softmax(-1)
+        return p.mean((0,1,2))
+
     def __init__(self,llm,prepared,specification):
         super().__init__(llm,prepared,deepcopy(specification))
         self.llm=llm
@@ -110,10 +117,9 @@ class ProgressivePruning(CompactStagedPruning):
                                 raise ValueError('Requires dense bidirectional equal-head attention')
                             if _layer==0 or self.spec['layer_start']:
                                 self.monitor_positions=torch.tensor(self.position_ids,device=q.device,dtype=torch.long)
-                                self.query_local=torch.searchsorted(self.monitor_positions,self.query_positions)
+                                self.query_local=self.local_queries()
                             if len(self.monitor_positions)!=q.shape[-2]:raise RuntimeError('Position map mismatch')
-                            p=(q.index_select(-2,self.query_local).float()@k.float().transpose(-1,-2)/math.sqrt(q.shape[-1])).softmax(-1)
-                            scores=p.mean((0,1,2))
+                            scores=self.attention_scores(q,k)
                             if self.spec['layer_start']:
                                 # Early layers retain all rows; deep layers have
                                 # compact keys. Accumulate in absolute positions.

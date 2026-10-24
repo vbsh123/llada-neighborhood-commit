@@ -34,9 +34,13 @@ class PrefixCache(AbstractContextManager):
             self.phases.append(refresh_phases(spec))
         self.step = -1
         self.patterns = {}
+        self.pattern_ids = {}
         self.banks = {}
         self.events = []
         self.originals = []
+        # Absolute query coordinates for optional structured-attention adapters.
+        self.active_by_layer = {}
+        self.active_ids_by_layer = {}
 
     def __enter__(self):
         try:
@@ -69,7 +73,10 @@ class PrefixCache(AbstractContextManager):
                                     if not refresh for p in positions} | set(removed)
                         selected = [p for p in range(x.shape[1]) if p not in inactive]
                         self.patterns[key] = torch.tensor(selected, dtype=torch.long, device=x.device)
+                        self.pattern_ids[key] = tuple(selected)
                     active = self.patterns[key]
+                    self.active_by_layer[_layer] = active
+                    self.active_ids_by_layer[_layer] = self.pattern_ids[key]
                     event = self.events[-1]
                     if _layer == 0:
                         # Historical fields describe layer zero; aggregate
