@@ -15,6 +15,7 @@ class PrefixCache(AbstractContextManager):
         self.intervals = tuple(intervals)
         self.step, self.length = -1, None
         self.banks, self.patterns, self.originals, self.events = {}, {}, [], []
+        self.pattern_ids, self.active_ids_by_layer = {}, {}
 
     def __enter__(self):
         try:
@@ -38,11 +39,14 @@ class PrefixCache(AbstractContextManager):
                         due=tuple(self.step%r==0 for r in self.intervals)
                         if due not in self.patterns:
                             inactive={p for group,refresh in zip(self.groups,due) if not refresh for p in group}
-                            self.patterns[due]=torch.tensor([p for p in range(self.length) if p not in inactive],
+                            selected=[p for p in range(self.length) if p not in inactive]
+                            self.pattern_ids[due]=tuple(selected)
+                            self.patterns[due]=torch.tensor(selected,
                                                           device=x.device,dtype=torch.long)
                         self.active=self.patterns[due]
                         self.events.append(dict(step=self.step,refresh=due,computed_rows=len(self.active)))
                     active=self.active
+                    self.active_ids_by_layer[_layer]=self.pattern_ids[self.events[-1]['refresh']]
                     if len(active)==self.length:
                         # Preserve the pinned upstream path for full refreshes.
                         attention=_block._scaled_dot_product_attention

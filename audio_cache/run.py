@@ -1,6 +1,7 @@
 """Fixed-prefix cache schedules on the original50; use saved baseline by default."""
 import argparse
-from contextlib import nullcontext
+from contextlib import ExitStack
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -22,11 +23,30 @@ from .scoring import score, canonical_number
 from .storage import write_json
 
 WHISPER_REVISION='06f233fe06e710322aca913c1bc4249a0d71fce1'
-POLICIES={'888':(8,8,8),'16816':(16,8,16),'161616':(16,16,16)}
+POLICIES={'888':(8,8,8),'16816':(16,8,16),'161616':(16,16,16),
+          '323232':(32,32,32),'321632':(32,16,32),'323216':(32,32,16)}
+
+
+def specifications(args):
+    if args.suite=='cache':
+        return [dict(condition='cache_a%d_p%d_s%d'%POLICIES[name],intervals=POLICIES[name]) for name in args.policies]
+    if args.suite=='prune':
+        return [dict(condition='prune_global_'+control,pruning=dict(control=control)) for control in ('audio','generic')]
+    sparse=dict(chunk_size=32,dense_layers=8,layer_group=8,anchor_fractions=[.5,.25,.125],proxy_queries=128,neighbors=1)
+    return [dict(condition='sparse_audio',sparse=sparse),
+            dict(condition='sparse_audio_cache323232',intervals=(32,32,32),sparse=sparse)]
+
+
+def resolve_policy(spec,completed):
+    resolved=deepcopy(spec)
+    if resolved.get('pruning',{}).get('control')=='generic':
+        resolved['pruning']['source']=completed['prune_global_audio']['accounting'][0]['pruning']
+    return resolved
 
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--suite',choices=['cache','prune','sparse'],default='cache')
     p.add_argument('--manifest',type=Path,default=Path('data/development50.jsonl'))
     p.add_argument('--out',type=Path,default=Path('runs/cache161616_50'))
     p.add_argument('--policies',choices=POLICIES,nargs='+',default=['161616'])
@@ -42,18 +62,30 @@ def parser():
 
 
 @torch.no_grad()
-def generation(llm,prepared,tokenizer,args,intervals=None):
+def generation(llm,prepared,tokenizer,args,intervals=None,*,policy=None):
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     start=time.perf_counter()
-    context=PrefixCache(llm,prepared,intervals) if intervals else nullcontext()
-    with context as cache:
+    cache,sparse=None,None
+    with ExitStack() as stack:
+        if policy and policy.get('pruning'):
+            from .pruning import GlobalPruning
+            if intervals:
+                raise ValueError('Pruning is evaluated separately from temporal caching')
+            cache=stack.enter_context(GlobalPruning(llm,prepared,**policy['pruning']))
+        elif intervals:
+            cache=stack.enter_context(PrefixCache(llm,prepared,intervals))
+        if policy and policy.get('sparse'):
+            from .sparse import AudioSparseAttention
+            sparse=stack.enter_context(AudioSparseAttention(llm,prepared,512,cache=cache,**policy['sparse']))
         final,events=decode(llm,prepared,512,32,256,
             eos_id=tokenizer.eos_token_id,progress_every=args.progress_every)
     torch.cuda.synchronize()
     elapsed=time.perf_counter()-start
     peak=torch.cuda.max_memory_allocated()
-    account=cache.accounting() if intervals else dict(forwards=len(events))
+    account=cache.accounting() if cache else dict(forwards=len(events))
+    if sparse:
+        account['sparse']=sparse.accounting()
     ids=final[0,prepared.prompt.shape[1]:].tolist()
     eos=tokenizer.eos_token_id
     visible=ids[:ids.index(eos)] if eos in ids else ids
@@ -77,6 +109,9 @@ def main():
         raise ValueError('Invalid sample/thread/verification/policy settings')
     if args.baseline_mode=='saved' and args.verify_samples:
         raise ValueError('Saved-baseline mode does not run additional uncached verification decodes')
+    if args.reuse_run and args.suite!='cache':
+        raise ValueError('Cross-run reuse is supported only for cache-only experiments')
+    specs=specifications(args)
     verify_checkout(args.diffa_root)
     all_rows=read_manifest(args.manifest)
     rows=all_rows[:args.samples]
@@ -95,7 +130,7 @@ def main():
         if path.suffix in ('.py','.json'):
             source.update(path.name.encode())
             source.update(path.read_bytes())
-    config=dict(protocol='standalone-audio-cache-v29',
+    config=dict(protocol='standalone-audio-inference-v30',specifications=specs,
         settings={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()},
         inputs=rows,development50_sha256=fingerprint(all_rows),source_sha256=source.hexdigest(),
         upstream_commit=COMMIT,torch=torch.__version__,scorer=VERSION,
@@ -104,17 +139,28 @@ def main():
     args.out.mkdir(parents=True,exist_ok=True)
     config_path=args.out/'config.json'
     if config_path.exists():
-        if json.loads(config_path.read_text())!=config:
+        if json.loads(config_path.read_text())!=json.loads(json.dumps(config)):
             raise ValueError('Source/config/inputs changed; use a fresh run name')
     elif any(args.out.iterdir()):
         raise ValueError('Output directory contains files without a config')
     else:
         write_json(config_path,config)
-    print(f'Exact previous {len(rows)} questions; baseline_mode={args.baseline_mode}; policies={args.policies}; one decode each, '
-          'one process warmup. No pruning, sparse attention, drift, boosting or replay.',flush=True)
+    print(f'Suite={args.suite}; exact previous {len(rows)} questions; baseline_mode={args.baseline_mode}; '
+          f'conditions={[s["condition"] for s in specs]}; one decode each, one process warmup. '
+          'No extra diagnostics or replay.',flush=True)
+    if all((args.out/'samples'/f'{index:05d}'/'result.json').exists() for index in range(len(rows))):
+        print(summarize(args.out),flush=True)
+        print(f'Already complete: {args.out}/summary.json',flush=True)
+        return
     model,tokenizer,extractor,load_report=load_model(args.diffa_root,DIFFA_REPO,DIFFA_REVISION,
         LLM_REPO,LLM_REVISION,'openai/whisper-large-v3',WHISPER_REVISION)
     llm=model.llm_model
+    def execute(spec,completed):
+        resolved=resolve_policy(spec,completed)
+        intervals=resolved.get('intervals')
+        if resolved.get('pruning') or resolved.get('sparse'):
+            return generation(llm,prepared,tokenizer,args,intervals,policy=resolved)
+        return generation(llm,prepared,tokenizer,args,intervals)
     write_json(args.out/'load_report.json',load_report)
     write_json(args.out/'device.json',dict(name=torch.cuda.get_device_name(),
         vram_bytes=torch.cuda.get_device_properties(0).total_memory))
@@ -164,11 +210,13 @@ def main():
         audio,duration=load_audio(row['audio'])
         prepared=prepare(model,tokenizer,extractor,audio,row['prompt'],512)
         if not warmed:
-            print('One process warmup: requested cache policies'+(' and baseline.' if args.baseline_mode=='fresh' else ' only.'),flush=True)
+            print('One process warmup: requested conditions'+(' and baseline.' if args.baseline_mode=='fresh' else ' only.'),flush=True)
             if args.baseline_mode=='fresh':
                 generation(llm,prepared,tokenizer,args)
-            for name in args.policies:
-                generation(llm,prepared,tokenizer,args,POLICIES[name])
+            completed={}
+            for spec in specs:
+                _,measurement=execute(spec,completed)
+                completed[spec['condition']]=measurement
             warmed=True
         if args.baseline_mode=='fresh':
             final,baseline=generation(llm,prepared,tokenizer,args)
@@ -191,16 +239,20 @@ def main():
         result=dict(id=row['id'],prompt=row['prompt'],target=row['target'],cohort='development50',
             audio_seconds=duration,group_tokens={g:len(prepared.group_positions(g)) for g in ('acoustic','prompt','semantic')},
             verified_against_upstream=verified,baseline=baseline,policies=[])
-        order=list(args.policies)
-        random.Random(f'{args.seed}:{row["id"]}').shuffle(order)
-        for name in order:
-            intervals=POLICIES[name]
-            label='cache_a%d_p%d_s%d'%intervals
+        order=list(specs)
+        if args.suite!='prune':
+            random.Random(f'{args.seed}:{row["id"]}').shuffle(order)
+        completed={}
+        for spec in order:
+            label=spec['condition']
             print(f'  {label}: starting',flush=True)
-            final,measurement=generation(llm,prepared,tokenizer,args,intervals)
+            final,measurement=execute(spec,completed)
             del final
             measurement=grade(measurement,label,row['target'])
-            measurement['intervals_acoustic_prompt_semantic']=intervals
+            if spec.get('intervals'):
+                measurement['intervals_acoustic_prompt_semantic']=spec['intervals']
+            measurement['specification']=spec
+            completed[label]=measurement
             result['policies'].append(measurement)
             write_json(work/'partial.json',result)
             print(f'    {measurement["seconds"]:.2f}s; {measurement["accounting"][0]["forwards"]} forwards; '

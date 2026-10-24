@@ -21,7 +21,8 @@ def summarize(out):
         'Frozen secondary final-answer accuracy; original scores retained. One synchronized EOS decode per '
         'condition/example after process warmup. TPS counts visible answer tokens excluding EOS. '
         'All examples stay included. Decoding remains 512 answer slots, block32, maximum256 forwards. '
-        'No drift recording or replay. Cache initialization and row gathers/scatters are included in timing. '
+        'No drift recording or replay. Cache initialization, pruning observations/selection, sparse anchor search '
+        'and row gathers/scatters are included when applicable. '
         'When baseline timing is historical, its TPS is archival: accuracy comparisons use those saved outputs, '
         'and same-run TPS changes/decode speedups are N/A. No uncached baseline is generated in saved mode.', '',
         '| Policy | N | Correct | Accuracy | Δ baseline (pp) | TPS | Timing source | Δ TPS | Decode speedup | Wins / losses |',

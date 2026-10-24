@@ -93,7 +93,7 @@ class ModelTests(unittest.TestCase):
     @torch.no_grad()
     def check_dense_reference(self,dtype):
         from copy import deepcopy
-        for intervals in ((1,1,1),(8,8,8),(16,8,16),(16,16,16)):
+        for intervals in ((1,1,1),(8,8,8),(16,8,16),(16,16,16),(32,32,32),(32,16,32),(32,32,16)):
             tested=deepcopy(self.llm).to(dtype)
             reference=deepcopy(self.llm).to(dtype)
             banks={}
