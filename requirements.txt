@@ -1,0 +1,12 @@
+# Torch/torchaudio are installed together by scripts/run.sh.
+numpy==1.26.4
+transformers==4.49.0
+accelerate==1.4.0
+huggingface-hub==0.29.3
+pyarrow==19.0.1
+einops==0.8.1
+sentencepiece==0.2.0
+peft==0.14.0
+soundfile==0.13.1
+librosa==0.11.0
+loguru==0.7.3
