@@ -1,4 +1,4 @@
-"""Baseline and fixed-prefix cache schedules on the original50 spoken questions."""
+"""Fixed-prefix cache schedules on the original50; use saved baseline by default."""
 import argparse
 from contextlib import nullcontext
 import hashlib
@@ -30,9 +30,11 @@ def parser():
     p.add_argument('--manifest',type=Path,default=Path('data/development50.jsonl'))
     p.add_argument('--out',type=Path,default=Path('runs/cache161616_50'))
     p.add_argument('--policies',choices=POLICIES,nargs='+',default=['161616'])
+    p.add_argument('--baseline-mode',choices=['saved','fresh'],default='saved')
+    p.add_argument('--reuse-run',type=Path,help='Reuse completed, matching cache results from an interrupted v28 run')
     p.add_argument('--samples',type=int,default=50)
     p.add_argument('--diffa-root',type=Path,default=DEFAULT_ROOT)
-    p.add_argument('--verify-samples',type=int,default=2)
+    p.add_argument('--verify-samples',type=int,default=0)
     p.add_argument('--progress-every',type=int,default=32)
     p.add_argument('--cpu-threads',type=int,default=4)
     p.add_argument('--seed',type=int,default=1729)
@@ -73,9 +75,14 @@ def main():
     if (not 1<=args.samples<=50 or args.cpu_threads<1 or min(args.verify_samples,args.progress_every)<0
             or len(set(args.policies))!=len(args.policies)):
         raise ValueError('Invalid sample/thread/verification/policy settings')
+    if args.baseline_mode=='saved' and args.verify_samples:
+        raise ValueError('Saved-baseline mode does not run additional uncached verification decodes')
     verify_checkout(args.diffa_root)
     all_rows=read_manifest(args.manifest)
     rows=all_rows[:args.samples]
+    saved=json.loads(Path(__file__).with_name('saved_baselines.json').read_text())
+    if saved['development50_sha256']!=fingerprint(all_rows) or set(saved['measurements'])!={r['id'] for r in all_rows}:
+        raise ValueError('Saved baselines do not match this cohort')
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError('Run on a BF16-capable CUDA GPU')
     torch.set_num_threads(args.cpu_threads)
@@ -88,7 +95,7 @@ def main():
         if path.suffix in ('.py','.json'):
             source.update(path.name.encode())
             source.update(path.read_bytes())
-    config=dict(protocol='standalone-audio-cache-v28',
+    config=dict(protocol='standalone-audio-cache-v29',
         settings={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()},
         inputs=rows,development50_sha256=fingerprint(all_rows),source_sha256=source.hexdigest(),
         upstream_commit=COMMIT,torch=torch.__version__,scorer=VERSION,
@@ -103,7 +110,7 @@ def main():
         raise ValueError('Output directory contains files without a config')
     else:
         write_json(config_path,config)
-    print(f'Exact previous {len(rows)} questions; baseline + {args.policies}; one decode each, '
+    print(f'Exact previous {len(rows)} questions; baseline_mode={args.baseline_mode}; policies={args.policies}; one decode each, '
           'one process warmup. No pruning, sparse attention, drift, boosting or replay.',flush=True)
     model,tokenizer,extractor,load_report=load_model(args.diffa_root,DIFFA_REPO,DIFFA_REVISION,
         LLM_REPO,LLM_REVISION,'openai/whisper-large-v3',WHISPER_REVISION)
@@ -114,6 +121,35 @@ def main():
     from src.origin_generate import generate as upstream_generate
     samples=args.out/'samples'
     samples.mkdir(exist_ok=True)
+    if args.reuse_run:
+        if args.reuse_run.resolve()==args.out.resolve():
+            raise ValueError('Use a new output directory when reusing an interrupted run')
+        previous=json.loads((args.reuse_run/'config.json').read_text())
+        if (previous['development50_sha256']!=config['development50_sha256']
+                or previous['model_revisions']!=config['model_revisions'] or previous['decoder']!=config['decoder']
+                or previous['settings']['seed']!=args.seed or previous['torch']!=config['torch']):
+            raise ValueError('Previous run model/input/decoder/seed/environment mismatch')
+        requested={'cache_a%d_p%d_s%d'%POLICIES[name] for name in args.policies}
+        for index,row in enumerate(rows):
+            target=samples/f'{index:05d}'
+            if (target/'result.json').exists():
+                continue
+            source=args.reuse_run/'samples'/f'{index:05d}'/'result.json'
+            if not source.exists():
+                continue
+            result=json.loads(source.read_text())
+            if (result['id'],result['prompt'],result['target'])!=(row['id'],row['prompt'],row['target']):
+                raise ValueError('Previous sample identity mismatch')
+            policies=[p for p in result['policies'] if p['condition'] in requested]
+            if {p['condition'] for p in policies}!=requested:
+                continue
+            if args.baseline_mode=='saved':
+                result['baseline']=grade(saved['measurements'][row['id']],'baseline',row['target'])
+            result['policies']=policies
+            result['reused_from']=str(source.resolve())
+            target.mkdir()
+            write_json(target/'result.json',result)
+            print(f'Reused completed cache result: {row["id"]}',flush=True)
     warmed=False
     for index,row in enumerate(rows):
         destination=samples/f'{index:05d}'
@@ -128,12 +164,17 @@ def main():
         audio,duration=load_audio(row['audio'])
         prepared=prepare(model,tokenizer,extractor,audio,row['prompt'],512)
         if not warmed:
-            print('One process warmup: baseline and requested cache policies.',flush=True)
-            generation(llm,prepared,tokenizer,args)
+            print('One process warmup: requested cache policies'+(' and baseline.' if args.baseline_mode=='fresh' else ' only.'),flush=True)
+            if args.baseline_mode=='fresh':
+                generation(llm,prepared,tokenizer,args)
             for name in args.policies:
                 generation(llm,prepared,tokenizer,args,POLICIES[name])
             warmed=True
-        final,baseline=generation(llm,prepared,tokenizer,args)
+        if args.baseline_mode=='fresh':
+            final,baseline=generation(llm,prepared,tokenizer,args)
+            del final
+        else:
+            baseline=saved['measurements'][row['id']]
         verified=None
         if index<args.verify_samples:
             official=upstream_generate(SimpleNamespace(llm_model=llm,device=llm.device),prepared.prompt,
@@ -145,10 +186,8 @@ def main():
             if not verified:
                 raise RuntimeError('Baseline differs from pinned official decoder')
             del official
-        del final
         baseline=grade(baseline,'baseline',row['target'])
-        print(f'  baseline: {baseline["seconds"]:.2f}s; {baseline["accounting"][0]["forwards"]} forwards; '
-              f'correct={baseline["secondary_correct"]}; official_match={verified}',flush=True)
+        print(f'  baseline ({args.baseline_mode}): correct={baseline["secondary_correct"]}; official_match={verified}',flush=True)
         result=dict(id=row['id'],prompt=row['prompt'],target=row['target'],cohort='development50',
             audio_seconds=duration,group_tokens={g:len(prepared.group_positions(g)) for g in ('acoustic','prompt','semantic')},
             verified_against_upstream=verified,baseline=baseline,policies=[])

@@ -195,13 +195,26 @@ class ModelTests(unittest.TestCase):
                   '--verify-samples','0','--diffa-root',os.environ['DIFFA_ROOT']]
             with patch.object(sys,'argv',argv):
                 run.main()
-            self.assertEqual(seen,[None,(16,16,16),None,(16,16,16)])
+            self.assertEqual(seen,[(16,16,16),(16,16,16)])
             result=json.loads((out/'samples'/'00000'/'result.json').read_text())
             self.assertEqual([p['condition'] for p in result['policies']],['cache_a16_p16_s16'])
             self.assertEqual(result['id'],rows[0]['id'])
             with patch.object(sys,'argv',argv):
                 run.main()
-            self.assertEqual(len(seen),4)
+            self.assertEqual(len(seen),2)
+            self.assertTrue(result['baseline']['historical_timing'])
+            summary=json.loads((out/'summary.json').read_text())
+            self.assertIsNone(summary['cache_a16_p16_s16']['decode_speedup'])
+            reused=Path(directory)/'reused'
+            reuse_argv=[*argv]
+            reuse_argv[reuse_argv.index('--out')+1]=str(reused)
+            reuse_argv+=['--reuse-run',str(out)]
+            with patch.object(sys,'argv',reuse_argv):
+                run.main()
+            self.assertEqual(len(seen),2)
+            reused_result=json.loads((reused/'samples'/'00000'/'result.json').read_text())
+            self.assertEqual(reused_result['policies'],result['policies'])
+            self.assertIn('reused_from',reused_result)
 
 
 if __name__=='__main__':

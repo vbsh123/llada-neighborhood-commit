@@ -13,7 +13,7 @@ def summarize(out):
             rows.append(dict(id=sample['id'], condition=policy['condition'], correct=policy['secondary_correct'],
                 original_correct=policy['score']['correct'], parse_failed=policy['secondary_parse_failed'],
                 seconds=policy['seconds'], tokens=policy['visible_answer_tokens'],
-                forwards=policy['accounting'][0]['forwards']))
+                forwards=policy['accounting'][0]['forwards'],historical_timing=policy.get('historical_timing',False)))
     if not rows:
         return
     base = {r['id']:r for r in rows if r['condition']=='baseline'}
@@ -21,9 +21,11 @@ def summarize(out):
         'Frozen secondary final-answer accuracy; original scores retained. One synchronized EOS decode per '
         'condition/example after process warmup. TPS counts visible answer tokens excluding EOS. '
         'All examples stay included. Decoding remains 512 answer slots, block32, maximum256 forwards. '
-        'No drift recording or replay. Cache initialization and row gathers/scatters are included in timing.', '',
-        '| Policy | N | Correct | Accuracy | Δ baseline (pp) | TPS | Δ TPS | Decode speedup | Wins / losses |',
-        '|---|---:|---:|---:|---:|---:|---:|---:|---:|']
+        'No drift recording or replay. Cache initialization and row gathers/scatters are included in timing. '
+        'When baseline timing is historical, its TPS is archival: accuracy comparisons use those saved outputs, '
+        'and same-run TPS changes/decode speedups are N/A. No uncached baseline is generated in saved mode.', '',
+        '| Policy | N | Correct | Accuracy | Δ baseline (pp) | TPS | Timing source | Δ TPS | Decode speedup | Wins / losses |',
+        '|---|---:|---:|---:|---:|---:|---|---:|---:|---:|']
     summary = {}
     for name in sorted({r['condition'] for r in rows}, key=lambda n:(n!='baseline',n)):
         selected = [r for r in rows if r['condition']==name]
@@ -37,13 +39,17 @@ def summarize(out):
         delta = 100*(correct-sum(r['correct'] for r in paired))/n
         wins = sum(r['correct'] and not b['correct'] for r,b in zip(selected,paired))
         losses = sum(b['correct'] and not r['correct'] for r,b in zip(selected,paired))
-        tps_change = 100*(tps/base_tps-1) if base_tps else None
+        comparable=not any(r['historical_timing'] for r in selected+paired)
+        tps_change = 100*(tps/base_tps-1) if base_tps and comparable else None
         tps_label = f'{tps_change:+.1f}%' if tps_change is not None else 'N/A'
+        speedup=base_seconds/seconds if comparable else None
+        speed_label=f'{speedup:.3f}×' if speedup is not None else 'N/A'
+        timing_source='historical' if any(r['historical_timing'] for r in selected) else 'current'
         summary[name] = dict(samples=n, correct=correct, accuracy=correct/n, accuracy_delta_pp=delta,
-            tps=tps, tps_change_percent=tps_change, decode_speedup=base_seconds/seconds,
+            tps=tps,timing_source=timing_source,tps_change_percent=tps_change, decode_speedup=speedup,
             wins=wins, losses=losses, parse_failures=sum(r['parse_failed'] for r in selected))
         lines.append(f'| {name} | {n} | {correct} | {100*correct/n:.1f}% | {delta:+.1f} | '
-                     f'{tps:.2f} | {tps_label} | {base_seconds/seconds:.3f}× | {wins} / {losses} |')
+                     f'{tps:.2f} | {timing_source} | {tps_label} | {speed_label} | {wins} / {losses} |')
     analysis = out/'analysis'
     analysis.mkdir(exist_ok=True)
     (analysis/'report.md').write_text('\n'.join(lines)+'\n')

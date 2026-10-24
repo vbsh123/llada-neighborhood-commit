@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Default: baseline +16/16/16, exact original50. One job, one GPU.
+# Default: only16/16/16, saved baseline, exact original50. One job, one GPU.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 audio_venv="${AUDIO_VENV:-$PWD/.venv}"
@@ -17,8 +17,10 @@ diffa_checkout="${DIFFA_ROOT:-$PWD/external/DIFFA}"
 python -m audio_cache.checkout --diffa-root "$diffa_checkout"
 manifest="${MANIFEST:-$PWD/data/development50.jsonl}"
 python -m audio_cache.data --out "$manifest"
-run="${RUN_NAME:-cache161616_50_v28}"
+run="${RUN_NAME:-cache161616_only50_v29}"
 [[ "$run" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid RUN_NAME'; exit 2; }
+extra=()
+if [[ -n "${REUSE_RUN:-}" ]]; then extra+=(--reuse-run "$REUSE_RUN"); fi
 python -u -m audio_cache.run --manifest "$manifest" --out "runs/$run" \
   --policies 161616 --samples 50 --diffa-root "$diffa_checkout" \
-  --verify-samples "${VERIFY_SAMPLES:-2}" --progress-every 32
+  --baseline-mode saved --verify-samples 0 --progress-every 32 "${extra[@]}"
