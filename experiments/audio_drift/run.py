@@ -71,7 +71,7 @@ def intervention_specs(args):
         from .progressive_pruning import progressive_conditions
         specs += progressive_conditions(args.length,args.block_length,args.steps,args.acoustic_start,
             args.progressive_semantic_start,args.progressive_interval,args.progressive_patience,
-            args.progressive_threshold,args.progressive_fraction,args.seed)
+            args.progressive_threshold,args.progressive_fraction,args.seed,getattr(args,'progressive_layer_start',0))
     if getattr(args,'lean_pruning',False):
         specs=[s for s in specs if s.get('pruning',{}).get('control') in ('audio','generic')]
     factors = getattr(args, 'depth_multipliers', [])
@@ -277,6 +277,7 @@ def parser():
     p.add_argument('--crossing-patience', type=int, default=2)
     p.add_argument('--progressive-prune', action='store_true')
     p.add_argument('--lean-pruning',action='store_true',help='Baseline/audio/generic, one timed EOS decode each')
+    p.add_argument('--minimal-pruning-records',action='store_true',help='Save pruning decisions without attention arrays or per-forward traces')
     p.add_argument('--pruning-sweep',action='store_true',help='Development: five threshold/fraction pairs, audio/generic each')
     p.add_argument('--cache-progressive-prune', action='store_true')
     p.add_argument('--progressive-semantic-start',type=int,default=44)
@@ -284,6 +285,7 @@ def parser():
     p.add_argument('--progressive-patience',type=int,default=2)
     p.add_argument('--progressive-threshold',type=float,default=.5)
     p.add_argument('--progressive-fraction',type=float,default=.25)
+    p.add_argument('--progressive-layer-start',type=int,default=0,help='First block that removes rows; earlier blocks retain all tokens')
     p.add_argument('--sensitivity-samples', type=int, default=0)
     p.add_argument('--sensitivity-fractions', type=float, nargs='+', default=[.25,.5,.75])
     p.add_argument('--sensitivity-budgets', type=int, nargs='+', default=[8,16,32])
@@ -362,6 +364,8 @@ def main():
     torch.set_num_threads(args.cpu_threads)
     schedule(args.length, args.block_length, args.steps)
     specifications = intervention_specs(args)
+    if args.progressive_layer_start<0 or (args.progressive_layer_start and (args.cache_progressive_prune or args.pruning_sweep)):
+        raise ValueError('Deep progressive pruning requires a separate progressive-only run')
     if args.pruning_sweep and not args.lean_pruning:
         raise ValueError('Pruning sensitivity sweep requires lean single-pass mode')
     if args.lean_pruning and (not args.progressive_prune or args.cache_progressive_prune
@@ -580,7 +584,7 @@ def main():
                 break
         baseline_score = score(text, row.get("target"), row.get("metric", "none"))
         print(f"  baseline: official_match={verified}; score={baseline_score}; text={text!r}", flush=True)
-        if not args.pruning_sweep:
+        if not (args.pruning_sweep or args.minimal_pruning_records):
             write_json(work / "steps.json", events)
         result = {"id": row["id"], "task": row["task"], "prompt": row["prompt"],
                   "cohort": row.get("cohort", "unspecified"), "drift_recorded": recorder is not None,

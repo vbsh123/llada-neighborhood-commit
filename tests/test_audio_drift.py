@@ -803,7 +803,7 @@ class UpstreamTests(unittest.TestCase):
         from experiments.audio_drift.benchmark import visible_ids
         self.llm.float()
         args=parser().parse_args(['--manifest','unused','--out','unused','--progressive-prune','--lean-pruning',
-            '--skip-dense-interventions','--no-drift','--profile-samples','0',
+            '--minimal-pruning-records','--skip-dense-interventions','--no-drift','--profile-samples','0',
             '--length','4','--block-length','2','--steps','4','--acoustic-start','1',
             '--progressive-semantic-start','2','--progressive-interval','1','--progressive-patience','1',
             '--progressive-threshold','100','--progressive-fraction','.5'])
@@ -825,6 +825,9 @@ class UpstreamTests(unittest.TestCase):
                 self.assertEqual(counted.call_count,2)
                 self.assertTrue(all(not c.kwargs['save_states'] and c.kwargs['eos_id']==30 for c in counted.call_args_list))
             self.assertEqual(report['protocol'],'single-pass-eos-v1')
+            self.assertFalse(list(work.glob('*_steps.json')))
+            self.assertTrue(all('attention_mean' not in c for p in report['policies']
+                for c in p['accounting'][0]['pruning']['trigger_checks']))
             self.assertTrue(all(len(p['seconds'])==1 for p in report['policies']))
             self.assertEqual(len(report['baseline_seconds']),1)
             a,g=report['policies']
@@ -884,6 +887,74 @@ class UpstreamTests(unittest.TestCase):
                 text='#### 1',score=dict(metric='numeric',correct=True,prediction='1',reference='1',parse_failed=False),benchmark=report))
             numeric_analyze(root);self.assertEqual(len(lean_analyze(root)),11)
             self.assertEqual(len(analyze(root)),10)
+
+    @torch.no_grad() if HAS_TORCH else lambda f: f
+    def test_deep_progressive_removals_preserve_early_rows_and_match_dense_reference(self):
+        from experiments.audio_drift.progressive_pruning import progressive_conditions
+        from experiments.audio_drift.crossing_pruning import resolve_control
+        from experiments.audio_drift.compact import policy_context
+        from experiments.audio_drift.decode import forward_logits
+        from experiments.audio_drift.hooks import blocks_of
+        self.llm.float()
+        self.prepared=Prepared(self.prepared.prompt,torch.randn(1,4,16).float(),1,2,31)
+        x=torch.tensor([[1,2,3,31,31,31,31]])
+        specs=progressive_conditions(4,2,4,1,2,1,1,100,.5,layer_start=1)
+        self.assertTrue(all(s['pruning']['layer_start']==1 and '_d1_' in s['condition'] for s in specs))
+        complete=[];baseline=forward_logits(self.llm,self.prepared,x)
+        for spec in [specs[0],specs[3]]:
+            spec=resolve_control(spec,complete)
+            with policy_context(self.llm,self.prepared,spec) as engine:
+                actual=[forward_logits(self.llm,self.prepared,x).clone() for _ in range(4)]
+                counts=engine.accounting();picks=engine.records
+            self.assertTrue(picks)
+            self.assertTrue(all(p['layer']==1 and p['applies_to_layers']==[1] for p in picks))
+            self.assertEqual(counts['computed_rows_by_layer'][0],4*11)
+            self.assertLess(counts['computed_rows_by_layer'][1],4*11)
+            self.assertEqual(counts['kv_columns_by_layer'][0],4*11)
+            self.assertTrue(all(len(check['attention_mean'])==len(check['positions']) for check in counts['pruning']['trigger_checks']))
+            if complete:
+                self.assertEqual(counts['computed_rows_by_layer'],complete[0]['accounting'][0]['computed_rows_by_layer'])
+            complete.append(dict(condition=spec['condition'],accounting=[counts]))
+            originals=[];clock=[0];observed={}
+            checks={r['step']:r for r in counts['pruning']['trigger_checks']}
+            try:
+                for layer,block in enumerate(blocks_of(self.llm)):
+                    original=block._scaled_dot_product_attention
+                    existed='_scaled_dot_product_attention' in block.__dict__
+                    originals.append((block,original,existed))
+                    def attention(q,k,v,_layer=layer,_original=original,**kw):
+                        removed={p for r in picks if r['step']<=clock[0] and r['layer']<=_layer for p in r['dropped_positions']}
+                        keep=torch.tensor([i for i in range(k.shape[-2]) if i not in removed])
+                        if clock[0] in checks:
+                            probes=torch.tensor(checks[clock[0]]['query_positions'])
+                            probability=(q.index_select(-2,probes).float()@k.index_select(-2,keep).float().transpose(-1,-2)
+                                /__import__('math').sqrt(q.shape[-1])).softmax(-1)
+                            relative=probability.mean((0,1,2))*len(keep)
+                            full=relative.new_zeros(k.shape[-2]);full.index_copy_(0,keep,relative)
+                            observed.setdefault(clock[0],[]).append(full)
+                        return _original(q,k.index_select(-2,keep),v.index_select(-2,keep),**kw)
+                    block._scaled_dot_product_attention=attention
+                for i in range(4):
+                    clock[0]=i;reference=forward_logits(self.llm,self.prepared,x)
+                    torch.testing.assert_close(actual[i][:,self.prepared.answer_start:],reference[:,self.prepared.answer_start:],rtol=2e-5,atol=2e-5)
+                    if i in checks:
+                        reference_relative=torch.stack(observed[i]).mean(0).index_select(0,torch.tensor(checks[i]['positions']))
+                        torch.testing.assert_close(reference_relative,torch.tensor(checks[i]['attention_relative_uniform']),rtol=2e-5,atol=2e-5)
+            finally:
+                for block,original,existed in originals:
+                    if existed:block._scaled_dot_product_attention=original
+                    else:delattr(block,'_scaled_dot_product_attention')
+            torch.testing.assert_close(baseline,forward_logits(self.llm,self.prepared,x),rtol=0,atol=0)
+        # Before any removal, per-layer uniform normalization agrees with the
+        # original all-layer rule at identical states, despite a different suffix.
+        with policy_context(self.llm,self.prepared,specs[0]) as deep:
+            forward_logits(self.llm,self.prepared,x)
+        flat=progressive_conditions(4,2,4,1,2,1,1,100,.5)[0]
+        with policy_context(self.llm,self.prepared,flat) as all_layers:
+            forward_logits(self.llm,self.prepared,x)
+        self.assertEqual(deep.checks[0]['planned_removals'],all_layers.checks[0]['planned_removals'])
+        torch.testing.assert_close(torch.tensor(deep.checks[0]['attention_relative_uniform']),
+            torch.tensor(all_layers.checks[0]['attention_relative_uniform']),rtol=1e-6,atol=1e-6)
 
     @torch.no_grad() if HAS_TORCH else lambda f: f
     def test_cached_progressive_against_dense_frozen_kv_and_removed_columns(self):

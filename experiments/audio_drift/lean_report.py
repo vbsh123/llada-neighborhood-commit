@@ -24,6 +24,7 @@ def analyze(run):
                 correct=s['correct']=='True',parse_failed=s['parse_failed']=='True',prediction=s['prediction'],reference=s['reference'],
                 seconds=p['median_seconds'],visible_answer_tokens=p['visible_answer_tokens'],forwards=p['accounting'][0]['forwards'],
                 threshold=plan.get('threshold_uniform'),fraction=plan.get('fraction'),control=plan.get('control'),
+                prune_layer_start=plan.get('layer_start'),
                 activated=bool(picks),removed_acoustic=sum(v['dropped_by_group']['acoustic'] for v in picks),
                 removed_semantic=sum(v['dropped_by_group']['semantic'] for v in picks),
                 removed_prompt=sum(v['dropped_by_group']['prompt'] for v in picks)))

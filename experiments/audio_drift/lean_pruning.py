@@ -59,7 +59,7 @@ def evaluate(llm,prepared,baseline,baseline_seconds,baseline_events,args,tokeniz
         torch.cuda.synchronize();seconds=time.perf_counter()-began
         peak=torch.cuda.max_memory_allocated()
         accounting=engine.accounting()
-        if getattr(args,'pruning_sweep',False):
+        if getattr(args,'pruning_sweep',False) or getattr(args,'minimal_pruning_records',False):
             # The matched control needs check times and removal budgets, not
             # full per-position attention histories. Preserve only decisions.
             account=accounting['pruning']
@@ -83,7 +83,7 @@ def evaluate(llm,prepared,baseline,baseline_seconds,baseline_events,args,tokeniz
             decode_speedup=baseline_seconds/seconds,
             same_forward_count_as_baseline=accounting['forwards']==len(baseline_events))
         report['policies'].append(result)
-        if not getattr(args,'pruning_sweep',False):
+        if not (getattr(args,'pruning_sweep',False) or getattr(args,'minimal_pruning_records',False)):
             write_json(work/(spec['condition']+'_steps.json'),events)
         write_json(work/'cache_benchmark.json',report)
         print(f"    {seconds:.2f}s; {accounting['forwards']} forwards; "

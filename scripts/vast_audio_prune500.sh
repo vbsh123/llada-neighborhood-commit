@@ -36,16 +36,19 @@ p.with_suffix('.fingerprint.json').write_text(json.dumps(dict(sha256=sha,samples
     excluded_ids=sorted(excluded),seed=seed,revision=revision),indent=2)+'\n')
 print(f'Validated {count} held-out questions; excluded all{len(excluded)} previously inspected IDs. INPUT_FINGERPRINT={sha}',flush=True)
 PY
+extra=()
+if [[ "${MINIMAL_RECORDS:-0}" == 1 ]]; then extra+=(--minimal-pruning-records); fi
 python -u -m experiments.audio_drift.run \
   --manifest "$manifest" --out "runs/$run" --samples "$count" \
   --length 512 --block-length 32 --steps 256 --layers all \
   --progressive-prune --lean-pruning --skip-dense-interventions --no-drift \
   --acoustic-start 16 --progressive-semantic-start 44 --progressive-interval 8 \
-  --progressive-patience 2 --progressive-threshold 0.5 --progressive-fraction 0.25 \
+  --progressive-patience 2 --progressive-threshold 0.5 --progressive-fraction "${PRUNE_FRACTION:-0.25}" \
+  --progressive-layer-start "${PRUNE_LAYER_START:-0}" \
   --benchmark-stopping eos --profile-samples 0 --verify-samples "${VERIFY_SAMPLES:-2}" \
   --reference-device cuda --cache-device model --cpu-threads "${CPU_THREADS:-4}" \
   --progress-every "${PROGRESS_EVERY:-32}" --seed 1729 \
-  --whisper-revision 06f233fe06e710322aca913c1bc4249a0d71fce1
+  --whisper-revision 06f233fe06e710322aca913c1bc4249a0d71fce1 "${extra[@]}"
 cp "${manifest%.*}.fingerprint.json" "runs/$run/input_fingerprint.json"
 python -m experiments.audio_drift.reasoning_report --run "runs/$run"
 python -m experiments.audio_drift.pruning_report --run "runs/$run"
