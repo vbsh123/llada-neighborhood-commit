@@ -5,6 +5,77 @@ imports from the older repo. Cache, global pruning and sparse attention each
 have a separate small mechanism module.
 Prior experiments and results remain on `audio-drift-study`.
 
+## 200-question cache comparison
+
+`scripts/cache200.sh` tests exactly these eight schedules (acoustic/prompt/semantic):
+**32/32/32,16/16/16,8/8/8,16/8/16,16/16/8,32/32/16,32/32/8,32/16/32**.
+There is no pruning, sparse attention, boosting, replay or drift collection.
+
+Default: **reuse200 existing baseline outputs and run only the eight cache
+policies**. Thus1600 timed generations, plus eight process warmups once. No
+uncached warmup, baseline generation, verification or repeated timings. Cached
+timing order is shuffled reproducibly per question.
+
+```bash
+cd /workspace/diffa-cache-clean
+git pull --ff-only origin audio-cache-clean
+nohup env SKIP_INSTALL=1 bash scripts/cache200.sh > cache_reused200_v31.log 2>&1 &
+tail -f cache_reused200_v31.log
+```
+
+The launcher searches nearby project/run folders under the current checkout and
+its parent (normally `/workspace`) for a compatible run with200 completed baseline
+records. It **stops if none is available; it never silently starts fresh baseline
+inference**. Existing prepared cohort/baseline sidecars can resume without the
+original run folder. To choose the source explicitly, set `BASELINE_RUN`:
+
+```bash
+nohup env SKIP_INSTALL=1 \
+  BASELINE_RUN=/workspace/llada-audio-drift/runs/audio_prune500_gentle_all_v25 \
+  bash scripts/cache200.sh > cache_reused200_v31.log 2>&1 &
+```
+
+Provide the extracted run directory containing `config.json` and
+`samples/*/result.json`, not a summary-only report. Reused mode takes a seeded200
+subset without correctness filtering, validates model revisions/decoder/seed and
+sample identity, and copies verified original WAVs when available. Otherwise it
+restores WAVs from the pinned dataset. These are previously evaluated questions,
+not fresh held-out data. Baseline timing remains historical; same-run uncached
+speedups are N/A. All cache policies receive current timing.
+
+Optional **explicit fresh mode**, only if new baseline inference is wanted:
+
+```bash
+nohup env SKIP_INSTALL=1 FRESH_BASELINE=1 \
+  bash scripts/cache200.sh > cache_fresh200_v31.log 2>&1 &
+```
+
+Fresh mode adds one baseline per question,1800 timed generations total and nine
+process warmups. It pins the previous dataset revision, restricts duration to0–30s,
+excludes all earlier130 GSM question IDs, exactly reconstructs the previous500
+pruning selection (reservoir seed20261024), and excludes those500 too. It samples
+200 remaining questions with seed20261025, independent of model correctness. If
+fewer than200 eligible unseen questions remain, it fails before model loading;
+it never silently admits old questions. This assumes the earlier500 used the
+documented fixed selection settings. `prepare200.py` and `earlier130_ids.json`
+contain the selection/exclusion rules. No full model inference runs during data
+preparation.
+
+Both modes save a frozen `.cohort.json`, input/WAV hashes and selection provenance.
+Reused mode also saves `.baselines.json`. Outputs default respectively to
+`runs/cache_fresh200_v31` or `runs/cache_reused200_v31`. `analysis/report.md` updates
+after every completed question; `pairs.csv` stores per-question measurements and
+`comparisons.csv` gives paired wins/losses for every pair of conditions. Final
+answers, both numeric scores, EOS flags, forward counts and cache work counts
+remain in each result. All examples remain in accuracy/TPS aggregates.
+
+The launcher resumes completed questions with unchanged source/settings. Model
+loads once for the whole comparison. After the first warmed question, logs estimate
+remaining time from observed sample wall times. Use `SAMPLES=2` for a short smoke
+evaluation of the first two questions from the frozen200 cohort. The default is
+200; changing count requires a fresh run name. On a new machine omit
+`SKIP_INSTALL=1` to install dependencies first.
+
 ## One overnight command:50 questions, seven conditions
 
 After any active job finishes, update the checkout and launch:

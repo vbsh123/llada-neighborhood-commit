@@ -1,5 +1,6 @@
 """Paired final-answer accuracy, throughput and latency reports."""
 import csv
+from itertools import combinations
 import json
 from .storage import write_json
 
@@ -17,7 +18,7 @@ def summarize(out):
     if not rows:
         return
     base = {r['id']:r for r in rows if r['condition']=='baseline'}
-    lines = ['# Audio inference development comparison', '',
+    lines = ['# Audio inference comparison', '',
         'Frozen secondary final-answer accuracy; original scores retained. One synchronized EOS decode per '
         'condition/example after process warmup. TPS counts visible answer tokens excluding EOS. '
         'All examples stay included. Decoding remains 512 answer slots, block32, maximum256 forwards. '
@@ -58,5 +59,21 @@ def summarize(out):
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    comparisons=[]
+    for left,right in combinations(summary,2):
+        a={r['id']:r for r in rows if r['condition']==left}
+        b={r['id']:r for r in rows if r['condition']==right}
+        ids=sorted(set(a)&set(b))
+        if not ids:continue
+        comparisons.append(dict(left=left,right=right,samples=len(ids),
+            left_correct=sum(a[i]['correct'] for i in ids),right_correct=sum(b[i]['correct'] for i in ids),
+            right_wins=sum(not a[i]['correct'] and b[i]['correct'] for i in ids),
+            right_losses=sum(a[i]['correct'] and not b[i]['correct'] for i in ids),
+            right_accuracy_delta_pp=100*sum(int(b[i]['correct'])-int(a[i]['correct']) for i in ids)/len(ids)))
+    if comparisons:
+        with (analysis/'comparisons.csv').open('w',newline='') as stream:
+            writer=csv.DictWriter(stream,fieldnames=list(comparisons[0]))
+            writer.writeheader()
+            writer.writerows(comparisons)
     write_json(out/'summary.json', summary)
     return '\n'.join(lines)

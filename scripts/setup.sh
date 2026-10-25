@@ -16,4 +16,13 @@ export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 diffa_checkout="${DIFFA_ROOT:-$PWD/external/DIFFA}"
 python -m audio_cache.checkout --diffa-root "$diffa_checkout"
 manifest="${MANIFEST:-$PWD/data/development50.jsonl}"
-python -m audio_cache.data --out "$manifest"
+case "${COHORT_MODE:-development50}" in
+  development50) python -m audio_cache.data --out "$manifest" ;;
+  cache200)
+    reference_args=()
+    if [[ -n "${BASELINE_RUN:-}" ]]; then reference_args+=(--baseline-run "$BASELINE_RUN"); fi
+    if [[ "${FRESH_BASELINE:-0}" != 1 ]]; then reference_args+=(--reuse-only); fi
+    python -u -m audio_cache.prepare200 --out "$manifest" --seed "${DATA_SEED:-20261025}" "${reference_args[@]}"
+    ;;
+  *) echo 'Unknown COHORT_MODE'; exit 2 ;;
+esac

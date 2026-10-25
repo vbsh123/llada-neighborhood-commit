@@ -19,7 +19,7 @@ def summarize(root):
         configs.append(config)
         if config['settings']['baseline_mode']!='saved':
             raise ValueError('Overnight report expects saved-baseline mode')
-        if configs[0]['development50_sha256']!=config['development50_sha256'] or configs[0]['inputs']!=config['inputs']:
+        if configs[0]['input_sha256']!=config['input_sha256'] or configs[0]['inputs']!=config['inputs']:
             raise ValueError('Overnight suites do not use identical ordered questions')
         for key in ('source_sha256','model_revisions','decoder','torch'):
             if config[key]!=configs[0][key]:
